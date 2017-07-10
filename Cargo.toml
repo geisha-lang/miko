@@ -1,0 +1,8 @@
+[package]
+name = "rl"
+version = "0.1.0"
+authors = ["nameoverflow <i@hcyue.me>"]
+
+[dependencies]
+pest = "0.4"
+llvm-sys = "39"

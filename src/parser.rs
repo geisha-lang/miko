@@ -1,22 +1,11 @@
 use pest::*;
 
 use syntax::*;
+use types::*;
 use utils::*;
 use std::str::FromStr;
 use std::collections::LinkedList;
 use std::borrow::BorrowMut;
-
-// macro_rules! match_list {
-//     ($name: ident, $tk: ident, $meth: ident -> $ty: ty) => (
-//         $name(&self) -> LinkedList< $ty > {
-//             (_: $tk, head: $meth(), mut tail: $name()) => {
-//                 tail.push_front(head);
-//                 tail
-//             }
-//             () => LinkedList::new()
-//         }
-//     )
-// }
 
 fn form(e: Expr) -> P<Form> {
     P(Form::new(Pos::new(0, 0), e))

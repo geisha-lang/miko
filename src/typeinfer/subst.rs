@@ -5,6 +5,7 @@ use std::ops::DerefMut;
 
 use syntax::*;
 use utils::*;
+use types::*;
 
 pub type Subst = HashMap<Name, Type>;
 pub trait Substituable {
@@ -167,6 +168,6 @@ impl SubstMut for Form {
 
 impl SubstMut for VarDecl {
     fn apply_mut(&mut self, sub: &Subst) {
-        self.1 = self.1.clone().apply(sub);
+        self.1.apply_mut(sub);
     }
 }

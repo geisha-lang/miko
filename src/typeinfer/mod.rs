@@ -1,11 +1,11 @@
-mod subst;
-mod typeenv;
-mod infer;
+pub mod subst;
+pub mod typeenv;
+pub mod infer;
 
-use syntax::*;
-use self::subst::*;
-use self::infer::*;
-use self::typeenv::*;
+// use syntax::*;
+// use self::subst::*;
+// use self::infer::*;
+// use self::typeenv::*;
 
 // pub fn type_check<'b, 'a: 'b, T>(_env: &'a TypeEnv<'a>, program: &'a mut Vec<Def>) -> TypeEnv<'b> {
 //     // Add top level definition names into environment.

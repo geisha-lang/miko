@@ -1,6 +1,7 @@
 use typeinfer::typeenv::*;
 use typeinfer::subst::*;
 use syntax::*;
+use types::*;
 
 use utils::*;
 
@@ -70,14 +71,12 @@ impl Substituable for Constraint {
     fn apply(self, sub: &Subst) -> Self {
         Constraint(self.0.apply(sub), self.1.apply(sub))
     }
-    // fn apply_mut(&mut self, sub: &Subst) {}
     fn ftv(&self) -> HashSet<Name> {
         let mut r = self.0.ftv();
         r.extend(self.1.ftv());
         r
     }
 }
-
 
 
 fn generalize(e: &TypeEnv, ty: Type) -> Scheme {
@@ -135,8 +134,7 @@ impl Infer {
             Mono(ref ty) => ty.deref().clone(),
             Poly(ref tvs, ref ty) => {
                 let tvs_: Vec<_> = tvs.iter().map(|_| self.fresh()).collect();
-                let mut sub: Subst = HashMap::new();
-                sub.extend(tvs.clone().into_iter().zip(tvs_));
+                let sub: Subst = tvs.clone().into_iter().zip(tvs_).collect();
 
                 ty.clone().apply(&sub)
             }

@@ -19,4 +19,4 @@ pub mod parser;
 pub mod typeinfer;
 pub mod codegen;
 pub mod types;
-pub mod core;
+// pub mod core;

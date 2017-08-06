@@ -7,6 +7,30 @@ use std::ops::DerefMut;
 use std::iter::IntoIterator;
 use std::iter::DoubleEndedIterator;
 
+
+/// Represents a variant of `data` type
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Variant {
+    pub name: Name,
+    pub body: VariantBody,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VariantBody {
+    Struct(Vec<Field>),
+    Tuple(Vec<Field>),
+    Unit,
+}
+
+/// A field definition of struct in `data`
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Field {
+//    pub pos: Pos,
+    pub name: Option<Name>,
+    pub ty: P<Type>,
+}
+
+
 /// Type scheme
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Scheme {

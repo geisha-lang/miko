@@ -16,12 +16,14 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ops::Placer;
 
+use std::mem;
+
 #[derive(Clone, PartialEq, Debug)]
-pub enum TypeError<'a> {
-    NotInScope(&'a Form),
+pub enum TypeError {
+    NotInScope(Form),
     MisMatch(Type, Type),
-    HighRank(&'a Form),
-    UnknownOperator(&'a BinOp, &'a Pos),
+    HighRank(Form),
+    UnknownOperator(BinOp, Pos),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -31,14 +33,14 @@ pub struct Infer {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct Constraint(Type, Type);
+struct Constraint(Type, Type);
 
 impl Constraint {
     pub fn apply_mut(&mut self, sub: &Subst) {
         self.0 = self.0.clone().apply(sub);
         self.1 = self.1.clone().apply(sub);
     }
-    pub fn unify<'a>(self) -> Result<Subst, TypeError<'a>> {
+    pub fn unify<'a>(self) -> Result<Subst, TypeError> {
         use self::Type::*;
         match self {
             Constraint(Var(n), t) |
@@ -82,7 +84,7 @@ impl Substituable for Constraint {
 fn generalize(e: &TypeEnv, ty: Type) -> Scheme {
     let fvs: Vec<_> = ty.ftv()
         .into_iter()
-        .filter(|fv| !e.exist(fv.as_str()))
+        .filter(|fv| !e.exist(fv))
         .collect();
     if fvs.is_empty() {
         Scheme::Mono(P(ty))
@@ -147,7 +149,7 @@ impl Infer {
     fn infer<'a>(&mut self,
                      e: &TypeEnv,
                      form: &'a mut Form)
-                     -> Result<&'a Scheme, TypeError<'a>> {
+                     -> Result<&'a Scheme, TypeError> {
         use self::Expr::*;
         use self::Scheme::*;
         use self::TypeError::*;
@@ -170,7 +172,7 @@ impl Infer {
                     form.tag.ty = (*ty).clone();
                     // form.set_scheme();
                 } else {
-                    return Err(NotInScope(form));
+                    return Err(NotInScope(form.to_owned()));
                 }
             }
 
@@ -180,7 +182,7 @@ impl Infer {
             // Exntend the environment with parameters type,
             //   then infer function body.
             Abs(ref mut fun) => {
-                let mut extends: Vec<(&str, &Scheme)> = vec![];
+                let mut extends = vec![];
                 let mut types: Vec<Type> = vec![];
 
                 for p in fun.param.iter_mut() {
@@ -188,7 +190,7 @@ impl Infer {
                         Slot => p.1 = Scheme::Mono(P(self.fresh())),
                         _ => {}
                     }
-                    extends.push((p.0.as_str(), &p.1));
+                    extends.push((p.0.to_owned(), p.1.clone()));
                     types.push(p.1.body().clone());
                 }
                 let typaram = Type::product_n(types);
@@ -222,7 +224,7 @@ impl Infer {
             Binary(ref op, ref mut left, ref mut right) => {
                 let ty_left = self.infer(e, left)?.body();
                 let ty_right = self.infer(e, right)?.body();
-                if let Some(ty_op) = e.lookup(op.as_str()) {
+                if let Some(ty_op) = e.lookup(&op.as_str().to_string()) {
                     let ty_lr = Type::product(ty_left.clone(), ty_right.clone());
 
                     form.tag.ty = to_mono(self.fresh());
@@ -230,7 +232,7 @@ impl Infer {
                     let ty_fun = Scheme::arrow(ty_lr, form.tag.clone_type());
                     self.uni(ty_op.body(), ty_fun.body());
                 } else {
-                    return Err(TypeError::UnknownOperator(op, &form.tag.pos));
+                    return Err(TypeError::UnknownOperator(op.clone(), form.tag.pos.clone()));
                 }
             }
 
@@ -242,7 +244,7 @@ impl Infer {
                 }
                 self.uni(ty.body(), tyval.body());
 
-                let tyexp = self.infer(&e.extend(name.as_str(), &tyval), body)?;
+                let tyexp = self.infer(&e.extend(name.to_owned(), tyval.to_owned()), body)?;
                 form.tag.ty = tyexp.clone();
             }
 
@@ -298,38 +300,48 @@ impl Infer {
     /// Do type inference over top level definitions
     pub fn infer_defs<'a>(&mut self,
                       _env: &'a TypeEnv<'a>,
-                      program: &'a mut Vec<Def>)
-                      -> Result<(), TypeError<'a>> {
-        
-        // Only need form definitions
-        let defs: Vec<&mut Def> = program
-            .iter_mut()
-            .filter(|ref v| v.is_form())
-            .collect();
-        
-        // Give each definitions a temporary type
-        let name_scms: Vec<(String, Scheme)> = defs
-            .iter()
-            .map(|ref d| (d.ident.clone(), to_mono(self.fresh())))
-            .collect();
-        // Add them into environment
-        let extends: Vec<_> = name_scms
-            .iter()
-            .map(|&(ref n, ref s)| (n.as_str(), s))
-            .collect();
-        let env = _env.extend_n(extends);
+                      program: &'a mut Vec<Box<Def>>)
+                      -> Result<(), TypeError> {
+                
+        // Give each definitions a temporary type if no annotattion
+        let mut env = {
+            let name_scms = program
+                .iter()
+                .filter(|ref v| v.is_form())
+                .map(|ref d| (d.name().to_string(), match d.form_annot() {
+                    Some(s) => s.clone(),
+                    _ => to_mono(self.fresh())
+                }));
 
-        for d in defs {
-            self.infer(&env, d.form_body_mut())?;
+            // Add them into environment
+            _env.extend_n(name_scms)
+        };
+
+        for d in program.iter_mut() {
+            if d.is_form() {
+                let sub = {
+                    self.infer(&env, d.form_body_mut())?;
+                    self.solve()?
+                };
+                d.form_body_mut().apply_mut(&sub);
+
+                let general = generalize(&env, d.form_type().body().to_owned());
+
+                d.form_body_mut().tag.set_scheme(general);
+
+                env.insert(d.name().to_owned(), d.form_type().clone());
+            }
         }
+
         Ok(())
     }
 
 
     /// Solve constraints. This will move out the `Infer` struct.
-    pub fn solve<'a>(self) -> Result<Subst, TypeError<'a>> {
+    fn solve<'a>(&mut self) -> Result<Subst, TypeError> {
         let mut sub = HashMap::<Name, Type>::new();
-        let mut constraints = self.constraints;
+        // let mut constraints = self.constraints;
+        let mut constraints = mem::replace(&mut self.constraints, LinkedList::new());
         while let Some(cons) = constraints.pop_front() {
             let new_sub = cons.unify()?;
             for ref mut c in constraints.iter_mut() {
@@ -396,7 +408,7 @@ mod tests {
         let PRIMITIVES: Vec<(&str, &Scheme)> = vec![("+", &ty_op)];
         let mut syn: Form = parse_expr("(a: Fuck, b) -> let c = a in { c + b }");
 
-        let mut env = TypeEnv::from_iter(PRIMITIVES.clone());
+        let mut env = TypeEnv::from_iter(PRIMITIVES.iter().map(|&(n, s)| (n.to_string(), s.clone())));
         let sub = {
             let mut inf = Infer::new();
             inf.infer(&mut env, &mut syn);

@@ -21,6 +21,11 @@ pub struct Def {
 }
 
 impl Def {
+    /// Get ident as `&str`
+    pub fn name(&self) -> &str {
+        self.ident.as_str()
+    }
+
     /// Create a definition node define a form (value).
     pub fn value<S: ToString>(pos: Pos, name: S, body: E) -> P<Def> {
         P(Def {
@@ -35,6 +40,18 @@ impl Def {
         match self.node {
             Item::Form(_) => true,
             _ => false,
+        }
+    }
+
+    pub fn form_annot(&self) -> Option<&Scheme> {
+        match self.node {
+            Item::Form(ref f) => {
+                match f.deref().tag.annotate {
+                    Some(ref scm) => Some(scm),
+                    _ => None
+                }
+            },
+            _ => None
         }
     }
 
@@ -74,27 +91,6 @@ pub enum Item {
     Alg(Vec<Variant>),
 }
 
-/// Represents a variant of `data` type
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Variant {
-    pub name: Name,
-    pub body: VariantBody,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum VariantBody {
-    Struct(Vec<Field>),
-    Tuple(Vec<Field>),
-    Unit,
-}
-
-/// A field definition of struct in `data`
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Field {
-    pub pos: Pos,
-    pub name: Option<Name>,
-    pub ty: P<Type>,
-}
 
 
 /// Represents a form

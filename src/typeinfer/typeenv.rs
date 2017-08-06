@@ -6,5 +6,5 @@ use types::*;
 
 
 
-pub type TypeEnv<'a> = SymTable<'a, &'a Scheme>;
+pub type TypeEnv<'a> = SymTable<'a, String, Scheme>;
 

@@ -13,6 +13,7 @@ fn form(e: Expr) -> P<Form> {
 
 impl_rdp! {
     grammar! {
+        top = { bind* }
         type_anno = { (["forall"] ~ type_bounds ~ ["."])? ~ type_expr }
         type_expr = {
             { type_factor }
@@ -107,6 +108,9 @@ impl_rdp! {
     }
 
     process! {
+        program(&self) -> LinkedList< P<Def> > {
+            (_: top, bs: _binds()) => bs
+        }
 
         // Just for test
         _type_expr(&self) -> P<Type> {
@@ -140,11 +144,22 @@ impl_rdp! {
         _bind(&self) -> P<Def> {
             (_: assign, ass: _assign()) => {
                 let (VarDecl(name, ty), mut val) = ass;
-                val.tag.annotate = Some(ty);
+                val.tag.annotate = match ty {
+                    Scheme::Slot => None,
+                    _ => Some(ty)
+                };
                 // f.settype(ty);
                 Def::value(Pos::new(0,0), name, val)
             }
         }
+        _binds(&self) -> LinkedList< P<Def> > {
+            (_: bind, head: _bind(), mut tail: _binds()) => {
+                tail.push_front(head);
+                tail
+            },
+            () => LinkedList::new()
+        }
+
 
 
         _lit(&self) -> Lit {
@@ -278,6 +293,12 @@ impl_rdp! {
             () => LinkedList::new()
         }
     }
+}
+
+pub fn parse(src: &str) -> LinkedList<P<Def>> {
+    let mut parser = Rdp::new(StringInput::new(src));
+    parser.top();
+    parser.program()
 }
 
 

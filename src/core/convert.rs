@@ -12,6 +12,7 @@ use types::*;
 use syntax::*;
 use core::term::*;
 
+
 #[derive(Default, Debug)]
 pub struct K {
     count: usize,
@@ -21,6 +22,8 @@ pub struct K {
 }
 
 impl K {
+    /// Do transformation on a syntax module,
+    /// generate core term representation
     pub fn go<I>(module: I) -> HashMap<String, P<Func>>
         where I: IntoIterator<Item=P<Def>>
     {
@@ -49,15 +52,15 @@ impl K {
 
     /// Generate a new temporary name
     fn fresh(&mut self) -> String {
-        let mut f = String::from(".tmp");
-        f.push_str(self.unique().to_string().as_str());
-        f
+        String::from(".tmp") + self.unique().to_string().as_str()
     }
 
+    /// Generate a name for closure
     fn make_cls_name(&mut self, bound: &str) -> String {
         self.cur_name.clone() + "$closure$" + self.unique().to_string().as_str()
     }
 
+    /// Convert a global definition to term
     fn convert_fun_def(&mut self, def: Def) {
         let Def { ident, node, .. } = def;
         match node {
@@ -82,6 +85,7 @@ impl K {
         }
     }
 
+    /// Add a function in top level definitions
     fn define_fn<'c: 'b, 'b>(
         &'c mut self,
         name: String,
@@ -98,6 +102,8 @@ impl K {
                             .collect())
     }
 
+
+    /// Get free variables of a term
     fn fv<'a>(&mut self, source: &'a Term) -> HashSet<&'a str> {
         use self::Term::*;
         match *source {
@@ -152,18 +158,21 @@ impl K {
         }
     }
 
-
+    /// Add a variable in environment
     fn close_var(&mut self, var: &str, ty: Scheme) -> Option<Scheme> {
         self.env.insert(var.to_string(), ty)
     }
+    /// Remove a variable from environment
     fn release_var(&mut self, var: &str) -> Option<Scheme> {
         self.env.remove(var)
     }
+
+    /// Find if a variable is in environment
     fn find_var(&mut self, var: &str) -> Option<&Scheme> {
         self.env.get(var)
     }
 
-    /// Get parameters, free variables, function body from lambda
+    /// Get parameters, free variables, function body term from lambda
     fn trans_lambda(&mut self, lambda: Lambda)
         -> (Vec<VarDecl>, Vec<VarDecl>, Term)
     {
@@ -209,6 +218,7 @@ impl K {
         lst.into_iter().map(|f| box self.transform(*f)).collect()
     }
 
+    /// Transform syntax form into core term
     fn transform(&mut self, form: Form) -> Term {
         use self::Expr::*;
         let Form { node, tag: FormTag { ty: tform, .. } } = form;
@@ -294,8 +304,6 @@ impl K {
                 let cls = Closure::new(cls_name, cls_fv);
                 Term::MakeCls(VarDecl(tmp_name.clone(), ty), box cls, box Term::Var(tmp_name))
             },
-            // _ => unimplemented!(),
-
         }
     }
 

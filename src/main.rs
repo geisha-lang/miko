@@ -1,6 +1,5 @@
 extern crate rl;
 use rl::utils::*;
-use rl::syntax::*;
 use rl::parser::*;
 use rl::types::*;
 use rl::typeinfer::*;
@@ -9,7 +8,7 @@ use rl::codegen::llvm::*;
 use std::io;
 use std::io::Write;
 use std::ops::Deref;
-use std::collections::HashMap;
+
 fn repl() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -30,9 +29,9 @@ fn repl() {
         println!("{:?}", res);
 
         let ty_op = Scheme::Poly(vec!["a".to_string()],
-                                 P(Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
+                                 Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
                                                           P(Type::Var("a".to_string())))),
-                                             P(Type::Var("a".to_string())))));
+                                             P(Type::Var("a".to_string()))));
 
         
         let mut ty_infer = infer::Infer::new();

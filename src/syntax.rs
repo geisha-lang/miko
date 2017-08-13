@@ -161,7 +161,7 @@ pub struct FormTag {
 
 impl FormTag {
     pub fn set_type(&mut self, ty: Type) {
-        self.ty = Scheme::Mono(P(ty));
+        self.ty = Scheme::Mono(ty);
     }
 
     pub fn set_scheme(&mut self, scm: Scheme) {
@@ -242,9 +242,8 @@ pub struct Lambda {
 pub struct VarDecl(pub Name, pub Scheme);
 
 impl VarDecl {
-    pub fn name(&self) -> Name {
-        let &VarDecl(ref name, _) = self;
-        name.clone()
+    pub fn name(&self) -> &str {
+        self.0.as_str()
     }
 }
 

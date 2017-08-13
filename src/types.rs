@@ -36,11 +36,11 @@ pub struct Field {
 pub enum Scheme {
     /// A monomorphism type
     /// `Int * Int -> Double`
-    Mono(P<Type>),
+    Mono(Type),
 
     /// Polymorphism type
     /// `forall a. a * a -> a`
-    Poly(Vec<Name>, P<Type>),
+    Poly(Vec<Name>, Type),
 
     /// Unknown type
     Slot,
@@ -52,19 +52,26 @@ impl Scheme {
     }
 
     pub fn con<S: ToString>(name: S) -> Scheme {
-        Scheme::Mono(P(Type::Con(name.to_string())))
+        Scheme::Mono(Type::Con(name.to_string()))
     }
 
     pub fn body(&self) -> &Type {
         match *self {
             Scheme::Mono(ref t) |
-            Scheme::Poly(_, ref t) => (*t).deref(),
+            Scheme::Poly(_, ref t) => t,
             Scheme::Slot => unreachable!(),
         }
     }
 
     pub fn arrow(from: Type, to: Type) -> Scheme {
-        Scheme::Mono(P(Type::Arr(P(from), P(to))))
+        Scheme::Mono(Type::Arr(P(from), P(to)))
+    }
+    pub fn is_fn(&self) -> bool {
+        match self {
+            &Scheme::Mono(Type::Arr(..)) |
+            &Scheme::Poly(_, Type::Arr(..)) => true,
+            _ => false
+        }
     }
 }
 

@@ -113,16 +113,16 @@ impl_rdp! {
         }
 
         // Just for test
-        _type_expr(&self) -> P<Type> {
+        _type_expr(&self) -> Type {
             (_: type_expr, ty: _type()) => ty
         }
 
-        _type(&self) -> P<Type> {
-            (&type_con: type_con, _: alphabet) => P(Type::Con(type_con.to_string())),
-            (&type_var: type_var, _: alphabet) => P(Type::Var(type_var.to_string())),
+        _type(&self) -> Type {
+            (&type_con: type_con, _: alphabet) => Type::Con(type_con.to_string()),
+            (&type_var: type_var, _: alphabet) => Type::Var(type_var.to_string()),
             (_: type_factor, t: _type()) => t,
-            (_: fn_type, left: _type(), _: type_arr, right: _type()) => P(Type::Arr(left, right)),
-            (_: prod_type, left: _type(), _: type_prod, right: _type()) => P(Type::Prod(left, right)),
+            (_: fn_type, left: _type(), _: type_arr, right: _type()) => Type::Arr(P(left), P(right)),
+            (_: prod_type, left: _type(), _: type_prod, right: _type()) => Type::Prod(P(left), P(right)),
         }
         _type_anno(&self) -> Scheme {
             (_: type_bounds, tvs: _bound_tv(), _: type_expr, ty: _type()) => {
@@ -394,7 +394,7 @@ mod tests {
             "let a: Fuck = shit in a",
             expr, __expr,
             form(Let(
-                VarDecl(s("a"), Scheme::Mono(P(Type::Con(s("Fuck"))))),
+                VarDecl(s("a"), Scheme::Mono(Type::Con(s("Fuck")))),
                 form(Var(s("shit"))),
                 form(Var(s("a")))
             ))
@@ -428,7 +428,7 @@ mod tests {
         use self::BinOp::*;
         use self::Expr::*;
         use self::Type::*;
-        let ty1 = Scheme::Mono(P(
+        let ty1 = Scheme::Mono(
             Arr(
                 P(Prod(
                     P(Con(s("Fuck"))),
@@ -436,7 +436,7 @@ mod tests {
                 )),
                 P(Con(s("Fuck")))
             )
-        ));
+        );
         test_non_terminal!(
             "def shit: Fuck * Fuck -> Fuck = (a: Fuck, b) -> let c = a in {
                 c + b

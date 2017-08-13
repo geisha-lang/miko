@@ -87,14 +87,14 @@ fn generalize(e: &TypeEnv, ty: Type) -> Scheme {
         .filter(|fv| !e.exist(fv))
         .collect();
     if fvs.is_empty() {
-        Scheme::Mono(P(ty))
+        Scheme::Mono(ty)
     } else {
-        Scheme::Poly(fvs, P(ty))
+        Scheme::Poly(fvs, ty)
     }
 }
 
 fn to_mono(ty: Type) -> Scheme {
-    Scheme::Mono(P(ty))
+    Scheme::Mono(ty)
 }
 
 
@@ -179,7 +179,7 @@ impl Infer {
             // Abstraction (function) should have a arrow type.
             // Generate temporary type var
             //   if parameter has no type annotation.
-            // Exntend the environment with parameters type,
+            // Extend the environment with parameters type,
             //   then infer function body.
             Abs(ref mut fun) => {
                 let mut extends = vec![];
@@ -187,7 +187,7 @@ impl Infer {
 
                 for p in fun.param.iter_mut() {
                     match p.1 {
-                        Slot => p.1 = Scheme::Mono(P(self.fresh())),
+                        Slot => p.1 = Scheme::Mono(self.fresh()),
                         _ => {}
                     }
                     extends.push((p.0.to_owned(), p.1.clone()));
@@ -263,7 +263,7 @@ impl Infer {
 
             // Type of a block is the type of last expr
             Block(ref mut exps) => {
-                let mut ty = &Scheme::Mono(P(Type::Void));
+                let mut ty = &Scheme::Mono(Type::Void);
                 for mut f in exps.iter_mut() {
                     ty = self.infer(e, f.deref_mut())?;
                 }

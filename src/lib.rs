@@ -6,6 +6,7 @@
 
 #![feature(placement_new_protocol)]
 #![feature(libc)]
+#![feature(box_syntax, box_patterns)]
 
 #[macro_use]
 extern crate pest;
@@ -19,4 +20,4 @@ pub mod parser;
 pub mod typeinfer;
 pub mod codegen;
 pub mod types;
-// pub mod core;
+pub mod core;

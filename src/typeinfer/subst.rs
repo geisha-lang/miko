@@ -59,13 +59,13 @@ impl Substituable for Scheme {
     fn apply(self, sub: &Subst) -> Self {
         use self::Scheme::*;
         match self {
-            Mono(ty) => Mono(P((*ty).apply(sub))),
+            Mono(ty) => Mono(ty.apply(sub)),
             Poly(bounds, ty) => {
                 let mut s_ = sub.clone();
                 for ref n in &bounds {
                     s_.remove(n.clone());
                 }
-                Poly(bounds, P(ty.apply(&s_)))
+                Poly(bounds, ty.apply(&s_))
             }
             t => t,
         }
@@ -93,7 +93,7 @@ impl SubstMut for Scheme {
         match self {
             &mut Mono(ref mut ty) |
             &mut Poly(_, ref mut ty) => {
-                *(*ty) = (*ty).clone().apply(sub)
+                *ty = ty.clone().apply(sub)
             }
             _ => {}
         }

@@ -1,6 +1,7 @@
 use typeinfer::typeenv::*;
 use typeinfer::subst::*;
-use syntax::*;
+use syntax::form::*;
+use syntax::interm::*;
 use types::*;
 
 use utils::*;
@@ -248,8 +249,8 @@ impl Infer {
                 form.tag.ty = tyexp.clone();
             }
 
-            // If conditional expression
-            // Condition expression should be `Bool`,
+            // If expression
+            // Condition should be `Bool`,
             //   all branches should be unified.
             If(ref mut cond, ref mut tr, ref mut fl) => {
                 let tycond = self.infer(e, cond)?;
@@ -264,7 +265,7 @@ impl Infer {
             // Type of a block is the type of last expr
             Block(ref mut exps) => {
                 let mut ty = &Scheme::Mono(Type::Void);
-                for mut f in exps.iter_mut() {
+                for f in exps.iter_mut() {
                     ty = self.infer(e, f.deref_mut())?;
                 }
 
@@ -274,7 +275,7 @@ impl Infer {
             // List should be mono
             List(ref mut exps) => {
                 let tyitem: Type = self.fresh();
-                for mut f in exps.iter_mut() {
+                for f in exps.iter_mut() {
                     let ty = self.infer(e, f)?;
                     self.uni(ty.body(), &tyitem);
                 }
@@ -303,7 +304,7 @@ impl Infer {
                       program: &'a mut Vec<Box<Def>>)
                       -> Result<(), TypeError> {
                 
-        // Give each definitions a temporary type if no annotattion
+        // Give each definitions a temporary type if no annotation
         let mut env = {
             let name_scms = program
                 .iter()

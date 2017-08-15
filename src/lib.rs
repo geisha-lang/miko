@@ -16,7 +16,6 @@ extern crate libc;
 pub mod utils;
 
 pub mod syntax;
-pub mod parser;
 pub mod typeinfer;
 pub mod codegen;
 pub mod types;

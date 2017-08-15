@@ -1,8 +1,9 @@
 use pest::*;
 
-use syntax::*;
 use types::*;
 use utils::*;
+use syntax::form::*;
+use syntax::interm::*;
 use std::str::FromStr;
 use std::collections::LinkedList;
 use std::borrow::BorrowMut;

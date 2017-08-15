@@ -1,11 +1,14 @@
 use std::string::*;
-use utils::*;
 
 use std::ops::Deref;
 use std::ops::DerefMut;
 
 use std::iter::IntoIterator;
 use std::iter::DoubleEndedIterator;
+
+use std::collections::HashMap;
+
+use utils::*;
 
 
 /// Represents a variant of `data` type
@@ -113,3 +116,7 @@ impl Type {
         res
     }
 }
+
+
+pub type TypeEnv<'a> = SymTable<'a, String, Scheme>;
+

@@ -75,4 +75,8 @@ impl<'a: 'b, 'b, K:'a, T: 'a> SymTable<'a, K, T>
 
         }
     }
+
+    pub fn unwrap(self) -> HashMap<K, T> {
+        self.vars
+    }
 }

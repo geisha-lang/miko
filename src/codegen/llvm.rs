@@ -16,7 +16,8 @@ use llvm_sys::LLVMRealPredicate;
 use llvm_sys::core::*;
 
 // use codegen::llvm::*;
-use syntax::*;
+use syntax::interm::*;
+use core::term::*;
 use types::*;
 use utils::*;
 
@@ -81,6 +82,58 @@ impl LLVMCodegen {
             }
         }
     }
+    pub fn gen_top_level(&mut self, def: &Definition, prelude: &VarEnv) {
+        unsafe {
+            // A global function definition
+            let fun_type = def.ref_type();
+            let fun = self.get_or_add_function(def.name(), fun_type);
+
+            // Check redefinition
+            if LLVMCountBasicBlocks(fun) != 0 {
+                panic!("Redefinition of function"); // TODO: Error return
+            }
+            let paramc = LLVMCountParams(fun) as usize;
+            if paramc != def.parameters().len() {
+                // TODO: Error return
+                // self.dump();
+                panic!("Redefinition of function with different argument count");
+            }
+
+            let mut symtbl = prelude.sub_env();
+
+
+            let bb = LLVMAppendBasicBlockInContext(
+                self.context,
+                fun,
+                CString::new("entry").unwrap().into_raw());
+
+            LLVMPositionBuilderAtEnd(self.builder, bb);
+
+            // For each parameter, set argument name,
+            //   create store instruction, add to
+            //   symbol table.
+            for (i, &VarDecl(ref pname, ref ptype)) in def.parameters().iter().enumerate() {
+                let llarg = LLVMGetParam(fun, i as c_uint);
+                // let lltype = self.get_llvm_type(ptype.body());
+                LLVMSetValueName(llarg, raw_string(pname.as_str()));
+
+                let alloca = self.create_entry_block_alloca(fun, pname.as_str(), ptype.body());
+
+                LLVMBuildStore(self.builder, llarg, alloca);
+                symtbl.insert(pname.as_str(), alloca);
+            }
+
+            // TODO: Make closure pointer a parameter
+            // make free var symbols point to free var allocas
+
+            let fun_body = self.gen_expr(def.body(), &mut symtbl);
+            LLVMBuildRet(self.builder, fun_body);
+
+            if LLVMVerifyFunction(fun, LLVMVerifierFailureAction::LLVMPrintMessageAction) != 0 {
+                println!("Function verify failed");
+            }
+        }
+    }
 
     pub fn dump(&mut self) {
         unsafe {
@@ -128,11 +181,12 @@ impl LLVMCodegen {
                 }
                 let argc = psty.len();
                 LLVMFunctionType(self.get_llvm_type(ret.deref()), psty.as_mut_ptr(), argc as c_uint, 0)
-            }
+            },
+            &Void => LLVMVoidTypeInContext(self.context),
             &Prod(ref l, ref r) => unimplemented!(), // TODO: make a struct represent tuple
             &Comp(ref c, ref p) => unimplemented!(), // TODO: determine the type
 
-            _ => unimplemented!(),
+            &Var(..) => panic!("Unmaterized type"),
         }
     }
 
@@ -149,13 +203,16 @@ impl LLVMCodegen {
     }
 
     unsafe fn get_or_add_function(&mut self, fname: &str, fty: &Type) -> LLVMValueRef {
+
+        // TODO: make closure pointer a parameter
+
         let n = CString::new(fname).unwrap().into_raw();
         let f = LLVMGetNamedFunction(self.module, n);
         if f.is_null() {
             let llvm_ty = self.get_llvm_type(fty);
             LLVMAddFunction(
                 self.module,
-                CString::new(fname).unwrap().into_raw(),
+                raw_string(fname),
                 llvm_ty)
         } else {
             f
@@ -176,89 +233,36 @@ impl LLVMCodegen {
         LLVMBuildAlloca(builder, llvm_ty, raw_string(var_name))
     }
 
-    pub fn gen_top_level(&mut self, def: &Def, prelude: &VarEnv) {
-        unsafe {
-            if let Item::Form(ref form) = def.node {
-                /// If is a global function definition
-                match (*form).node {
-                    Expr::Abs(ref lambda) => {
-                        let fun_type = (*form).tag.ref_type();
-                        let fun = self.get_or_add_function(def.ident.as_str(), fun_type);
-
-                        // Check redefinition
-                        if LLVMCountBasicBlocks(fun) != 0 {
-                            panic!("Redefinition of function"); // TODO: Error return
-                        }
-                        let paramc = LLVMCountParams(fun) as usize;
-                        if paramc != lambda.param.len() {
-                            // TODO: Error return
-                            panic!("Redefinition of function with different argument count");
-                        }
-
-                        let mut symtbl = prelude.sub_env();
-
-
-                        let bb = LLVMAppendBasicBlockInContext(
-                            self.context,
-                            fun,
-                            CString::new("entry").unwrap().into_raw());
-
-                        LLVMPositionBuilderAtEnd(self.builder, bb);
-
-                        /// For each parameter, set argument name,
-                        ///   create store instruction, add to
-                        ///   symbol table.
-                        for (i, &VarDecl(ref pname, ref ptype)) in lambda.param.iter().enumerate() {
-                            let llarg = LLVMGetParam(fun, i as c_uint);
-                            // let lltype = self.get_llvm_type(ptype.body());
-                            LLVMSetValueName(llarg, raw_string(pname.as_str()));
-
-                            let alloca = self.create_entry_block_alloca(fun, pname.as_str(), ptype.body());
-
-                            LLVMBuildStore(self.builder, llarg, alloca);
-                            symtbl.insert(pname.as_str(), alloca);
-                        }
-
-                        let fun_body = self.gen_expr(lambda.body.deref(), &mut symtbl);
-                        LLVMBuildRet(self.builder, fun_body);
-
-                        if LLVMVerifyFunction(fun, LLVMVerifierFailureAction::LLVMPrintMessageAction) != 0 {
-                            println!("Function verify failed");
-                        }
-                    }
-                    _ => unimplemented!()
-                }
-            } else {
-                unimplemented!()
-            }
-        }
-    }
 
     unsafe fn gen_expr<'a: 'b, 'b>(
         &mut self,
-        form: &'a Form,
-        symtbl: &mut VarEnv<'b>)
+        term: &'a TaggedTerm,
+        symbols: &mut VarEnv<'b>)
         -> LLVMValueRef
     {
-        use self::Expr::*;
+        // TODO: fix variable ref
+        //  change `form` code to `term` code
+        //  get var type from environment
+        //  instead of form attribute
+        use self::Term::*;
         // println!("{:?}", form);
-        match form.node {
+        match *term.body() {
             Lit(ref lit) => self.gen_lit(lit),
             Var(ref vn) => {
                 let var_name = vn.as_str();
-                match symtbl.lookup(&var_name) {
+                match symbols.lookup(&var_name) {
                     Some(v) => {
                         LLVMBuildLoad(self.builder, *v, raw_string(var_name))
                         // *v
                     },
                     // Impossible because of type check
-                    None => self.get_or_add_function(var_name, form.tag.ref_type())
+                    None => self.get_or_add_function(var_name, term.ref_scheme().body())
                 }
             }
             Binary(op, ref lhs, ref rhs) => {
-                let lval = self.gen_expr(lhs, symtbl);
-                let rval = self.gen_expr(rhs, symtbl);
-                let instr = get_llvm_op(op, lhs.tag.ref_type());
+                let lval = self.gen_expr(lhs, symbols);
+                let rval = self.gen_expr(rhs, symbols);
+                let instr = get_llvm_op(op, lhs.ref_scheme().body());
 
                 instr(self.builder, lval, rval, self.gensym().unwrap().into_raw())
             }
@@ -269,29 +273,29 @@ impl LLVMCodegen {
                 let blk = LLVMGetInsertBlock(self.builder);
                 let fun = LLVMGetBasicBlockParent(blk);
 
-                let init = self.gen_expr(val, symtbl);
+                let init = self.gen_expr(val, symbols);
                 let alloca = self.create_entry_block_alloca(fun, var_name, tyvar.body());
                 LLVMBuildStore(self.builder, init, alloca);
 
-                let old = symtbl.insert(var_name, alloca);
+                let old = symbols.insert(var_name, alloca);
 
-                let res = self.gen_expr(exp.deref(), symtbl);
+                let res = self.gen_expr(exp.deref(), symbols);
 
                 if let Some(o) = old {
-                    symtbl.insert(var_name, o);
+                    symbols.insert(var_name, o);
                 } else {
-                    symtbl.remove(&var_name);
+                    symbols.remove(&var_name);
                 }
                 res
             }
-            Apply(ref callee, ref args) => {
+            ApplyCls(ref callee, ref args) => {
                 // let funty = self.get_fun_type(callee.deref().tag.ref_scheme());
-                let callee_ref = self.gen_expr(callee, symtbl);
+                let callee_ref = self.gen_expr(callee, symbols);
 
                 let mut argsv = vec![];
                 for arg in args.iter() {
                     // TODO: unpack tuple
-                    argsv.push(self.gen_expr(arg, symtbl));
+                    argsv.push(self.gen_expr(arg, symbols));
                 }
 
                 LLVMBuildCall(
@@ -304,16 +308,19 @@ impl LLVMCodegen {
             Block(ref fs) => {
                 let mut it = fs.iter();
                 if let Some(v) = it.next() {
-                    let mut ret = self.gen_expr(v, symtbl);
+                    let mut ret = self.gen_expr(v, symbols);
                     for n in it {
-                        ret = self.gen_expr(n, symtbl);
+                        ret = self.gen_expr(n, symbols);
                     }
                     ret
                 } else {
                     panic!("Empty block")
                 }                
-            }
-            _ => unimplemented!()
+            },
+            MakeCls(ref var_decl, ref cls, ref exp) => unimplemented!(),
+            List(_) => unimplemented!(),
+            Unary(_, _) => unimplemented!(),
+            If(_, _, _) => unimplemented!()
         }
     }
 }

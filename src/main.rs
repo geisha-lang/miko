@@ -1,9 +1,10 @@
-extern crate rl;
-use rl::utils::*;
-use rl::parser::*;
-use rl::types::*;
-use rl::typeinfer::*;
-use rl::codegen::llvm::*;
+extern crate miko;
+use miko::utils::*;
+use miko::syntax::parser::*;
+use miko::types::*;
+use miko::typeinfer::*;
+use miko::codegen::llvm::*;
+use miko::core::convert::*;
 
 use std::io;
 use std::io::Write;
@@ -42,10 +43,14 @@ fn repl() {
         let inf = ty_infer.infer_defs(&ty_env, &mut res);
         match inf {
             Ok(_) => {
+                // let env = types.unwrap();
                 println!("Typed AST:");
                 println!("{:?}", res);
+                println!("Core term:");
+                let top = K::go(res);
+                println!("{:?}", top);
                 println!("LLVM IR:");
-                for def in res {
+                for def in top.values() {
                     generator.gen_top_level(def.deref(), &VarEnv::new());
                 }
                 generator.dump();

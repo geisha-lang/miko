@@ -3,7 +3,8 @@ use std::collections::HashMap;
 
 use std::ops::DerefMut;
 
-use syntax::*;
+use syntax::form::*;
+use syntax::interm::*;
 use utils::*;
 use types::*;
 
@@ -102,7 +103,7 @@ impl SubstMut for Scheme {
 
 impl<T: SubstMut> SubstMut for Vec<T> {
     fn apply_mut(&mut self, sub: &Subst) {
-        for mut v in self.iter_mut() {
+        for v in self.iter_mut() {
             v.apply_mut(sub);
         }
     }
@@ -127,7 +128,7 @@ impl Substituable for Form {
 
 impl SubstMut for Form {
     fn apply_mut(&mut self, sub: &Subst) {
-        use syntax::Expr::*;
+        use self::Expr::*;
         self.tag.ty.apply_mut(sub);
         match self.node {
             List(ref mut es) |

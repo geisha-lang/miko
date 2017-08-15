@@ -8,8 +8,9 @@ use std::ops::DerefMut;
 
 use utils::*;
 use types::*;
+use syntax::form::*;
+use syntax::interm::*;
 
-use syntax::*;
 use core::term::*;
 
 
@@ -17,14 +18,14 @@ use core::term::*;
 pub struct K {
     count: usize,
     env: HashMap<String, Scheme>,
-    global: HashMap<String, P<Func>>,
+    global: HashMap<String, P<Definition>>,
     cur_name: String,
 }
 
 impl K {
     /// Do transformation on a syntax module,
     /// generate core term representation
-    pub fn go<I>(module: I) -> HashMap<String, P<Func>>
+    pub fn go<I>(module: I) -> HashMap<String, P<Definition>>
         where I: IntoIterator<Item=P<Def>>
     {
         let mut runner = K {
@@ -57,7 +58,7 @@ impl K {
 
     /// Generate a name for closure
     fn make_cls_name(&mut self, bound: &str) -> String {
-        self.cur_name.clone() + "$closure$" + self.unique().to_string().as_str()
+        self.cur_name.clone() + "$closure$" + bound + self.unique().to_string().as_str()
     }
 
     /// Convert a global definition to term
@@ -73,7 +74,7 @@ impl K {
               
                 match node {
                     Expr::Abs(lambda) => {
-                        // We can ignore fvs (glocal definitions) there
+                        // We can ignore fvs (global definitions) there
                         // because of type check
                         let (ps, _, bd) = self.trans_lambda(lambda);
                         self.define_fn(def_name, ty, ps, vec![], bd);
@@ -92,10 +93,10 @@ impl K {
         ty: Scheme,
         params: Vec<VarDecl>,
         freevars: Vec<VarDecl>,
-        body: Term)
+        body: TaggedTerm)
         -> (&'b str, Vec<&'b str>)
     {
-        let fun = Func::new(name.clone(), ty, params, freevars, body);
+        let fun = Definition::new(name.clone(), ty, params, freevars, body);
         let ent = self.global.entry(name).or_insert(P(fun));
         (&(*ent).name(), (*ent).fv().iter()
                             .map(|ref v| { v.name() })
@@ -104,9 +105,9 @@ impl K {
 
 
     /// Get free variables of a term
-    fn fv<'a>(&mut self, source: &'a Term) -> HashSet<&'a str> {
+    fn fv<'a>(&mut self, source: &'a TaggedTerm) -> HashSet<&'a str> {
         use self::Term::*;
-        match *source {
+        match *source.body() {
             Term::Lit(_) => HashSet::new(),
             Var(ref v) => {
                 let mut hs = HashSet::new();
@@ -174,7 +175,7 @@ impl K {
 
     /// Get parameters, free variables, function body term from lambda
     fn trans_lambda(&mut self, lambda: Lambda)
-        -> (Vec<VarDecl>, Vec<VarDecl>, Term)
+        -> (Vec<VarDecl>, Vec<VarDecl>, TaggedTerm)
     {
         let params = lambda.param;
         let bd = *lambda.body;
@@ -197,10 +198,15 @@ impl K {
             }
 
             let body_term = self.transform(bd);
-            let fvs = self.fv(&body_term).iter().map(|vn| {
-                VarDecl(vn.to_string(), self.env[&vn.to_string()].to_owned())
-            }).collect();
-
+            let fvs = {
+                let mut _fvs = self.fv(&body_term);
+                for &VarDecl(ref n, _) in params.iter() {
+                    _fvs.remove(n.as_str());
+                }
+                _fvs.iter().map(|vn| {
+                    VarDecl(vn.to_string(), self.env[&vn.to_string()].to_owned())
+                }).collect()
+            };
             // Reset env
             for bname in present {
                 self.release_var(bname);
@@ -214,24 +220,24 @@ impl K {
         (params, fvs, body_term)
     }
 
-    fn transform_list(&mut self, lst: Vec<P<Form>>) -> Vec<P<Term>> {
+    fn transform_list(&mut self, lst: Vec<P<Form>>) -> Vec<P<TaggedTerm>> {
         lst.into_iter().map(|f| box self.transform(*f)).collect()
     }
 
     /// Transform syntax form into core term
-    fn transform(&mut self, form: Form) -> Term {
+    fn transform(&mut self, form: Form) -> TaggedTerm {
         use self::Expr::*;
         let Form { node, tag: FormTag { ty: tform, .. } } = form;
-        match node {
+        let t = match node {
             Lit(l) => Term::Lit(l),
             Var(n) => {
                 // A global definition should not be in scope env
                 if self.find_var(n.as_str()) == None && tform.is_fn() {
                     // For global function name, make a closure
                     Term::MakeCls(
-                        VarDecl(n.clone(), tform),
+                        VarDecl(n.clone(), tform.clone()),
                         box Closure::new(n.as_str(), vec![]),
-                        box Term::Var(n))
+                        box TaggedTerm::new(tform.clone(), Term::Var(n)))
                 } else {
                     Term::Var(n)
                 }
@@ -293,7 +299,7 @@ impl K {
 
             // Give anonymous lambda a name binding
             Abs(lambda) => {
-                let ty = tform;
+                let ty = tform.clone();
                 let tmp_name = {
                     let fr_name = self.fresh();
                     self.make_cls_name(fr_name.as_str())
@@ -302,9 +308,13 @@ impl K {
 
                 let (cls_name, cls_fv) = self.define_fn(tmp_name.clone(), ty.clone(), ps, fv, bd);
                 let cls = Closure::new(cls_name, cls_fv);
-                Term::MakeCls(VarDecl(tmp_name.clone(), ty), box cls, box Term::Var(tmp_name))
+                Term::MakeCls(
+                    VarDecl(tmp_name.clone(), ty.clone()),
+                    box cls,
+                    box TaggedTerm::new(ty, Term::Var(tmp_name)))
             },
-        }
+        };
+        TaggedTerm::new(tform, t)
     }
 
 }

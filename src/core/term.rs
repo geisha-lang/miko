@@ -7,41 +7,40 @@ use std::ops::DerefMut;
 use std::iter::IntoIterator;
 use std::iter::DoubleEndedIterator;
 
+use syntax::interm::*;
 use types::*;
-use syntax::{
-    Lit,
-    VarDecl,
-    BinOp,
-    UnOp
-};
 use utils::*;
 
+
+type Node = Box<TaggedTerm>;
+
+
 #[derive(Clone, PartialEq, Debug)]
-pub struct Func {
+pub struct Definition {
     name: Name,
     params: Vec<VarDecl>,
     freevars: Vec<VarDecl>,
-    body: P<Term>,
+    body: Node,
     ty: Scheme,
-    inst: Option<HashMap<String, Term>>,
+//    inst: Option<HashMap<String, Term>>,
 }
 
-impl Func {
+impl Definition {
     pub fn new(
         name: String,
         ty: Scheme,
         params: Vec<VarDecl>,
         freevars: Vec<VarDecl>,
-        body: Term)
-        -> Func
+        body: TaggedTerm)
+        -> Definition
     {
-        Func {
+        Definition {
             name: name,
             params: params,
             freevars: freevars,
             body: box body,
             ty: ty,
-            inst: None
+//            inst: None
         }
     }
 
@@ -53,7 +52,40 @@ impl Func {
         &self.freevars
     }
 
+    pub fn body(&self) -> &TaggedTerm {
+        self.body.deref()
+    }
+
+    pub fn ref_type(&self) -> &Type {
+        self.ty.body()
+    }
+
+    pub fn parameters(&self) -> &Vec<VarDecl> {
+        &self.params
+    }
+
 }
+
+/// Represents a expression term
+#[derive(Clone, PartialEq, Debug)]
+pub struct TaggedTerm {
+    ty: Scheme,
+    node: Term,
+}
+
+impl TaggedTerm {
+    pub fn new(ty: Scheme, node: Term) -> TaggedTerm {
+        TaggedTerm { ty, node }
+    }
+    
+    pub fn ref_scheme(&self) -> &Scheme {
+        &self.ty
+    }
+    pub fn body(&self) -> &Term {
+        &self.node
+    }
+}
+
 
 /// Represents a expression term
 #[derive(Clone, PartialEq, Debug)]
@@ -64,35 +96,35 @@ pub enum Term {
     Var(Name),
     /// List (array)
     /// e.g. `[fuck, shit]`
-    List(Vec<P<Term>>),
+    List(Vec<Node>),
     /// Block (statement sequence)
     /// e.g. `{ print(fuck); print(shit); 1 }`
-    Block(Vec<P<Term>>),
+    Block(Vec<Node>),
 
     /// Make closure with free variables
-    MakeCls(VarDecl, P<Closure>, P<Term>),
+    MakeCls(VarDecl, P<Closure>, Node),
 
     /// Apply a closure
-    ApplyCls(P<Term>, Vec<P<Term>>),
+    ApplyCls(Node, Vec<Node>),
 
     //** For now, all functions will represent as closure
     /// Apply a global function directly
-    // ApplyDir(Name, Vec<P<Term>>),
+    // ApplyDir(Name, Vec<Node>),
 
     /// Binary operator expression
     /// e.g. `fuck + shit`
-    Binary(BinOp, P<Term>, P<Term>),
+    Binary(BinOp, Node, Node),
     /// Unary operator expression
     /// e.g. `!fuck`
     /// e.g. `-shit`
-    Unary(UnOp, P<Term>),
+    Unary(UnOp, Node),
 
     /// Let-in expression
     /// e.g. `let fuck = shit in fuck + 1`
-    Let(VarDecl, P<Term>, P<Term>),
+    Let(VarDecl, Node, Node),
     /// Conditional expression
     /// e.g. `if (fuck == shit) 1 else 0`
-    If(P<Term>, P<Term>, P<Term>),
+    If(Node, Node, Node),
 }
 
 /// Represents a closure, including a entry as

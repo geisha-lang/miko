@@ -3,7 +3,7 @@ use pest::*;
 use types::*;
 use utils::*;
 use syntax::form::*;
-use syntax::interm::*;
+use internal::*;
 use std::str::FromStr;
 use std::collections::LinkedList;
 use std::borrow::BorrowMut;

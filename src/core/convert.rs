@@ -9,7 +9,7 @@ use std::ops::DerefMut;
 use utils::*;
 use types::*;
 use syntax::form::*;
-use syntax::interm::*;
+use internal::*;
 
 use core::term::*;
 
@@ -26,13 +26,13 @@ impl K {
     /// Do transformation on a syntax module,
     /// generate core term representation
     pub fn go<I>(module: I) -> HashMap<String, P<Definition>>
-        where I: IntoIterator<Item=P<Def>>
+        where I: IntoIterator<Item = P<Def>>
     {
         let mut runner = K {
             count: 0,
             env: HashMap::new(),
             global: HashMap::new(),
-            cur_name: "".to_string()
+            cur_name: "".to_string(),
         };
         {
             let b = &mut runner;
@@ -71,7 +71,7 @@ impl K {
                 let ty = tag.ty;
                 self.cur_name = ident;
                 let def_name = self.cur_name.clone();
-              
+
                 match node {
                     Expr::Abs(lambda) => {
                         // We can ignore fvs (global definitions) there
@@ -79,28 +79,29 @@ impl K {
                         let (ps, _, bd) = self.trans_lambda(lambda);
                         self.define_fn(def_name, ty, ps, vec![], bd);
                     }
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 }
-            },
+            }
             _ => {}
         }
     }
 
     /// Add a function in top level definitions
-    fn define_fn<'c: 'b, 'b>(
-        &'c mut self,
-        name: String,
-        ty: Scheme,
-        params: Vec<VarDecl>,
-        freevars: Vec<VarDecl>,
-        body: TaggedTerm)
-        -> (&'b str, Vec<&'b str>)
-    {
+    fn define_fn<'c: 'b, 'b>(&'c mut self,
+                             name: String,
+                             ty: Scheme,
+                             params: Vec<VarDecl>,
+                             freevars: Vec<VarDecl>,
+                             body: TaggedTerm)
+                             -> (&'b str, Vec<&'b str>) {
         let fun = Definition::new(name.clone(), ty, params, freevars, body);
         let ent = self.global.entry(name).or_insert(P(fun));
-        (&(*ent).name(), (*ent).fv().iter()
-                            .map(|ref v| { v.name() })
-                            .collect())
+        (&(*ent).name(),
+         (*ent)
+             .fv()
+             .iter()
+             .map(|ref v| v.name())
+             .collect())
     }
 
 
@@ -112,15 +113,15 @@ impl K {
             Var(ref v) => {
                 let mut hs = HashSet::new();
                 hs.insert(v.as_str());
-                return hs
-            },
+                return hs;
+            }
 
             List(ref lst) | Block(ref lst) => {
                 lst.iter().fold(HashSet::new(), |mut res, v| {
                     res.extend(self.fv(v.deref()));
                     res
                 })
-            },
+            }
 
             // The new binding name should not be visible
             // in binding value.
@@ -129,13 +130,13 @@ impl K {
                 res.remove(var.name());
                 res.extend(&self.fv(val.deref()));
                 res
-            },
+            }
             MakeCls(ref var, ref cls, ref exp) => {
                 let mut r = self.fv(exp.deref());
                 r.extend(cls.deref().fv());
                 r.remove(var.name());
                 r
-            },
+            }
             ApplyCls(ref n, ref args) => {
                 let mut r = args.iter().fold(HashSet::new(), |mut res, v| {
                     res.extend(self.fv(v.deref()));
@@ -143,19 +144,19 @@ impl K {
                 });
                 r.extend(self.fv(n.deref()));
                 r
-            },
+            }
             Binary(_, ref lhs, ref rhs) => {
                 let mut r = self.fv(lhs.deref());
                 r.extend(self.fv(rhs.deref()));
                 r
-            },
+            }
             Unary(_, ref e) => self.fv(e.deref()),
             If(ref c, ref t, ref f) => {
                 let mut r = self.fv(c.deref());
                 r.extend(self.fv(t.deref()));
                 r.extend(self.fv(f.deref()));
                 r
-            },
+            }
         }
     }
 
@@ -174,9 +175,7 @@ impl K {
     }
 
     /// Get parameters, free variables, function body term from lambda
-    fn trans_lambda(&mut self, lambda: Lambda)
-        -> (Vec<VarDecl>, Vec<VarDecl>, TaggedTerm)
-    {
+    fn trans_lambda(&mut self, lambda: Lambda) -> (Vec<VarDecl>, Vec<VarDecl>, TaggedTerm) {
         let params = lambda.param;
         let bd = *lambda.body;
 
@@ -203,9 +202,9 @@ impl K {
                 for &VarDecl(ref n, _) in params.iter() {
                     _fvs.remove(n.as_str());
                 }
-                _fvs.iter().map(|vn| {
-                    VarDecl(vn.to_string(), self.env[&vn.to_string()].to_owned())
-                }).collect()
+                _fvs.iter()
+                    .map(|vn| VarDecl(vn.to_string(), self.env[&vn.to_string()].to_owned()))
+                    .collect()
             };
             // Reset env
             for bname in present {
@@ -234,27 +233,22 @@ impl K {
                 // A global definition should not be in scope env
                 if self.find_var(n.as_str()) == None && tform.is_fn() {
                     // For global function name, make a closure
-                    Term::MakeCls(
-                        VarDecl(n.clone(), tform.clone()),
-                        box Closure::new(n.as_str(), vec![]),
-                        box TaggedTerm::new(tform.clone(), Term::Var(n)))
+                    Term::MakeCls(VarDecl(n.clone(), tform.clone()),
+                                  box Closure::new(n.as_str(), vec![]),
+                                  box TaggedTerm::new(tform.clone(), Term::Var(n)))
                 } else {
                     Term::Var(n)
                 }
-            },
+            }
             List(e) | Block(e) => Term::List(self.transform_list(e)),
             Unary(op, e) => Term::Unary(op, box self.transform(*e)),
             If(cond, tr, fl) => {
-                Term::If(
-                    box self.transform(*cond),
-                    box self.transform(*tr),
-                    box self.transform(*fl))
+                Term::If(box self.transform(*cond),
+                         box self.transform(*tr),
+                         box self.transform(*fl))
             }
             Binary(op, left, right) => {
-                Term::Binary(
-                    op,
-                    box self.transform(*left),
-                    box self.transform(*right))
+                Term::Binary(op, box self.transform(*left), box self.transform(*right))
             }
             Let(v, val, exp) => {
                 let exp_term = self.transform(*exp);
@@ -273,24 +267,19 @@ impl K {
                         }
 
                         let _cls_name = self.make_cls_name(bound);
-                        self.define_fn(
-                            _cls_name,
-                            var_ty.clone(),
-                            ps, fv, bd)
+                        self.define_fn(_cls_name, var_ty.clone(), ps, fv, bd)
                     };
-                    
-                    let cls = Closure::new(
-                        cls_name,
-                        cls_fv);
-                    
+
+                    let cls = Closure::new(cls_name, cls_fv);
+
                     Term::MakeCls(v, box cls, box exp_term)
                 } else {
                     // Normal variable bingding
                     let val_term = self.transform(*val);
                     Term::Let(v, box val_term, box exp_term)
                 }
-            },
-            
+            }
+
             Apply(callee, params) => {
                 let callee_term = self.transform(*callee);
                 let params_term = self.transform_list(params);
@@ -308,14 +297,11 @@ impl K {
 
                 let (cls_name, cls_fv) = self.define_fn(tmp_name.clone(), ty.clone(), ps, fv, bd);
                 let cls = Closure::new(cls_name, cls_fv);
-                Term::MakeCls(
-                    VarDecl(tmp_name.clone(), ty.clone()),
-                    box cls,
-                    box TaggedTerm::new(ty, Term::Var(tmp_name)))
-            },
+                Term::MakeCls(VarDecl(tmp_name.clone(), ty.clone()),
+                              box cls,
+                              box TaggedTerm::new(ty, Term::Var(tmp_name)))
+            }
         };
         TaggedTerm::new(tform, t)
     }
-
 }
-

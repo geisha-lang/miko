@@ -6,3 +6,8 @@ authors = ["nameoverflow <i@hcyue.me>"]
 [dependencies]
 pest = "0.4"
 llvm-sys = "39"
+bytecount = "0.1.4"
+
+[features]
+avx-accel = ["bytecount/avx-accel"]
+simd-accel = ["bytecount/simd-accel"]

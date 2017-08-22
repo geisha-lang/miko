@@ -3,8 +3,8 @@ use miko::utils::*;
 use miko::syntax::parser::*;
 use miko::types::*;
 use miko::typeinfer::*;
-use miko::codegen::llvm::*;
-use miko::core::convert::*;
+use miko::codegen::emit::*;
+use miko::core::*;
 
 use std::io;
 use std::io::Write;
@@ -15,7 +15,7 @@ fn repl() {
     let mut stdout = io::stdout();
     let mut input = String::new();
 
-    let mut generator = LLVMCodegen::new("repl");
+    let mut generator = LLVMEmit::new("repl");
 
     'main: loop {
         print!("> ");
@@ -31,10 +31,10 @@ fn repl() {
 
         let ty_op = Scheme::Poly(vec!["a".to_string()],
                                  Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
-                                                          P(Type::Var("a".to_string())))),
-                                             P(Type::Var("a".to_string()))));
+                                                        P(Type::Var("a".to_string())))),
+                                           P(Type::Var("a".to_string()))));
 
-        
+
         let mut ty_infer = infer::Infer::new();
         let mut ty_env = infer::Infer::new_env();
 
@@ -54,8 +54,8 @@ fn repl() {
                     generator.gen_top_level(def.deref(), &VarEnv::new());
                 }
                 generator.dump();
-            },
-            Err(e) => println!("{:?}", e)
+            }
+            Err(e) => println!("{:?}", e),
         }
 
 

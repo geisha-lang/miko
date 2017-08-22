@@ -1,7 +1,7 @@
 use typeinfer::typeenv::*;
 use typeinfer::subst::*;
 use syntax::form::*;
-use syntax::interm::*;
+use internal::*;
 use types::*;
 
 use utils::*;

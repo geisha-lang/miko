@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ops::DerefMut;
 
 use syntax::form::*;
-use syntax::interm::*;
+use internal::*;
 use utils::*;
 use types::*;
 

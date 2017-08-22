@@ -9,7 +9,7 @@ use std::iter::DoubleEndedIterator;
 use utils::*;
 use types::*;
 
-use syntax::interm::*;
+use internal::*;
 
 pub type E = P<Form>;
 

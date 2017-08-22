@@ -115,6 +115,35 @@ impl Type {
         }
         res
     }
+
+    pub fn prod_to_vec(&self) -> Vec<&Type> {
+        use self::Type::*;
+        let mut v = vec![];
+        let mut r: &Type = self;
+        loop {
+            if let &Prod(box ref t, box ref rest) = r {
+                v.push(t);
+                r = rest;
+            } else {
+                v.push(r);
+                break;
+            }
+        }
+        v
+    }
+}
+
+impl ToString for Type {
+    fn to_string(&self) -> String {
+        use self::Type::*;
+        match self {
+            &Void => String::from("Void"),
+            &Var(ref n) | &Con(ref n) => n.clone(),
+            &Arr(box ref l, box ref r) => l.to_string() + "->" + r.to_string().as_str(),
+            &Prod(box ref l, box ref r) => l.to_string() + "*" + r.to_string().as_str(),
+            &Comp(box ref l, box ref r) => l.to_string() + "+" + r.to_string().as_str(),
+        }
+    }
 }
 
 

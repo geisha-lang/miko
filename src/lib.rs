@@ -8,6 +8,10 @@
 #![feature(libc)]
 #![feature(box_syntax, box_patterns)]
 
+extern crate bytecount;
+#[macro_use]
+// extern crate nom;
+// extern crate regex;
 #[macro_use]
 extern crate pest;
 extern crate llvm_sys;
@@ -20,3 +24,4 @@ pub mod typeinfer;
 pub mod codegen;
 pub mod types;
 pub mod core;
+pub mod internal;

@@ -21,25 +21,23 @@ pub struct Definition {
     params: Vec<VarDecl>,
     freevars: Vec<VarDecl>,
     body: Node,
-    ty: Scheme,
+    ty: Scheme, 
 //    inst: Option<HashMap<String, Term>>,
 }
 
 impl Definition {
-    pub fn new(
-        name: String,
-        ty: Scheme,
-        params: Vec<VarDecl>,
-        freevars: Vec<VarDecl>,
-        body: TaggedTerm)
-        -> Definition
-    {
+    pub fn new(name: String,
+               ty: Scheme,
+               params: Vec<VarDecl>,
+               freevars: Vec<VarDecl>,
+               body: TaggedTerm)
+               -> Definition {
         Definition {
             name: name,
             params: params,
             freevars: freevars,
             body: box body,
-            ty: ty,
+            ty: ty, 
 //            inst: None
         }
     }
@@ -63,7 +61,6 @@ impl Definition {
     pub fn parameters(&self) -> &Vec<VarDecl> {
         &self.params
     }
-
 }
 
 /// Represents a expression term
@@ -77,7 +74,7 @@ impl TaggedTerm {
     pub fn new(ty: Scheme, node: Term) -> TaggedTerm {
         TaggedTerm { ty, node }
     }
-    
+
     pub fn ref_scheme(&self) -> &Scheme {
         &self.ty
     }
@@ -110,7 +107,6 @@ pub enum Term {
     //** For now, all functions will represent as closure
     /// Apply a global function directly
     // ApplyDir(Name, Vec<Node>),
-
     /// Binary operator expression
     /// e.g. `fuck + shit`
     Binary(BinOp, Node, Node),
@@ -132,20 +128,18 @@ pub enum Term {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Closure {
     entry: String,
-    actualFv: Vec<String>
+    actualFv: Vec<String>,
 }
 
 impl Closure {
     pub fn new(ent: &str, fv: Vec<&str>) -> Closure {
         Closure {
             entry: ent.to_string(),
-            actualFv: fv.iter().map(|s| { s.to_string() }).collect()
+            actualFv: fv.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     pub fn fv<'a>(&self) -> Vec<&str> {
-        (&self.actualFv).iter().map(|s| { s.as_str() }).collect()
+        (&self.actualFv).iter().map(|s| s.as_str()).collect()
     }
 }
-
-

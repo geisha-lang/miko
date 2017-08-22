@@ -342,13 +342,12 @@ mod tests {
 
     #[test]
     fn parse_type_expr() {
-        test_non_terminal!("shit * Fuck -> Shit", type_expr, _type_expr,
-            P(Type::Arr(
-                P(Type::Prod(
-                    P(Type::Var(String::from("shit"))),
-                    P(Type::Con(String::from("Fuck")))
-                )),
-                P(Type::Con(String::from("Shit"))))));
+        test_non_terminal!("shit * Fuck -> Shit",
+                           type_expr,
+                           _type_expr,
+                           P(Type::Arr(P(Type::Prod(P(Type::Var(String::from("shit"))),
+                                                    P(Type::Con(String::from("Fuck"))))),
+                                       P(Type::Con(String::from("Shit"))))));
     }
 
     #[test]
@@ -356,17 +355,16 @@ mod tests {
         test_non_terminal!("true", boolean, _lit, (Lit::Bool(true)));
         test_non_terminal!("12345", number, _lit, (Lit::Int(12345)));
         test_non_terminal!("12345.123", float, _lit, (Lit::Float(12345.123)));
-        test_non_terminal!("\"deep dark fantasy\"", string, _lit, (Lit::Str(String::from("deep dark fantasy"))));
+        test_non_terminal!("\"deep dark fantasy\"",
+                           string,
+                           _lit,
+                           (Lit::Str(String::from("deep dark fantasy"))));
     }
 
     #[test]
     fn parse_factor() {
-        test_non_terminal!(
-            "true", lit, _factor,
-            form(Expr::Lit(Lit::Bool(true))));
-        test_non_terminal!(
-            "fuck", var, _factor,
-            form(Expr::Var(s("fuck"))));
+        test_non_terminal!("true", lit, _factor, form(Expr::Lit(Lit::Bool(true))));
+        test_non_terminal!("fuck", var, _factor, form(Expr::Var(s("fuck"))));
     }
 
     #[test]
@@ -391,37 +389,30 @@ mod tests {
                     )),
                     form(Lit(self::Lit::Int(4)))
                 )))));
-        test_non_terminal!(
-            "let a: Fuck = shit in a",
-            expr, __expr,
-            form(Let(
-                VarDecl(s("a"), Scheme::Mono(Type::Con(s("Fuck")))),
-                form(Var(s("shit"))),
-                form(Var(s("a")))
-            ))
-        );
-        test_non_terminal!(
-            "(a: Fuck, b) -> let c = a in {
+        test_non_terminal!("let a: Fuck = shit in a",
+                           expr,
+                           __expr,
+                           form(Let(VarDecl(s("a"), Scheme::Mono(Type::Con(s("Fuck")))),
+                                    form(Var(s("shit"))),
+                                    form(Var(s("a"))))));
+        test_non_terminal!("(a: Fuck, b) -> let c = a in {
                 c + b
             }",
-            expr, __expr,
-            form(Abs(Lambda {
-                param: vec![VarDecl(s("a"), Scheme::con("Fuck")), VarDecl(s("b"), Scheme::slot())],
-                body: form(Let(
-                    VarDecl(s("c"), Scheme::slot()),
-                    form(Var(s("a"))),
-                    form(Block(
-                        vec![
+                           expr,
+                           __expr,
+                           form(Abs(Lambda {
+                                        param: vec![VarDecl(s("a"), Scheme::con("Fuck")),
+                                                    VarDecl(s("b"), Scheme::slot())],
+                                        body: form(Let(VarDecl(s("c"), Scheme::slot()),
+                                                       form(Var(s("a"))),
+                                                       form(Block(vec![
                             form(Binary(
                                 Add,
                                 form(Var(s("c"))),
                                 form(Var(s("b")))
                             ))
-                        ]
-                    ))
-                ))
-            }))
-        );
+                        ])))),
+                                    })));
     }
 
     #[test]
@@ -429,15 +420,8 @@ mod tests {
         use self::BinOp::*;
         use self::Expr::*;
         use self::Type::*;
-        let ty1 = Scheme::Mono(
-            Arr(
-                P(Prod(
-                    P(Con(s("Fuck"))),
-                    P(Con(s("Fuck")))
-                )),
-                P(Con(s("Fuck")))
-            )
-        );
+        let ty1 = Scheme::Mono(Arr(P(Prod(P(Con(s("Fuck"))), P(Con(s("Fuck"))))),
+                                   P(Con(s("Fuck")))));
         test_non_terminal!(
             "def shit: Fuck * Fuck -> Fuck = (a: Fuck, b) -> let c = a in {
                 c + b

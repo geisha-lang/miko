@@ -9,13 +9,15 @@ pub fn P<T>(t: T) -> Box<T> {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct SymTable<'a, K, T: 'a>
-    where K: 'a + ::std::cmp::Eq + ::std::hash::Hash {
+    where K: 'a + ::std::cmp::Eq + ::std::hash::Hash
+{
     vars: HashMap<K, T>,
     parent: Option<&'a SymTable<'a, K, T>>,
 }
 
-impl<'a: 'b, 'b, K:'a, T: 'a> SymTable<'a, K, T>
-    where K: 'a + ::std::cmp::Eq + ::std::hash::Hash {
+impl<'a: 'b, 'b, K: 'a, T: 'a> SymTable<'a, K, T>
+    where K: 'a + ::std::cmp::Eq + ::std::hash::Hash
+{
     pub fn new() -> SymTable<'a, K, T> {
         SymTable {
             vars: HashMap::new(),

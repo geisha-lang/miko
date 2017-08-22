@@ -50,10 +50,10 @@ impl Def {
             Item::Form(ref f) => {
                 match f.deref().tag.annotate {
                     Some(ref scm) => Some(scm),
-                    _ => None
+                    _ => None,
                 }
-            },
-            _ => None
+            }
+            _ => None,
         }
     }
 
@@ -63,8 +63,8 @@ impl Def {
         match self.node {
             Item::Form(ref mut f) => {
                 (*f).deref_mut().tag.set_scheme(scm);
-            },
-            _ => panic!("Set scheme to a non-form definition")
+            }
+            _ => panic!("Set scheme to a non-form definition"),
         }
     }
 
@@ -73,7 +73,7 @@ impl Def {
     pub fn form_type<'a>(&'a self) -> &'a Scheme {
         match self.node {
             Item::Form(ref f) => f.tag.ref_scheme(),
-            _ => panic!("Get scheme from a non-form definition")
+            _ => panic!("Get scheme from a non-form definition"),
         }
     }
 
@@ -81,7 +81,7 @@ impl Def {
     pub fn form_body_mut<'a>(&'a mut self) -> &'a mut Form {
         match self.node {
             Item::Form(ref mut f) => (*f).deref_mut(),
-            _ => panic!("Get form from a non-form definition")
+            _ => panic!("Get form from a non-form definition"),
         }
     }
 }
@@ -239,4 +239,3 @@ pub struct Lambda {
     pub param: Vec<VarDecl>,
     pub body: E,
 }
-

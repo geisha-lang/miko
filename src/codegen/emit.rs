@@ -9,8 +9,7 @@ use std::ops::Deref;
 
 
 pub trait EmitProvider {
-    fn gen_module<T>(&mut self, module: T)
-        where T: IntoIterator<Item=Definition>;
+    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = Definition>;
 }
 
 pub struct LLVMEmit(LLVMCodegen);
@@ -44,14 +43,15 @@ impl LLVMEmit {
 
             let mut params_ref: Vec<_> = def.parameters().iter().collect();
 
-            let last_param: Option<&VarDecl> = if let Some(&VarDecl(_, ref _last_type)) = def.parameters().last() {
+            let last_param: Option<&VarDecl> = if let Some(&VarDecl(_, ref _last_type)) =
+                def.parameters().last() {
                 match _last_type.body() {
-                    &Type::Prod(..) => {
-                        params_ref.pop()
-                    },
-                    _ => None
+                    &Type::Prod(..) => params_ref.pop(),
+                    _ => None,
                 }
-            } else { None };
+            } else {
+                None
+            };
 
 
             // Spread length
@@ -73,14 +73,16 @@ impl LLVMEmit {
             if let Some(&VarDecl(ref last_name, ref _last_type)) = last_param {
                 let last_type_flat = _last_type.body().prod_to_vec();
                 // Handle the last parameter
-                let last_alloca = self.0.create_entry_block_alloca(&fun, last_name.as_str(), _last_type.body());
+                let last_alloca =
+                    self.0.create_entry_block_alloca(&fun, last_name.as_str(), _last_type.body());
                 println!("fuck: {:?}", last_type_flat.clone());
                 for (i, ty) in last_type_flat.into_iter().enumerate() {
                     let idx_name = i.to_string();
                     let arg = fun.get_param(i + len_head);
                     let arg_name = last_name.clone() + idx_name.as_str();
                     arg.set_name(arg_name.as_str());
-                    let field = self.0.builder.struct_field(&last_alloca, i as u32, idx_name.as_str());
+                    let field =
+                        self.0.builder.struct_field(&last_alloca, i as u32, idx_name.as_str());
                     self.0.builder.store(&arg, &field);
                 }
             }
@@ -93,7 +95,9 @@ impl LLVMEmit {
             let fun_body = self.gen_expr(def.body(), &mut symtbl);
             self.0.builder.ret(&fun_body);
 
-            if LLVMVerifyFunction(fun.raw_ptr(), LLVMVerifierFailureAction::LLVMPrintMessageAction) != 0 {
+            if LLVMVerifyFunction(fun.raw_ptr(),
+                                  LLVMVerifierFailureAction::LLVMPrintMessageAction) !=
+               0 {
                 println!("Function verify failed");
             }
         }
@@ -108,14 +112,15 @@ impl LLVMEmit {
             Var(ref vn) => {
                 let var_name = vn.as_str();
                 match symbols.lookup(&var_name) {
-                    Some(v) => {
-                        self.0.builder.load(v, var_name)
-                    }
+                    Some(v) => self.0.builder.load(v, var_name),
                     // It must be a global definition because of type check
                     None => {
                         let llvm_type = self.0.get_llvm_type(term.ref_scheme().body());
-                        self.0.module.get_or_add_function(var_name, &llvm_type).into_value()
-                    },
+                        self.0
+                            .module
+                            .get_or_add_function(var_name, &llvm_type)
+                            .into_value()
+                    }
                 }
             }
             Binary(op, ref lhs, ref rhs) => {
@@ -148,7 +153,8 @@ impl LLVMEmit {
             ApplyCls(ref callee, ref args) => {
                 let callee_ref = self.gen_expr(callee, symbols).into_function();
 
-                let mut argsv: Vec<_> = args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+                let mut argsv: Vec<_> =
+                    args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
                 let name = self.0.new_symbol_string();
                 self.0.builder.call(&callee_ref, &mut argsv, name.as_str())
             }
@@ -170,13 +176,8 @@ impl LLVMEmit {
             If(_, _, _) => unimplemented!(),
         }
     }
-
 }
 
 impl EmitProvider for LLVMCodegen {
-    fn gen_module<T>(&mut self, module: T)
-        where T: IntoIterator<Item=Definition>
-    {
-
-    }
+    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = Definition> {}
 }

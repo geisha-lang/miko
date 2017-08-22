@@ -96,7 +96,6 @@ pub enum Type {
 impl Type {
     pub fn product(left: Type, right: Type) -> Type {
         Type::Prod(P(left), P(right))
-        // Type::Comp(P(Type::Con("->".to_string())))
     }
     pub fn compose(callee: Type, arg: Type) -> Type {
         Type::Comp(P(callee), P(arg))

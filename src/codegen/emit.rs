@@ -1,10 +1,9 @@
-
 use core::*;
 use types::*;
 use internal::*;
+use utils::*;
 
 use codegen::llvm::*;
-pub use codegen::llvm::{ VarEnv };
 
 use std::ops::Deref;
 
@@ -15,31 +14,30 @@ pub trait EmitProvider {
 }
 
 pub struct LLVMEmit(LLVMCodegen);
+pub type VarEnv<'a> = SymTable<'a, &'a str, LLVMValue>;
 
 impl LLVMEmit {
     pub fn new(name: &str) -> Self {
         LLVMEmit(LLVMCodegen::new(name))
     }
     pub fn dump(&mut self) {
-        unsafe {
-            LLVMDumpModule(self.0.module);
-        }
+        self.0.module.dump()
     }
     pub fn gen_top_level(&mut self, def: &Definition, prelude: &VarEnv) {
         unsafe {
             // A global function definition
             let fun_type = def.ref_type();
-            let fun = self.0.get_or_add_function(def.name(), fun_type);
-            println!("{:?}", fun_type);
+            let llvm_fun_type = self.0.get_llvm_type(fun_type);
+            let fun = self.0.module.get_or_add_function(def.name(), &llvm_fun_type);
 
             // Check redefinition
-            if LLVMCountBasicBlocks(fun) != 0 {
+
+            if fun.count_basic_blocks() != 0 {
                 panic!("Redefinition of function");
             }
+            let block = self.0.context.append_basic_block(&fun, "entry");
 
-            let bb = LLVMAppendBasicBlockInContext(self.0.context, fun, raw_string("entry"));
-
-            LLVMPositionBuilderAtEnd(self.0.builder, bb);
+            self.0.builder.set_position_at_end(&block);
 
             // Create a sub environment for current function generating
             let mut symtbl = prelude.sub_env();
@@ -59,43 +57,33 @@ impl LLVMEmit {
             // Spread length
             let len_head = params_ref.len();
 
-//            let paramc = LLVMCountParams(fun) as usize;
-            // LLVM parameter counts should be the sum
-//            if paramc != len_head + last_type_flat.len() + 1 {
-//                eprintln!("expected {:?}, found {:?}", paramc, len_head + last_type_flat.len() + 1);
-//                panic!("Redefinition of function with different argument count");
-//            }
             // For each parameter, set argument name,
             //   create store instruction, add to
             //   symbol table.
             for (i, &VarDecl(ref pname, ref ptype)) in params_ref.into_iter().enumerate() {
-                let llarg = LLVMGetParam(fun, i as c_uint);
-                // let lltype = self.get_llvm_type(ptype.body());
-                LLVMSetValueName(llarg, raw_string(pname.as_str()));
+                let arg = fun.get_param(i);
+                arg.set_name(pname.as_str());
 
-                let alloca = self.0.create_entry_block_alloca(fun, pname.as_str(), ptype.body());
+                let alloca = self.0.create_entry_block_alloca(&fun, pname.as_str(), ptype.body());
 
-                LLVMBuildStore(self.0.builder, llarg, alloca);
+                self.0.builder.store(&arg, &alloca);
                 symtbl.insert(pname.as_str(), alloca);
             }
 
             if let Some(&VarDecl(ref last_name, ref _last_type)) = last_param {
-//                let last_type =
                 let last_type_flat = _last_type.body().prod_to_vec();
                 // Handle the last parameter
-                let last_alloca = self.0.create_entry_block_alloca(fun, last_name.as_str(), _last_type.body());
+                let last_alloca = self.0.create_entry_block_alloca(&fun, last_name.as_str(), _last_type.body());
                 println!("fuck: {:?}", last_type_flat.clone());
                 for (i, ty) in last_type_flat.into_iter().enumerate() {
                     let idx_name = i.to_string();
-                    let llarg = LLVMGetParam(fun, (i + len_head) as c_uint);
-                    let argname = last_name.clone() + idx_name.as_str();
-                    LLVMSetValueName(llarg, raw_string(argname.as_str()));
-
-                    let field = LLVMBuildStructGEP(self.0.builder, last_alloca, i as c_uint, raw_string(idx_name.as_str()));
-                    LLVMBuildStore(self.0.builder, llarg, field);
+                    let arg = fun.get_param(i + len_head);
+                    let arg_name = last_name.clone() + idx_name.as_str();
+                    arg.set_name(arg_name.as_str());
+                    let field = self.0.builder.struct_field(&last_alloca, i as u32, idx_name.as_str());
+                    self.0.builder.store(&arg, &field);
                 }
             }
-
 
 
 
@@ -103,9 +91,9 @@ impl LLVMEmit {
             // TODO: return pointer instead of stack value for structure type
 
             let fun_body = self.gen_expr(def.body(), &mut symtbl);
-            LLVMBuildRet(self.0.builder, fun_body);
+            self.0.builder.ret(&fun_body);
 
-            if LLVMVerifyFunction(fun, LLVMVerifierFailureAction::LLVMPrintMessageAction) != 0 {
+            if LLVMVerifyFunction(fun.raw_ptr(), LLVMVerifierFailureAction::LLVMPrintMessageAction) != 0 {
                 println!("Function verify failed");
             }
         }
@@ -113,7 +101,7 @@ impl LLVMEmit {
     pub unsafe fn gen_expr<'a: 'b, 'b>(&mut self,
                                        term: &'a TaggedTerm,
                                        symbols: &mut VarEnv<'b>)
-                                       -> LLVMValueRef {
+                                       -> LLVMValue {
         use self::Term::*;
         match *term.body() {
             Lit(ref lit) => self.0.gen_lit(lit),
@@ -121,29 +109,30 @@ impl LLVMEmit {
                 let var_name = vn.as_str();
                 match symbols.lookup(&var_name) {
                     Some(v) => {
-                        LLVMBuildLoad(self.0.builder, *v, raw_string(var_name))
+                        self.0.builder.load(v, var_name)
                     }
                     // It must be a global definition because of type check
-                    None => self.0.get_or_add_function(var_name, term.ref_scheme().body()),
+                    None => {
+                        let llvm_type = self.0.get_llvm_type(term.ref_scheme().body());
+                        self.0.module.get_or_add_function(var_name, &llvm_type).into_value()
+                    },
                 }
             }
             Binary(op, ref lhs, ref rhs) => {
                 let lval = self.gen_expr(lhs, symbols);
                 let rval = self.gen_expr(rhs, symbols);
-                let instr = get_llvm_op(op, lhs.ref_scheme().body());
 
-                instr(self.0.builder, lval, rval, self.0.new_symbol().unwrap().into_raw())
+                self.0.bin_operator(op, lval, rval, lhs.ref_scheme().body())
             }
             Let(ref var_decl, ref val, ref exp) => {
                 let &VarDecl(ref var, ref tyvar) = var_decl;
                 let var_name = var.as_str();
-
-                let blk = LLVMGetInsertBlock(self.0.builder);
-                let fun = LLVMGetBasicBlockParent(blk);
+                let block = self.0.builder.insert_block();
+                let fun = block.get_parent();
 
                 let init = self.gen_expr(val, symbols);
-                let alloca = self.0.create_entry_block_alloca(fun, var_name, tyvar.body());
-                LLVMBuildStore(self.0.builder, init, alloca);
+                let alloca = self.0.create_entry_block_alloca(&fun, var_name, tyvar.body());
+                self.0.builder.store(&init, &alloca);
 
                 let old = symbols.insert(var_name, alloca);
 
@@ -157,20 +146,11 @@ impl LLVMEmit {
                 res
             }
             ApplyCls(ref callee, ref args) => {
-                // let funty = self.get_fun_type(callee.deref().tag.ref_scheme());
-                let callee_ref = self.gen_expr(callee, symbols);
+                let callee_ref = self.gen_expr(callee, symbols).into_function();
 
-                let mut argsv = vec![];
-                for arg in args.iter() {
-                    // TODO: unpack tuple
-                    argsv.push(self.gen_expr(arg, symbols));
-                }
-
-                LLVMBuildCall(self.0.builder,
-                              callee_ref,
-                              argsv.as_mut_ptr(),
-                              argsv.len() as c_uint,
-                              self.0.new_symbol().unwrap().into_raw())
+                let mut argsv: Vec<_> = args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+                let name = self.0.new_symbol_string();
+                self.0.builder.call(&callee_ref, &mut argsv, name.as_str())
             }
             Block(ref fs) => {
                 let mut it = fs.iter();

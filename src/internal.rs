@@ -131,7 +131,7 @@ pub enum UnOp {
 }
 
 impl UnOp {
-    pub fn to_string(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match *self {
             UnOp::Not => "!",
             UnOp::Neg => "-",

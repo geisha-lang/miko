@@ -16,23 +16,41 @@ type Node = Box<TaggedTerm>;
 
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct Definition {
+pub struct TypeDef {
+    name: Name,
+    params: Vec<Name>,
+    body: TypeKind
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum TypeKind {
+    Alias(P<Scheme>),
+    Algebra(Vec<Variant>)
+}
+
+impl TypeDef {
+    pub fn new(name: String, params: Vec<Name>, body: TypeKind) -> Self {
+        TypeDef { name, params, body }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct FunDef {
     name: Name,
     params: Vec<VarDecl>,
     freevars: Vec<VarDecl>,
     body: Node,
     ty: Scheme, 
-//    inst: Option<HashMap<String, Term>>,
 }
 
-impl Definition {
+impl FunDef {
     pub fn new(name: String,
                ty: Scheme,
                params: Vec<VarDecl>,
                freevars: Vec<VarDecl>,
                body: TaggedTerm)
-               -> Definition {
-        Definition {
+               -> FunDef {
+        FunDef {
             name: name,
             params: params,
             freevars: freevars,

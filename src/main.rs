@@ -47,7 +47,7 @@ fn repl() {
                 println!("Typed AST:");
                 println!("{:?}", res);
                 println!("Core term:");
-                let top = K::go(res);
+                let (top, tys) = K::go(res);
                 println!("{:?}", top);
                 println!("LLVM IR:");
                 for def in top.values() {
@@ -63,9 +63,5 @@ fn repl() {
 }
 
 fn main() {
-    // println!("{:?}", type_term(Span::new("(a) * ASDBCa * Fuck * Shit * c")));
-    // println!("{:?}", type_factor(Span::new("shit")));
-    // println!("{:?}", type_factor(Span::new("Fuck")));
-    // println!("{:?}", type_expr(Span::new("a")));
     repl();
 }

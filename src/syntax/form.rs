@@ -89,8 +89,8 @@ impl Def {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Item {
     Form(E),
-    Alias(P<Scheme>),
-    Alg(Vec<Variant>),
+    Alias(Vec<Name>, P<Scheme>),
+    Alg(Vec<Name>, Vec<Variant>),
 }
 
 

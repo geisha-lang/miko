@@ -9,7 +9,7 @@ use std::ops::Deref;
 
 
 pub trait EmitProvider {
-    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = Definition>;
+    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item =FunDef>;
 }
 
 pub struct LLVMEmit(LLVMCodegen);
@@ -22,7 +22,7 @@ impl LLVMEmit {
     pub fn dump(&mut self) {
         self.0.module.dump()
     }
-    pub fn gen_top_level(&mut self, def: &Definition, prelude: &VarEnv) {
+    pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
         unsafe {
             // A global function definition
             let fun_type = def.ref_type();
@@ -70,13 +70,13 @@ impl LLVMEmit {
                 symtbl.insert(pname.as_str(), alloca);
             }
 
-            if let Some(&VarDecl(ref last_name, ref _last_type)) = last_param {
-                let last_type_flat = _last_type.body().prod_to_vec();
+            if let Some(&VarDecl(ref last_name, ref last_type)) = last_param {
+                let flatten_count = last_type.body().prod_to_vec().len();
                 // Handle the last parameter
                 let last_alloca =
-                    self.0.create_entry_block_alloca(&fun, last_name.as_str(), _last_type.body());
-                println!("fuck: {:?}", last_type_flat.clone());
-                for (i, ty) in last_type_flat.into_iter().enumerate() {
+                    self.0.create_entry_block_alloca(&fun, last_name.as_str(), last_type.body());
+                // println!("fuck: {:?}", last_type_flat.clone());
+                for i in 0..flatten_count {
                     let idx_name = i.to_string();
                     let arg = fun.get_param(i + len_head);
                     let arg_name = last_name.clone() + idx_name.as_str();
@@ -179,5 +179,5 @@ impl LLVMEmit {
 }
 
 impl EmitProvider for LLVMCodegen {
-    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = Definition> {}
+    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item =FunDef> {}
 }

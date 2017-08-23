@@ -18,31 +18,28 @@ use core::term::*;
 pub struct K {
     count: usize,
     env: HashMap<String, Scheme>,
-    global: HashMap<String, P<Definition>>,
-    cur_name: String,
+    global: HashMap<String, P<FunDef>>,
+    types: HashMap<String, P<TypeDef>>,
+    current: String,
 }
 
 impl K {
     /// Do transformation on a syntax module,
     /// generate core term representation
-    pub fn go<I>(module: I) -> HashMap<String, P<Definition>>
+    pub fn go<I>(module: I) -> (HashMap<String, P<FunDef>>, HashMap<String, P<TypeDef>>)
         where I: IntoIterator<Item = P<Def>>
     {
-        let mut runner = K {
-            count: 0,
-            env: HashMap::new(),
-            global: HashMap::new(),
-            cur_name: "".to_string(),
-        };
+        let mut runner = K::default();
         {
             let b = &mut runner;
 
             for def in module.into_iter() {
-                b.convert_fun_def(*def);
+                b.convert_def(*def);
             }
         }
 
-        runner.global
+        let K { global, types, .. } = runner;
+        (global, types)
     }
 
     /// Get a unique id, then increase the counter
@@ -58,19 +55,18 @@ impl K {
 
     /// Generate a name for closure
     fn make_cls_name(&mut self, bound: &str) -> String {
-        self.cur_name.clone() + "$closure$" + bound + self.unique().to_string().as_str()
+        self.current.clone() + "$closure$" + bound + self.unique().to_string().as_str()
     }
 
     /// Convert a global definition to term
-    fn convert_fun_def(&mut self, def: Def) {
+    fn convert_def(&mut self, def: Def) {
         let Def { ident, node, .. } = def;
         match node {
-            Item::Form(form) => {
-                let _form = *form;
-                let Form { node, tag } = _form;
+            Item::Form(box form) => {
+                let Form { node, tag } = form;
                 let ty = tag.ty;
-                self.cur_name = ident;
-                let def_name = self.cur_name.clone();
+                self.current = ident;
+                let def_name = self.current.clone();
 
                 match node {
                     Expr::Abs(lambda) => {
@@ -82,7 +78,14 @@ impl K {
                     _ => unreachable!(),
                 }
             }
-            _ => {}
+            Item::Alg(ps, vs) => {
+                let d = box TypeDef::new(ident.clone(), ps, TypeKind::Algebra(vs));
+                self.types.insert(ident, d);
+            }
+            Item::Alias(ps, t) => {
+                let d = box TypeDef::new(ident.clone(), ps, TypeKind::Alias(t));
+                self.types.insert(ident, d);
+            }
         }
     }
 
@@ -91,10 +94,10 @@ impl K {
                              name: String,
                              ty: Scheme,
                              params: Vec<VarDecl>,
-                             freevars: Vec<VarDecl>,
+                             free: Vec<VarDecl>,
                              body: TaggedTerm)
                              -> (&'b str, Vec<&'b str>) {
-        let fun = Definition::new(name.clone(), ty, params, freevars, body);
+        let fun = FunDef::new(name.clone(), ty, params, free, body);
         let ent = self.global.entry(name).or_insert(P(fun));
         (&(*ent).name(),
          (*ent)

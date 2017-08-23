@@ -101,7 +101,7 @@ impl Type {
         Type::Comp(P(callee), P(arg))
     }
 
-    pub fn product_n<'a, I>(ts: I) -> Type
+    pub fn product_n<I>(ts: I) -> Type
         where I: IntoIterator<Item = Type>,
               <I as IntoIterator>::IntoIter: DoubleEndedIterator
     {
@@ -111,6 +111,18 @@ impl Type {
         let mut res = last;
         for ty in it {
             res = Type::Prod(P(ty), P(res));
+        }
+        res
+    }
+    pub fn compose_n<I>(ts: I) -> Type
+        where I: IntoIterator<Item = Type>
+    {
+
+        let mut it = ts.into_iter();
+        let last = it.next().unwrap();
+        let mut res = last;
+        for ty in it {
+            res = Type::Comp(box res, box ty);
         }
         res
     }

@@ -60,12 +60,10 @@ pub fn is_primitive_type(t: &Type) -> bool {
 
 impl LLVMCodegen {
     pub fn new(name: &str) -> LLVMCodegen {
-        unsafe {
-            let context = LLVMContext::new();
-            let module = LLVMModule::in_ctx(name, &context);
-            let builder = LLVMBuilder::in_ctx(&context);
-            LLVMCodegen { module, context, builder, unique: 0 }
-        }
+        let context = LLVMContext::new();
+        let module = LLVMModule::in_ctx(name, &context);
+        let builder = LLVMBuilder::in_ctx(&context);
+        LLVMCodegen { module, context, builder, unique: 0 }
     }
 
 
@@ -114,8 +112,8 @@ impl LLVMCodegen {
             }
             &Arr(box ref p, box ref ret) => {
                 // Type of parameters and returned value should be pointer if not primitive
-                let mut cls_type = self.get_closure_type().get_ptr(0);
-                let mut retty = self.get_llvm_type_or_ptr(ret);
+                let cls_type = self.get_closure_type().get_ptr(0);
+                let retty = self.get_llvm_type_or_ptr(ret);
                 let psty = p.prod_to_vec();
                 let mut llvm_psty: Vec<_> =
                     psty.into_iter().map(|t| self.get_llvm_type_or_ptr(t)).collect();
@@ -124,7 +122,7 @@ impl LLVMCodegen {
             }
             &Void => self.context.get_void_type(),
             &Prod(..) => {
-                let mut tys: Vec<_> = ty.prod_to_vec()
+                let tys: Vec<_> = ty.prod_to_vec()
                     .iter()
                     .map(|t| self.get_llvm_type(t))
                     .collect();

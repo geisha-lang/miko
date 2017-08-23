@@ -1,0 +1,307 @@
+use std::str::FromStr;
+
+use syntax::form::*;
+use internal::*;
+use types::*;
+use utils::*;
+use super::{ escape_string, make_spanned_binexpr };
+
+#![arguments(interner: &mut Interner)]
+
+
+// Lexer helpers
+
+whitespace = #quiet<[ \n\r\t]*>
+whitespace_inline = #quiet<[ \t]*>
+
+keywords = "def" / "if" / "else" / "let" / "in" / "type" / "data"
+
+lexeme<X>
+    = whitespace !keywords token:X { token }
+
+reserved<X>
+    = whitespace r:X !identifier_char { r }
+
+parens<X>
+    = lexeme<"("> t:X lexeme<")"> { t }
+
+spanned<X>
+    = start:#position p:X end:#position {
+        let span = Span::new(start, end);
+        (span, p)
+    }
+
+identifier_char
+    = [a-zA-Z0-9_\x80-\xff]
+
+string_content -> &'input str = $(((!"\"" .) / "\\\"")*)
+
+// Lex rules
+
+identifier -> &'input str
+    = lexeme<$([a-zA-Z_\x80-\xff] identifier_char*)>
+
+type_constant_identifier -> &'input str
+    = lexeme<$([A-Z] identifier_char*)>
+
+type_variable_identifier -> &'input str
+    = lexeme<$([a-z] identifier_char*)>
+
+integer -> &'input str
+    = lexeme<$([1-9][0-9]*)>
+
+float -> &'input str
+    = lexeme<$("-"?[0-9]"."[0-9]+("e" "-"? [1-9][0-9]*)?)>
+
+string -> &'input str
+    = lexeme<"\"" s:string_content "\"" {s}>
+
+
+// Top level definition
+definition_delimite = whitespace_inline (";" / "\n" / "\r\n")
+
+pub module -> Vec<Def>
+    = d:(definition+) whitespace { d }
+
+pub definition -> Def
+    = t:forward_declaration definition_delimite* d:spanned<form_definition> {?
+        let (forward_name, scm) = t;
+        let (span, (name, mut form)) = d;
+        if forward_name == name {
+            form.tag.annotate = Some(scm);
+            Ok(Def::value(span, name, box form))
+        } else {
+            Err("Forward declaration should be followed by it's definition")
+        }
+        
+    }
+    / d:spanned<form_definition> {
+        let (span, (name, mut form)) = d;
+        Def::value(span, name, box form)
+    }
+    / type_definition
+
+forward_declaration -> (Name, Scheme)
+    = n:identifier lexeme<":"> t:type_scheme { (n.to_string(), t) }
+
+form_definition -> (Name, Form)
+    = value_definition
+    / function_definition
+
+value_definition -> (Name, Form)
+    = reserved<"def"> name:identifier lexeme<"="> value:expression { (name.to_string(), value) }
+
+function_definition -> (Name, Form)
+    = reserved<"def"> name:identifier
+      lexeme<"("> ps:parameter_sequence lexeme<")">
+      lexeme<"="> body:expression {
+          let span = body.tag.pos.clone();
+          let lambda = Expr::Abs(Lambda { param: ps, body: box body });
+          (name.to_string(), Form::new(span, lambda))
+      }
+
+type_definition -> Def
+    = reserved<"type"> a:spanned<type_alias> {
+        let (span, (name, item)) = a;
+        Def {
+            ident: name,
+            pos: span,
+            node: item
+        }
+    }
+    / reserved<"data"> a:spanned<type_algebra> {
+        let (span, (name, item)) = a;
+        Def {
+            ident: name,
+            pos: span,
+            node: item
+        }
+    }
+
+type_alias -> (Name, Item)
+    = n:type_constant_identifier p:type_parameter_sequence lexeme<"="> a:type_scheme {
+        let param = p.into_iter().map(|s| s.to_string()).collect();
+        (n.to_string(), Item::Alias(param, box a))
+    }
+
+type_algebra -> (Name, Item)
+    = n:type_constant_identifier p:type_parameter_sequence
+      lexeme<"{"> v:(type_algebra_variant ++ lexeme<",">) lexeme<"}"> {
+         let param = p.into_iter().map(|s| s.to_string()).collect();
+         (n.to_string(), Item::Alg(param, v))
+      }
+
+type_algebra_variant -> Variant
+    = n:identifier ts:parens<type_expression ++ lexeme<",">> {
+        let body = ts.into_iter().enumerate().map(|(i, t)| Field { name: None, ty: box t }).collect();
+        Variant { name: n.to_string(), body: VariantBody::Tuple(body) }
+    }
+    / n:identifier fs:struct_fields {
+        Variant { name: n.to_string(), body: VariantBody::Struct(fs) }
+    }
+
+struct_fields -> Vec<Field>
+    = lexeme<"{"> fs:(struct_field_declaration ++ lexeme<",">) lexeme<"}"> { fs }
+
+struct_field_declaration -> Field
+    = n:identifier lexeme<":"> t:type_expression {
+        Field { name: Some(n.to_string()), ty: box t }
+    }
+
+// Type scheme
+
+type_parameter_sequence -> Vec<&'input str>
+    = type_variable_identifier ** whitespace
+
+type_constant -> Type
+    = n:type_constant_identifier { Type::Con(n.to_string()) }
+
+type_variable -> Type
+    = n:type_variable_identifier { Type::Var(n.to_string()) }
+
+type_factor -> Type
+    = v:type_composition { Type::compose_n(v) }
+    / parens<type_expression>
+
+type_terminal -> Type
+    = type_constant / type_variable
+
+type_composition -> Vec<Type>
+    = type_terminal ++ whitespace
+
+
+pub type_expression -> Type
+    = #infix<type_factor> {
+        #R lhs lexeme<"->"> rhs { Type::Arr(box lhs, box rhs) }
+        #R lhs lexeme<"*"> rhs { Type::Prod(box lhs, box rhs) }
+    }
+
+type_binders -> Vec<&'input str>
+    = type_variable_identifier ++ lexeme<",">
+
+pub type_scheme -> Scheme
+    = reserved<"forall"> f:(type_variable_identifier*) lexeme<"."> b:type_expression {
+        let binders = f.into_iter().map(|s| s.to_string()).collect();
+        Scheme::Poly(binders, b)
+    }
+    / b:type_expression { Scheme::Mono(b) }
+
+
+// Expression form
+
+spanned_form<E> = _e: spanned<E> {
+    let (s, e) = _e;
+    Form::new(s, e)
+}
+
+
+pub expression -> Form
+    = #infix<form_factor> {
+        #L lhs lexeme<"||"> rhs { make_spanned_binexpr(BinOp::Or, lhs, rhs) }
+        #L lhs lexeme<"&&"> rhs { make_spanned_binexpr(BinOp::And, lhs, rhs) }
+        #L lhs lexeme<"<="> rhs { make_spanned_binexpr(BinOp::Le, lhs, rhs) }
+           lhs lexeme<">="> rhs { make_spanned_binexpr(BinOp::Ge, lhs, rhs) }
+           lhs lexeme<"<"> rhs { make_spanned_binexpr(BinOp::Lt, lhs, rhs) }
+           lhs lexeme<">"> rhs { make_spanned_binexpr(BinOp::Gt, lhs, rhs) }
+           lhs lexeme<"=="> rhs { make_spanned_binexpr(BinOp::Eq, lhs, rhs) }
+           lhs lexeme<"!="> rhs { make_spanned_binexpr(BinOp::Ne, lhs, rhs) }
+        #L lhs lexeme<"+"> rhs { make_spanned_binexpr(BinOp::Add, lhs, rhs) }
+           lhs lexeme<"-"> rhs { make_spanned_binexpr(BinOp::Sub, lhs, rhs) }
+        #L lhs lexeme<"*"> rhs { make_spanned_binexpr(BinOp::Mul, lhs, rhs) }
+           lhs lexeme<"/"> rhs { make_spanned_binexpr(BinOp::Div, lhs, rhs) }
+           lhs lexeme<"%"> rhs { make_spanned_binexpr(BinOp::Rem, lhs, rhs) }
+    }
+
+form_factor -> Form
+    = start:#position h:_form_factor t:_apply* {
+        let mut f = h;
+        for (end, app) in t {
+            let param = app.into_iter().map(|e| box e).collect();
+            let span = Span::new(start, end);
+            f = Form::new(span, Expr::Apply(box f, param))
+        }
+        f
+    }
+
+_form_factor -> Form
+    = spanned_form<factor_expr> / parens<expression>
+
+factor_expr -> Expr
+    = ifelse / letin / lambda / lit / var / list / block
+
+ifelse -> Expr
+    = reserved<"if"> c:parens<expression>
+      t:expression reserved<"else"> f:expression {
+          Expr::If(box c, box t, box f)
+      }
+
+letin -> Expr
+    = reserved<"let"> v:variable_declaration lexeme<"="> val:expression
+      reserved<"in"> e:expression {
+        Expr::Let(v, box val, box e)
+    }
+
+lambda -> Expr
+    = p:parens<parameter_sequence> lexeme<"->"> to:expression {
+        Expr::Abs(Lambda { param: p, body: box to })
+    }
+
+var -> Expr
+    = n:identifier { Expr::Var(n.to_string()) }
+
+list -> Expr
+    = lexeme<"["> l:(expression ** lexeme<",">) lexeme<"]"> {
+        Expr::List(l.into_iter().map(|e| box e).collect())
+    }
+block -> Expr
+    = lexeme<"{"> l:(expression ** lexeme<",">) lexeme<"}"> {
+        Expr::Block(l.into_iter().map(|e| box e).collect())
+    }
+
+lit -> Expr
+    = float_lit / integer_lit / string_lit / bool_lit
+
+float_lit -> Expr = f:float {?
+    f64::from_str(f).and_then(|v| Ok(Expr::Lit(Lit::Float(v))))
+        .or_else(|_| Err("Parse float failed"))
+}
+
+integer_lit -> Expr = i:integer {?
+    i32::from_str(i)
+        .and_then(|v| Ok(Expr::Lit(Lit::Int(v))))
+        .or_else(|_: ::std::num::ParseIntError| {
+            f64::from_str(i).and_then(|v| Ok(Expr::Lit(Lit::Float(v))))
+                .or_else(|_| Err("Parse integer failed"))
+        })
+}
+
+string_lit -> Expr
+    = s:string {?
+        escape_string(s)
+            .and_then(|s| Ok(Expr::Lit(Lit::Str(s))))
+            .or_else(|_| Err("Parse string failed"))
+    }
+
+bool_lit -> Expr
+    = b:lexeme<$("true" / "false")> {
+        Expr::Lit(Lit::Bool(match b {
+            "true" => true,
+            "false" => false,
+            _ => unreachable!()
+        }))
+    }
+
+_apply -> (usize, Vec<Form>)
+    = l:parens<apply_list> end:#position { (end, l) }
+
+apply_list -> Vec<Form>
+    = expression ** lexeme<",">
+
+parameter_sequence -> Vec<VarDecl> = variable_declaration ** lexeme<",">
+variable_declaration -> VarDecl
+    = n:identifier lexeme<":"> t:type_expression {
+        VarDecl(n.to_string(), Scheme::Mono(t))
+    }
+    / n:identifier { VarDecl(n.to_string(), Scheme::Slot) }
+
+

@@ -1,5 +1,6 @@
 use std::string::*;
 
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::ops::DerefMut;
 
@@ -8,6 +9,35 @@ use std::iter::DoubleEndedIterator;
 
 use utils::*;
 use types::*;
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Identifier(usize);
+
+pub struct Interner {
+    forward: HashMap<String, Identifier>,
+    backward: Vec<String>
+}
+
+impl Interner {
+    pub fn new() -> Interner {
+        Interner { forward: HashMap::new(), backward: Vec::new() }
+    }
+
+    pub fn intern(&mut self, s: &str) -> Identifier {
+        if let Some(&id) = self.forward.get(s) { id } else {
+            let id = Identifier(self.backward.len());
+            self.backward.push(s.to_owned());
+            self.forward.insert(s.to_owned(), id);
+            id
+        }
+    }
+
+    pub fn trace(&self, i: usize) -> Option<&str> {
+        self.backward.get(i).map(|s| s.as_str())
+    }
+}
+
+
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct VarDecl(pub Name, pub Scheme);
@@ -78,6 +108,8 @@ pub enum BinOp {
     Ge,
     /// The `>` operator (greater than)
     Gt,
+    /// `.`
+    Dot,
 }
 impl BinOp {
     pub fn as_str(&self) -> &'static str {
@@ -101,6 +133,7 @@ impl BinOp {
             Ne => "!=",
             Ge => ">=",
             Gt => ">",
+            Dot => ".",
         }
     }
     pub fn take(op_str: &str) -> BinOp {

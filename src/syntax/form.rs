@@ -19,7 +19,7 @@ pub type E = P<Form>;
 pub struct Def {
     pub ident: Name,
     pub node: Item,
-    pub pos: Pos,
+    pub pos: Span,
 }
 
 impl Def {
@@ -29,12 +29,12 @@ impl Def {
     }
 
     /// Create a definition node define a form (value).
-    pub fn value<S: ToString>(pos: Pos, name: S, body: E) -> P<Def> {
-        P(Def {
+    pub fn value<S: ToString>(pos: Span, name: S, body: E) -> Def {
+        Def {
               ident: name.to_string(),
               node: Item::Form(body),
               pos,
-          })
+        }
     }
 
     /// If this is a form define
@@ -106,7 +106,7 @@ pub struct Form {
 }
 
 impl Form {
-    pub fn new(pos: Pos, exp: Expr) -> Form {
+    pub fn new(pos: Span, exp: Expr) -> Form {
         Form {
             node: exp,
             tag: FormTag {
@@ -116,7 +116,7 @@ impl Form {
             },
         }
     }
-    pub fn typed(pos: Pos, ty: Scheme, exp: Expr) -> Form {
+    pub fn typed(pos: Span, ty: Scheme, exp: Expr) -> Form {
         Form {
             node: exp,
             tag: FormTag {
@@ -126,7 +126,7 @@ impl Form {
             },
         }
     }
-    pub fn annotated(pos: Pos, anno: Scheme, exp: Expr) -> Form {
+    pub fn annotated(pos: Span, anno: Scheme, exp: Expr) -> Form {
         Form {
             node: exp,
             tag: FormTag {
@@ -136,7 +136,7 @@ impl Form {
             },
         }
     }
-    pub fn abs(pos: Pos, params: Vec<VarDecl>, to: P<Form>) -> Form {
+    pub fn abs(pos: Span, params: Vec<VarDecl>, to: P<Form>) -> Form {
         Form {
             node: Expr::Abs(Lambda {
                                 param: params,
@@ -154,7 +154,7 @@ impl Form {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FormTag {
     /// Position in source
-    pub pos: Pos,
+    pub pos: Span,
     /// Type of node
     pub ty: Scheme,
     /// Annotate type
@@ -184,14 +184,20 @@ impl FormTag {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
-pub struct Pos {
-    line: usize,
-    col: usize,
+pub struct Span {
+    start: usize,
+    end: usize,
 }
 
-impl Pos {
-    pub fn new(l: usize, c: usize) -> Pos {
-        Pos { line: l, col: c }
+impl Span {
+    pub fn new(l: usize, c: usize) -> Span {
+        Span { start: l, end: c }
+    }
+    pub fn union(&self, s: &Span) -> Span {
+        Span {
+            start: self.start,
+            end: s.end
+        }
     }
 }
 

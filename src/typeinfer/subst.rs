@@ -25,6 +25,7 @@ impl Substituable for Type {
         match self {
             Arr(left, right) => Arr(P((*left).apply(sub)), P((*right).apply(sub))),
             Prod(left, right) => Prod(P((*left).apply(sub)), P((*right).apply(sub))),
+            Comp(left, right) => Comp(P((*left).apply(sub)), P((*right).apply(sub))),
             Var(n) => {
                 if let Some(ref t) = sub.get(&n) {
                     (*t).clone()
@@ -44,6 +45,7 @@ impl Substituable for Type {
                 it
             }
             Arr(ref left, ref right) |
+            Comp(ref left, ref right) |
             Prod(ref left, ref right) => {
                 let mut it = left.ftv();
                 it.extend(right.ftv());

@@ -24,7 +24,7 @@ pub enum TypeError {
     NotInScope(Form),
     MisMatch(Type, Type),
     HighRank(Form),
-    UnknownOperator(BinOp, Pos),
+    UnknownOperator(BinOp, Span),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -301,7 +301,7 @@ impl Infer {
     /// Do type inference over top level definitions
     pub fn infer_defs<'a>(&mut self,
                       _env: &'a TypeEnv<'a>,
-                      program: &'a mut Vec<Box<Def>>)
+                      program: &'a mut Vec<Def>)
                       -> Result<(), TypeError> {
                 
         // Give each definitions a temporary type if no annotation
@@ -362,25 +362,24 @@ mod tests {
     use typeinfer::infer::*;
     use typeinfer::subst::*;
     use typeinfer::typeenv::*;
-    use syntax::*;
-    use parser::*;
+    use syntax::form::*;
+    use syntax::parser;
     use utils::*;
-    use pest::*;
+    use internal::*;
+    // use pest::*;
 
 
     fn parse_expr(src: &str) -> Form {
-        let mut parser = Rdp::new(StringInput::new(src));
-        parser.expr();
-        *parser.__expr()
+        parser::expression(src, &mut Interner::new()).unwrap()
     }
 
 
     fn form(e: Expr) -> P<Form> {
-        P(Form::new(Pos::new(0, 0), e))
+        P(Form::new(Span::new(0, 0), e))
     }
 
     fn fmty(t: Scheme, e: Expr) -> P<Form> {
-        P(Form::typed(Pos::new(0, 0), t, e))
+        P(Form::typed(Span::new(0, 0), t, e))
     }
 
     fn s(src: &'static str) -> String {
@@ -393,8 +392,8 @@ mod tests {
         let mut env = TypeEnv::new();
 
         assert_eq!(inf.infer(&mut env,
-                             &mut Form::new(Pos::new(0, 0), Expr::Lit(Lit::Int(123)))),
-                   Ok(&Scheme::Mono(P(Type::Con("Int".to_string())))));
+                             &mut Form::new(Span::new(0, 0), Expr::Lit(Lit::Int(123)))),
+                   Ok(&Scheme::Mono(Type::Con("Int".to_string()))));
     }
 
     #[test]
@@ -403,9 +402,9 @@ mod tests {
         use self::Scheme::*;
         use self::Type::*;
         let ty_op = Scheme::Poly(vec!["a".to_string()],
-                                 P(Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
+                                 Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
                                                           P(Type::Var("a".to_string())))),
-                                             P(Type::Var("a".to_string())))));
+                                             P(Type::Var("a".to_string()))));
         let PRIMITIVES: Vec<(&str, &Scheme)> = vec![("+", &ty_op)];
         let mut syn: Form = parse_expr("(a: Fuck, b) -> let c = a in { c + b }");
 
@@ -418,30 +417,46 @@ mod tests {
 
         syn.apply_mut(&sub);
 
-        assert_eq!(syn,
-                   *fmty(Mono(P(
-                       Arr(
-                           P(Prod(
-                               P(Con("Fuck".to_string())),
-                               P(Con("Fuck".to_string()))
-                           )),
-                           P(Con("Fuck".to_string()))
-                       ))),
-                         Abs(Lambda {
-                                 param: vec![VarDecl(s("a"), Scheme::con("Fuck")),
-                                             VarDecl(s("b"), Scheme::con("Fuck"))],
-                                 body: fmty(Scheme::con("Fuck"),
-                                            Let(VarDecl(s("c"), Mono(P(Type::Con(s("Fuck"))))),
-                                                fmty(Scheme::con("Fuck"), Expr::Var(s("a"))),
-                                                fmty(Scheme::con("Fuck"),
-                                                     Block(vec![fmty(Scheme::con("Fuck"),
-                                                                     Binary(BinOp::Add,
-                                                                            fmty(Scheme::con("Fuck"),
-                                                                                 Expr::Var(s("c"))),
-                                                                            fmty(Scheme::con("Fuck"),
-                                                                                 Expr::Var(s("b")))))])))),
-                             })));
-
+        assert_eq!(syn, Form::typed(
+            Span::new(0, 38),
+            parser::type_scheme("Fuck * Fuck -> Fuck", &mut Interner::new()).unwrap(),
+            Abs(Lambda {
+                param: vec![
+                    VarDecl("a".to_string(), Scheme::con("Fuck")),
+                    VarDecl("b".to_string(), Scheme::con("Fuck"))
+                ],
+                body: box Form::typed(
+                    Span::new(15, 38),
+                    Scheme::con("Fuck"),
+                    Let(
+                        VarDecl(s("c"), Mono(Type::Con(s("Fuck")))),
+                        box Form::typed(
+                            Span::new(23, 25),
+                            Scheme::con("Fuck"),
+                            Expr::Var(s("a"))
+                        ),
+                        box Form::typed(
+                            Span::new(28, 38),
+                            Scheme::con("Fuck"),
+                            Block(vec![
+                                box Form::typed(
+                                    Span::new(30, 36),
+                                    Scheme::con("Fuck"),
+                                    Binary(BinOp::Add,
+                                        box Form::typed(
+                                            Span::new(30, 32),
+                                            Scheme::con("Fuck"),
+                                            Expr::Var(s("c"))),
+                                        box Form::typed(
+                                            Span::new(34, 36),
+                                            Scheme::con("Fuck"),
+                                                Expr::Var(s("b")))))
+                            ])
+                        )
+                    )
+                )
+            })
+        ))
     }
 
 }

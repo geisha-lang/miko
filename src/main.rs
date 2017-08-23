@@ -5,7 +5,7 @@ use miko::types::*;
 use miko::typeinfer::*;
 use miko::codegen::emit::*;
 use miko::core::*;
-
+use miko::internal::*;
 use std::io;
 use std::io::Write;
 use std::ops::Deref;
@@ -25,7 +25,7 @@ fn repl() {
         if input.as_str() == ".quit\n" {
             break;
         }
-        let mut res: Vec<_> = parse(input.as_str()).into_iter().collect();
+        let mut res: Vec<_> = parse(input.as_str(), &mut Interner::new()).unwrap();
         println!("Parsed syntax tree:");
         println!("{:?}", res);
 
@@ -47,7 +47,7 @@ fn repl() {
                 println!("Typed AST:");
                 println!("{:?}", res);
                 println!("Core term:");
-                let (top, tys) = K::go(res);
+                let (top, _) = K::go(res);
                 println!("{:?}", top);
                 println!("LLVM IR:");
                 for def in top.values() {

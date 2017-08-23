@@ -2,12 +2,15 @@
 name = "miko"
 version = "0.1.0"
 authors = ["nameoverflow <i@hcyue.me>"]
+build = "build.rs"
 
 [dependencies]
-pest = "0.4"
 llvm-sys = "39"
 bytecount = "0.1.4"
 
 [features]
 avx-accel = ["bytecount/avx-accel"]
 simd-accel = ["bytecount/simd-accel"]
+
+[build-dependencies]
+peg = { version = "0.5" }

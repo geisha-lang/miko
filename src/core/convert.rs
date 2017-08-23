@@ -27,14 +27,14 @@ impl K {
     /// Do transformation on a syntax module,
     /// generate core term representation
     pub fn go<I>(module: I) -> (HashMap<String, P<FunDef>>, HashMap<String, P<TypeDef>>)
-        where I: IntoIterator<Item = P<Def>>
+        where I: IntoIterator<Item = Def>
     {
         let mut runner = K::default();
         {
             let b = &mut runner;
 
             for def in module.into_iter() {
-                b.convert_def(*def);
+                b.convert_def(def);
             }
         }
 

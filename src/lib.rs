@@ -10,14 +10,6 @@
 #![feature(box_syntax, box_patterns)]
  
 extern crate bytecount;
-#[macro_use]
-// extern crate nom;
-// extern crate regex;
-// extern crate memchr;
-// #[macro_use]
-// extern crate lazy_static;
-#[macro_use]
-extern crate pest;
 extern crate llvm_sys;
 extern crate libc;
 

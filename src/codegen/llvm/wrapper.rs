@@ -30,18 +30,36 @@ macro_rules! make_LLVM_wrapper {
                 self.0.clone()
             }
         }
+    };
+    ($origin:ty, $wrapper:ident, Copy) => {
+        #[derive(Debug, Clone, Copy)]
+        pub struct $wrapper($origin);
+        impl LLVMWrapper<$origin> for $wrapper {
+            fn from_ref(ptr: $origin) -> Self {
+                $wrapper(ptr)
+            }
+            fn raw_ptr(&self) -> $origin {
+                self.0.clone()
+            }
+        }
     }
 }
 
 make_LLVM_wrapper!(LLVMModuleRef, LLVMModule);
 make_LLVM_wrapper!(LLVMContextRef, LLVMContext);
-make_LLVM_wrapper!(LLVMValueRef, LLVMValue);
-make_LLVM_wrapper!(LLVMValueRef, LLVMFunction);
-make_LLVM_wrapper!(LLVMTypeRef, LLVMType);
+make_LLVM_wrapper!(LLVMValueRef, LLVMValue, Copy);
+make_LLVM_wrapper!(LLVMValueRef, LLVMFunction, Copy);
+make_LLVM_wrapper!(LLVMTypeRef, LLVMType, Copy);
 make_LLVM_wrapper!(LLVMBuilderRef, LLVMBuilder);
 make_LLVM_wrapper!(LLVMBasicBlockRef, LLVMBasicBlock);
 
-macro_rules! method_get_type {
+
+pub unsafe fn raw_string(s: &str) -> *mut c_char {
+    CString::new(s).unwrap().into_raw()
+}
+
+
+macro_rules! method_type_getter {
     ($name: ident, $fun: ident) => {
         pub fn $name(&self) -> LLVMType {
             unsafe {
@@ -51,22 +69,16 @@ macro_rules! method_get_type {
     };
 }
 
-pub unsafe fn raw_string(s: &str) -> *mut c_char {
-    CString::new(s).unwrap().into_raw()
-}
-
-
-
 impl LLVMContext {
     pub fn new() -> Self {
         unsafe { LLVMContext(LLVMContextCreate()) }
     }
-    method_get_type!(get_int1_type, LLVMInt1TypeInContext);
-    method_get_type!(get_int8_type, LLVMInt8TypeInContext);
-    method_get_type!(get_int16_type, LLVMInt16TypeInContext);
-    method_get_type!(get_int32_type, LLVMInt32TypeInContext);
-    method_get_type!(get_double_type, LLVMDoubleTypeInContext);
-    method_get_type!(get_void_type, LLVMVoidTypeInContext);
+    method_type_getter!(get_int1_type, LLVMInt1TypeInContext);
+    method_type_getter!(get_int8_type, LLVMInt8TypeInContext);
+    method_type_getter!(get_int16_type, LLVMInt16TypeInContext);
+    method_type_getter!(get_int32_type, LLVMInt32TypeInContext);
+    method_type_getter!(get_double_type, LLVMDoubleTypeInContext);
+    method_type_getter!(get_void_type, LLVMVoidTypeInContext);
 
     pub fn get_function_type(ret: &LLVMType, param: &Vec<LLVMType>, is_var_arg: bool) -> LLVMType {
         let mut ps: Vec<_> = param.iter().map(|t| t.raw_ptr()).collect();
@@ -160,6 +172,11 @@ impl LLVMValue {
     pub fn into_function(self) -> LLVMFunction {
         LLVMFunction::from_ref(self.0)
     }
+    pub fn get_type(&self) -> LLVMType {
+        unsafe {
+            LLVMType::from_ref(LLVMTypeOf(self.0))
+        }
+    }
 }
 
 impl LLVMFunction {
@@ -220,6 +237,7 @@ impl LLVMBuilder {
     method_build_instr!(load, LLVMBuildLoad, ptr: &LLVMValue => target: &str);
     method_build_instr!(store, LLVMBuildStore, val: &LLVMValue, ptr: &LLVMValue);
     method_build_instr!(ret, LLVMBuildRet, val: &LLVMValue);
+    method_build_instr!(bit_cast, LLVMBuildBitCast, val: &LLVMValue, dest_ty: &LLVMType => name: &str);
 
     pub fn call(&self, fun: &LLVMFunction, args: &mut Vec<LLVMValue>, name: &str) -> LLVMValue {
         let mut _args: Vec<_> = args.iter_mut().map(|arg| arg.raw_ptr()).collect();
@@ -234,9 +252,9 @@ impl LLVMBuilder {
 
     }
 
-    pub fn struct_field(&self, ptr: &LLVMValue, idx: u32, name: &str) -> LLVMValue {
+    pub fn struct_field_ptr(&self, ptr: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
         unsafe {
-            let ret = LLVMBuildStructGEP(self.raw_ptr(), ptr.raw_ptr(), idx, raw_string(name));
+            let ret = LLVMBuildStructGEP(self.raw_ptr(), ptr.raw_ptr(), idx as u32, raw_string(name));
             LLVMValue::from_ref(ret)
         }
     }

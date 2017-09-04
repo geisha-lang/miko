@@ -11,10 +11,10 @@ use utils::*;
 use types::*;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-pub struct Identifier(usize);
+pub struct Id(usize);
 
 pub struct Interner {
-    forward: HashMap<String, Identifier>,
+    forward: HashMap<String, Id>,
     backward: Vec<String>
 }
 
@@ -23,9 +23,9 @@ impl Interner {
         Interner { forward: HashMap::new(), backward: Vec::new() }
     }
 
-    pub fn intern(&mut self, s: &str) -> Identifier {
+    pub fn intern(&mut self, s: &str) -> Id {
         if let Some(&id) = self.forward.get(s) { id } else {
-            let id = Identifier(self.backward.len());
+            let id = Id(self.backward.len());
             self.backward.push(s.to_owned());
             self.forward.insert(s.to_owned(), id);
             id

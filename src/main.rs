@@ -27,7 +27,7 @@ fn repl() {
         }
         let mut res: Vec<_> = parse(input.as_str(), &mut Interner::new()).unwrap();
         println!("Parsed syntax tree:");
-        println!("{:?}", res);
+        println!("{:#?}", res);
 
         let ty_op = Scheme::Poly(vec!["a".to_string()],
                                  Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
@@ -45,17 +45,17 @@ fn repl() {
             Ok(_) => {
                 // let env = types.unwrap();
                 println!("Typed AST:");
-                println!("{:?}", res);
+                println!("{:#?}", res);
                 println!("Core term:");
                 let (top, _) = K::go(res);
-                println!("{:?}", top);
+                println!("{:#?}", top);
                 println!("LLVM IR:");
                 for def in top.values() {
                     generator.gen_top_level(def.deref(), &VarEnv::new());
                 }
                 generator.dump();
             }
-            Err(e) => println!("{:?}", e),
+            Err(e) => println!("{:#?}", e),
         }
 
 

@@ -157,7 +157,11 @@ impl Closure {
         }
     }
 
-    pub fn fv<'a>(&self) -> Vec<&str> {
+    pub fn fv(&self) -> Vec<&str> {
         (&self.actualFv).iter().map(|s| s.as_str()).collect()
+    }
+
+    pub fn entry(&self) -> &str {
+        self.entry.as_str()
     }
 }

@@ -63,7 +63,12 @@ impl LLVMCodegen {
         let context = LLVMContext::new();
         let module = LLVMModule::in_ctx(name, &context);
         let builder = LLVMBuilder::in_ctx(&context);
-        LLVMCodegen { module, context, builder, unique: 0 }
+        LLVMCodegen {
+            module,
+            context,
+            builder,
+            unique: 0,
+        }
     }
 
 
@@ -79,9 +84,16 @@ impl LLVMCodegen {
         f
     }
 
-    fn get_closure_type(&self) -> LLVMType {
-        let ptr = self.context.get_int8_type().get_ptr(0);
-        let mem = vec![self.context.get_int16_type(), ptr];
+    pub fn get_closure_type(&self) -> LLVMType {
+        // closure = [i8*, i8*]
+        let mut mem = vec![self.context.get_int8_type().get_ptr(0),
+                           self.context.get_int8_type().get_ptr(0)];
+        self.context.get_struct_type(&mem, false)
+    }
+
+    pub fn get_actual_cls_type(&self, fv_ty: &Vec<LLVMType>) -> LLVMType {
+        let mut mem = vec![self.context.get_int8_type().get_ptr(0),
+                           self.context.get_struct_type(&fv_ty, false)];
         self.context.get_struct_type(&mem, false)
     }
 
@@ -151,11 +163,11 @@ impl LLVMCodegen {
         unimplemented!()
     }
 
-    pub unsafe fn create_entry_block_alloca(&self,
-                                            fun: &LLVMFunction,
-                                            var_name: &str,
-                                            ty: &Type)
-                                            -> LLVMValue {
+    pub fn create_entry_block_alloca(&self,
+                                     fun: &LLVMFunction,
+                                     var_name: &str,
+                                     ty: &Type)
+                                     -> LLVMValue {
         let builder = LLVMBuilder::in_ctx(&self.context);
         let block = fun.get_entry_basic_block();
         let fi = block.get_first_instr();

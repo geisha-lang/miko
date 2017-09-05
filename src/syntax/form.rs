@@ -17,21 +17,21 @@ pub type E = P<Form>;
 /// `def` or `data` or `type`
 #[derive(Clone, PartialEq, Debug)]
 pub struct Def {
-    pub ident: Name,
+    pub ident: Id,
     pub node: Item,
     pub pos: Span,
 }
 
 impl Def {
     /// Get ident as `&str`
-    pub fn name(&self) -> &str {
-        self.ident.as_str()
+    pub fn name(&self) -> Id {
+        self.ident.clone()
     }
 
     /// Create a definition node define a form (value).
-    pub fn value<S: ToString>(pos: Span, name: S, body: E) -> Def {
+    pub fn value(pos: Span, name: Id, body: E) -> Def {
         Def {
-              ident: name.to_string(),
+              ident: name,
               node: Item::Form(body),
               pos,
         }
@@ -89,8 +89,8 @@ impl Def {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Item {
     Form(E),
-    Alias(Vec<Name>, P<Scheme>),
-    Alg(Vec<Name>, Vec<Variant>),
+    Alias(Vec<Id>, P<Scheme>),
+    Alg(Vec<Id>, Vec<Variant>),
 }
 
 
@@ -209,7 +209,7 @@ pub enum Expr {
     /// Literial value
     Lit(Lit),
     /// Identifier (binding/definition)
-    Var(Name),
+    Var(Id),
     /// List (array)
     /// e.g. `[fuck, shit]`
     List(Vec<E>),

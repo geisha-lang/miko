@@ -158,5 +158,5 @@ impl ToString for Type {
 }
 
 
-pub type TypeEnv<'a> = SymTable<'a, String, Scheme>;
+pub type TypeEnv<'a> = SymTable<'a, Id, Scheme>;
 

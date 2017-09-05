@@ -1,0 +1,7 @@
+[package]
+name = "libllvm"
+version = "0.1.0"
+authors = ["nameoverflow <i@hcyue.me>"]
+
+[dependencies]
+llvm-sys = "39"

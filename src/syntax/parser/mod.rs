@@ -1,5 +1,7 @@
 use internal::*;
 use syntax::form::*;
+use utils::*;
+
 fn escape_string(s: &str) -> Result<String, &str> {
     let mut cs = s.chars();
     let mut r = String::new();

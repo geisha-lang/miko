@@ -12,12 +12,16 @@ pub trait EmitProvider {
     fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = FunDef>;
 }
 
-pub struct LLVMEmit(LLVMCodegen);
-pub type VarEnv<'a> = SymTable<'a, &'a str, LLVMValue>;
+pub struct LLVMEmit<'i> {
+    generator: LLVMCodegen,
+    interner: &'i mut Interner,
+}
+
+pub type VarEnv<'a> = SymTable<'a, Id, LLVMValue>;
 
 fn with_var<'a, 'b: 'a, F, R>(
     sym: &mut VarEnv<'a>,
-    var: &'b str,
+    var: Id,
     val: LLVMValue,
     mut cb: F) -> R
     where F: FnMut(&mut VarEnv<'a>) -> R
@@ -33,25 +37,29 @@ fn with_var<'a, 'b: 'a, F, R>(
 }
 
 
-impl LLVMEmit {
-    pub fn new(name: &str) -> Self {
-        LLVMEmit(LLVMCodegen::new(name))
+impl<'i> LLVMEmit<'i> {
+    pub fn new(name: &str, interner: &'i mut Interner) -> Self {
+        LLVMEmit {
+            generator: LLVMCodegen::new(name),
+            interner
+        }
     }
     pub fn dump(&mut self) {
-        self.0.module.dump()
+        self.generator.module.dump()
     }
     pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
         // A global function definition
         let fun_type = def.ref_type();
-        let llvm_fun_type = self.0.get_llvm_type(fun_type);
-        let fun = self.0.module.get_or_add_function(def.name(), &llvm_fun_type);
+        let llvm_fun_type = self.generator.get_llvm_type(fun_type);
+        let def_name = def.name();
+        let fun = self.generator.module.get_or_add_function(def_name, &llvm_fun_type);
 
         // Check redefinition
 
         if fun.count_basic_blocks() != 0 {
             panic!("Redefinition of function");
         }
-        let block = self.0.context.append_basic_block(&fun, "entry");
+        let block = self.generator.context.append_basic_block(&fun, "entry");
 
         self.builder().set_position_at_end(&block);
 
@@ -78,14 +86,14 @@ impl LLVMEmit {
         //   create store instruction, add to
         //   symbol table.
         for (i, param) in params_ref.into_iter().enumerate() {
-            let &VarDecl(ref pname, ref ptype) = param;
+            let &VarDecl(pname, ref ptype) = param;
             let arg = fun.get_param(i);
-            arg.set_name(pname.as_str());
+            arg.set_name(self.trace_id(pname));
 
             let alloca = self.alloca_for_var(&fun, param);
 
             self.builder().store(&arg, &alloca);
-            symtbl.insert(pname.as_str(), alloca);
+            symtbl.insert(pname, alloca);
         }
 
         if let Some(param) = last_param {
@@ -98,7 +106,7 @@ impl LLVMEmit {
             for i in 0..flatten_count {
                 let idx_name = i.to_string();
                 let arg = fun.get_param(i + len_head);
-                let arg_name = last_name.clone() + idx_name.as_str();
+                let arg_name = self.trace_id(last_name.to_owned()).to_owned() + idx_name.as_str();
                 arg.set_name(arg_name.as_str());
                 let field = self.builder().struct_field_ptr(&last_alloca, i, idx_name.as_str());
                 self.builder().store(&arg, &field);
@@ -123,16 +131,16 @@ impl LLVMEmit {
                                 -> LLVMValue {
         use self::Term::*;
         match *term.body() {
-            Lit(ref lit) => self.0.gen_lit(lit),
-            Var(ref vn) => {
-                let var_name = vn.as_str();
-                match symbols.lookup(&var_name) {
+            Lit(ref lit) => self.generator.gen_lit(lit),
+            Var(vn) => {
+                let var_name = self.interner.trace(vn);
+                match symbols.lookup(&vn) {
                     Some(v) => self.builder().load(v, var_name),
                     _ => unreachable!(), // global functions should be converted to closure
 
                     // // It must be a global definition because of type check
                     // None => {
-                    //     let llvm_type = self.0.get_llvm_type_or_ptr(term.ref_scheme().body());
+                    //     let llvm_type = self.generator.get_llvm_type_or_ptr(term.ref_scheme().body());
                     //     self.0
                     //         .module
                     //         .get_or_add_function(var_name, &llvm_type)
@@ -144,25 +152,27 @@ impl LLVMEmit {
                 let lval = self.gen_expr(lhs, symbols);
                 let rval = self.gen_expr(rhs, symbols);
 
-                self.0.bin_operator(op, lval, rval, lhs.ref_scheme().body())
+                self.generator.bin_operator(op, lval, rval, lhs.ref_scheme().body())
             }
             Let(ref var_decl, ref val, ref exp) => {
-                let &VarDecl(ref var, ref tyvar) = var_decl;
-                let var_name = var.as_str();
+                let &VarDecl(var, ref tyvar) = var_decl;
                 let block = self.builder().insert_block();
                 let fun = block.get_parent();
 
                 let init = self.gen_expr(val, symbols);
-                let alloca = self.0.create_entry_block_alloca(&fun, var_name, tyvar.body());
+                let alloca = {
+                    let var_name = self.interner.trace(var);
+                    self.generator.create_entry_block_alloca(&fun, var_name, tyvar.body())
+                };
                 self.builder().store(&init, &alloca);
 
 
-                with_var(symbols, var_name, alloca, |sym| {
+                with_var(symbols, var, alloca, |sym| {
                     self.gen_expr(exp.deref(), sym)
                 })
             }
             ApplyCls(ref callee, ref args) => {
-                let callee_ty = self.0.get_llvm_type(callee.ref_scheme().body());
+                let callee_ty = self.generator.get_llvm_type(callee.ref_scheme().body());
                 // get the pointer to closure struct
                 let callee_ptr = self.gen_expr(callee, symbols); //.into_function();
 
@@ -198,24 +208,24 @@ impl LLVMEmit {
             }
             MakeCls(ref var_decl, box ref cls, box ref exp) => {
                 let &VarDecl(ref var, ref tyvar) = var_decl;
-                let fun_ty = self.0.get_llvm_type(tyvar.body());
+                let fun_ty = self.generator.get_llvm_type(tyvar.body());
                 // make a closure type
                 let fv_ty: Vec<LLVMType> = cls.fv()
                     .into_iter()
                     .map(|fv_name| symbols.lookup(&fv_name).unwrap().get_type())
                     .collect();
-                let cls_actual_ty = self.0.get_actual_cls_type(&fv_ty);
+                let cls_actual_ty = self.generator.get_actual_cls_type(&fv_ty);
 
                 // allocate for closure
                 let alloca = self.builder().alloca(&cls_actual_ty, "cls.actual");
 
                 // set function entry
                 let elm_ptr_fun = self.builder().struct_field_ptr(&alloca, 0, "cls.fn");
-                let fn_ent = self.0
+                let fn_ent = self.generator
                     .module
                     .get_or_add_function(cls.entry(), &fun_ty)
                     .into_value();
-                let ptr_ty = self.0
+                let ptr_ty = self.generator
                     .context
                     .get_int8_type()
                     .get_ptr(0);
@@ -224,16 +234,19 @@ impl LLVMEmit {
 
                 // store free vars
                 let elm_ptr_fv = self.builder().struct_field_ptr(&alloca, 1, "cls.fv");
-                for (i, fv_name) in cls.fv().into_iter().enumerate() {
+                for (i, fv_id) in cls.fv().into_iter().enumerate() {
                     // if variable stored a pointer, it will get (type **)
                     // if stored a value, (type *)
-                    let val_ptr = symbols.lookup(&fv_name).unwrap();
+                    let val_ptr = symbols.lookup(&fv_id).unwrap();
                     let val = self.builder().load(&val_ptr, "tmp");
-                    let fv = self.builder().struct_field_ptr(&elm_ptr_fv, i, fv_name);
+                    let fv = {
+                        let fv_name = self.interner.trace(fv_id);
+                        self.builder().struct_field_ptr(&elm_ptr_fv, i, fv_name)
+                    };
                     self.builder().store(&val, &fv);
                 }
 
-                let cls_ty = self.0.get_closure_type();
+                let cls_ty = self.generator.get_closure_type();
                 let cls_var = self.builder().bit_cast(&alloca, &cls_ty, "cls");
 
                 with_var(symbols, var_decl.name(), cls_var, |sym| {
@@ -247,14 +260,18 @@ impl LLVMEmit {
     }
 
     fn builder(&self) -> &LLVMBuilder {
-        &self.0.builder
+        &self.generator.builder
     }
 
-    fn alloca_for_var(&self, fun: &LLVMFunction, var: &VarDecl) -> LLVMValue {
-        let &VarDecl(ref pname, ref ptype) = var;
-        let name = pname.as_str();
+    fn alloca_for_var(&mut self, fun: &LLVMFunction, var: &VarDecl) -> LLVMValue {
+        let &VarDecl(pname, ref ptype) = var;
+        let name = self.interner.trace(pname);
         let ty = ptype.body();
-        self.0.create_entry_block_alloca(&fun, name, ty)
+        self.generator.create_entry_block_alloca(&fun, name, ty)
+    }
+
+    fn trace_id(&mut self, id: Id) -> &str {
+        self.interner.trace(id)
     }
 
 }

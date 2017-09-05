@@ -14,22 +14,30 @@ use internal::*;
 use core::term::*;
 
 
-#[derive(Default, Debug)]
-pub struct K {
+#[derive(Debug)]
+pub struct K<'i> {
     count: usize,
-    env: HashMap<String, Scheme>,
+    env: HashMap<Id, Scheme>,
     global: HashMap<String, P<FunDef>>,
     types: HashMap<String, P<TypeDef>>,
     current: String,
+    interner: &'i mut Interner,
 }
 
-impl K {
+impl<'i> K<'i> {
     /// Do transformation on a syntax module,
     /// generate core term representation
-    pub fn go<I>(module: I) -> (HashMap<String, P<FunDef>>, HashMap<String, P<TypeDef>>)
+    pub fn go<I>(module: I, interner: &mut Interner) -> (HashMap<String, P<FunDef>>, HashMap<String, P<TypeDef>>)
         where I: IntoIterator<Item = Def>
     {
-        let mut runner = K::default();
+        let mut runner = K {
+            count: 0,
+            env: HashMap::new(),
+            global: HashMap::new(),
+            types: HashMap::new(),
+            current: "".to_string(),
+            interner
+        };
         {
             let b = &mut runner;
 
@@ -61,11 +69,12 @@ impl K {
     /// Convert a global definition to term
     fn convert_def(&mut self, def: Def) {
         let Def { ident, node, .. } = def;
+        let name = self.interner.trace(ident).to_owned();
         match node {
             Item::Form(box form) => {
                 let Form { node, tag } = form;
                 let ty = tag.ty;
-                self.current = ident;
+                self.current = name.clone();
                 let def_name = self.current.clone();
 
                 match node {
@@ -79,12 +88,14 @@ impl K {
                 }
             }
             Item::Alg(ps, vs) => {
-                let d = box TypeDef::new(ident.clone(), ps, TypeKind::Algebra(vs));
-                self.types.insert(ident, d);
+                let params = ps.into_iter().map(|id| self.interner.trace(id).to_owned()).collect();
+                let d = box TypeDef::new(name.clone(), params, TypeKind::Algebra(vs));
+                self.types.insert(name.to_owned(), d);
             }
             Item::Alias(ps, t) => {
-                let d = box TypeDef::new(ident.clone(), ps, TypeKind::Alias(t));
-                self.types.insert(ident, d);
+                let params = ps.into_iter().map(|id| self.interner.trace(id).to_owned()).collect();
+                let d = box TypeDef::new(name.clone(), params, TypeKind::Alias(t));
+                self.types.insert(name.clone(), d);
             }
         }
     }
@@ -96,7 +107,7 @@ impl K {
                              params: Vec<VarDecl>,
                              free: Vec<VarDecl>,
                              body: TaggedTerm)
-                             -> (&'b str, Vec<&'b str>) {
+                             -> (&'b str, Vec<Id>) {
         let fun = FunDef::new(name.clone(), ty, params, free, body);
         let ent = self.global.entry(name).or_insert(P(fun));
         (&(*ent).name(),
@@ -109,13 +120,13 @@ impl K {
 
 
     /// Get free variables of a term
-    fn fv<'a>(&mut self, source: &'a TaggedTerm) -> HashSet<&'a str> {
+    fn fv<'a>(&mut self, source: &'a TaggedTerm) -> HashSet<Id> {
         use self::Term::*;
         match *source.body() {
             Term::Lit(_) => HashSet::new(),
             Var(ref v) => {
                 let mut hs = HashSet::new();
-                hs.insert(v.as_str());
+                hs.insert(v.to_owned());
                 return hs;
             }
 
@@ -130,14 +141,14 @@ impl K {
             // in binding value.
             Let(ref var, ref val, ref exp) => {
                 let mut res = self.fv(exp.deref());
-                res.remove(var.name());
+                res.remove(&var.name());
                 res.extend(&self.fv(val.deref()));
                 res
             }
             MakeCls(ref var, ref cls, ref exp) => {
                 let mut r = self.fv(exp.deref());
                 r.extend(cls.deref().fv());
-                r.remove(var.name());
+                r.remove(&var.name());
                 r
             }
             ApplyCls(ref n, ref args) => {
@@ -164,16 +175,16 @@ impl K {
     }
 
     /// Add a variable in environment
-    fn close_var(&mut self, var: &str, ty: Scheme) -> Option<Scheme> {
-        self.env.insert(var.to_string(), ty)
+    fn close_var(&mut self, var: Id, ty: Scheme) -> Option<Scheme> {
+        self.env.insert(var, ty)
     }
     /// Remove a variable from environment
-    fn release_var(&mut self, var: &str) -> Option<Scheme> {
+    fn release_var(&mut self, var: &Id) -> Option<Scheme> {
         self.env.remove(var)
     }
 
     /// Find if a variable is in environment
-    fn find_var(&mut self, var: &str) -> Option<&Scheme> {
+    fn find_var(&mut self, var: &Id) -> Option<&Scheme> {
         self.env.get(var)
     }
 
@@ -183,15 +194,15 @@ impl K {
         let bd = *lambda.body;
 
         let (body_term, fvs) = {
-            let mut present: Vec<&str> = Vec::new();
-            let mut backup: Vec<(&str, Scheme)> = Vec::new();
+            let mut present: Vec<Id> = Vec::new();
+            let mut backup: Vec<(Id, Scheme)> = Vec::new();
 
             // Add parameter into env
             {
                 let it = params.iter();
                 for para in it {
                     let &VarDecl(ref n, ref t) = para;
-                    let pname = n.as_str();
+                    let pname = n.to_owned();
                     if let Some(origin) = self.close_var(pname, t.to_owned()) {
                         backup.push((pname, origin));
                     }
@@ -203,15 +214,15 @@ impl K {
             let fvs = {
                 let mut _fvs = self.fv(&body_term);
                 for &VarDecl(ref n, _) in params.iter() {
-                    _fvs.remove(n.as_str());
+                    _fvs.remove(n);
                 }
                 _fvs.iter()
-                    .map(|vn| VarDecl(vn.to_string(), self.env[&vn.to_string()].to_owned()))
+                    .map(|vn| VarDecl(vn.to_owned(), self.env[vn].to_owned()))
                     .collect()
             };
             // Reset env
             for bname in present {
-                self.release_var(bname);
+                self.release_var(&bname);
             }
             for (bname, bty) in backup {
                 self.close_var(bname, bty);
@@ -234,10 +245,11 @@ impl K {
             Lit(l) => Term::Lit(l),
             Var(n) => {
                 // A global definition should not be in scope env
-                if self.find_var(n.as_str()) == None && tform.is_fn() {
+                if self.find_var(&n) == None && tform.is_fn() {
                     // For global function name, make a closure
+                    let ent = self.interner.trace(n);
                     Term::MakeCls(VarDecl(n.clone(), tform.clone()),
-                                  box Closure::new(n.as_str(), vec![]),
+                                  box Closure::new(ent, vec![]),
                                   box TaggedTerm::new(tform.clone(), Term::Var(n)))
                 } else {
                     Term::Var(n)
@@ -259,17 +271,17 @@ impl K {
                     // Handle closure
 
                     let (cls_name, cls_fv) = {
-                        let VarDecl(ref var, ref var_ty) = v;
-                        let bound = var.as_str();
-                        let origin = self.close_var(bound, var_ty.to_owned());
+                        let VarDecl(ref bound, ref var_ty) = v;
+                        let origin = self.close_var(bound.to_owned(), var_ty.to_owned());
 
                         let (ps, fv, bd) = self.trans_lambda(lambda);
                         self.release_var(bound);
                         if let Some(v) = origin {
-                            self.close_var(bound, v);
+                            self.close_var(bound.to_owned(), v);
                         }
 
-                        let _cls_name = self.make_cls_name(bound);
+                        let bound_str = self.interner.trace(bound.to_owned()).to_owned();
+                        let _cls_name = self.make_cls_name(bound_str.as_str());
                         self.define_fn(_cls_name, var_ty.clone(), ps, fv, bd)
                     };
 
@@ -296,13 +308,15 @@ impl K {
                     let fr_name = self.fresh();
                     self.make_cls_name(fr_name.as_str())
                 };
+                let tmp_id = self.interner.intern(tmp_name.as_str());
                 let (ps, fv, bd) = self.trans_lambda(lambda);
 
-                let (cls_name, cls_fv) = self.define_fn(tmp_name.clone(), ty.clone(), ps, fv, bd);
+                let (cls_name, cls_fv) = self.define_fn(tmp_name, ty.clone(), ps, fv, bd);
                 let cls = Closure::new(cls_name, cls_fv);
-                Term::MakeCls(VarDecl(tmp_name.clone(), ty.clone()),
+
+                Term::MakeCls(VarDecl(tmp_id, ty.clone()),
                               box cls,
-                              box TaggedTerm::new(ty, Term::Var(tmp_name)))
+                              box TaggedTerm::new(ty, Term::Var(tmp_id)))
             }
         };
         TaggedTerm::new(tform, t)

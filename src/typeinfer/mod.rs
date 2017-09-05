@@ -1,4 +1,8 @@
-pub mod subst;
-pub mod typeenv;
-pub mod infer;
+mod subst;
+mod error;
+mod constraint;
 
+mod infer;
+
+pub use self::infer::*;
+pub use self::error::*;

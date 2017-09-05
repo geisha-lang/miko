@@ -8,8 +8,7 @@ pub use llvm_sys::core::*;
 
 pub use libc::{c_char, c_uint, c_ulonglong};
 use std::char;
-use std::ffi::{CString, NulError};
-use std::ptr;
+use std::ffi::{CString};
 
 
 

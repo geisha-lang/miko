@@ -44,7 +44,7 @@ pub struct FunDef {
 }
 
 impl FunDef {
-    pub fn new(name: String,
+    pub fn new(name: Name,
                ty: Scheme,
                params: Vec<VarDecl>,
                freevars: Vec<VarDecl>,
@@ -60,7 +60,7 @@ impl FunDef {
         }
     }
 
-    pub fn name<'a>(&'a self) -> &'a str {
+    pub fn name<'a>(&'a self) -> &str {
         self.name.as_str()
     }
 
@@ -108,7 +108,7 @@ pub enum Term {
     /// Literal value
     Lit(Lit),
     /// Identifier (binding/definition)
-    Var(Name),
+    Var(Id),
     /// List (array)
     /// e.g. `[fuck, shit]`
     List(Vec<Node>),
@@ -146,19 +146,19 @@ pub enum Term {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Closure {
     entry: String,
-    actualFv: Vec<String>,
+    actualFv: Vec<Id>,
 }
 
 impl Closure {
-    pub fn new(ent: &str, fv: Vec<&str>) -> Closure {
+    pub fn new(ent: &str, fv: Vec<Id>) -> Closure {
         Closure {
             entry: ent.to_string(),
-            actualFv: fv.iter().map(|s| s.to_string()).collect(),
+            actualFv: fv,
         }
     }
 
-    pub fn fv(&self) -> Vec<&str> {
-        (&self.actualFv).iter().map(|s| s.as_str()).collect()
+    pub fn fv(&self) -> Vec<Id> {
+        self.actualFv.clone()
     }
 
     pub fn entry(&self) -> &str {

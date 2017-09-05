@@ -1,5 +1,3 @@
-use typeinfer::typeenv::*;
-use typeinfer::subst::*;
 use syntax::form::*;
 use internal::*;
 use types::*;
@@ -19,91 +17,32 @@ use std::ops::Placer;
 
 use std::mem;
 
-#[derive(Clone, PartialEq, Debug)]
-pub enum TypeError {
-    NotInScope(Form),
-    MisMatch(Type, Type),
-    HighRank(Form),
-    UnknownOperator(BinOp, Span),
-}
+use super::subst::*;
+use super::constraint::{ Constraint };
+use super::error::{ TypeError };
 
-#[derive(Clone, PartialEq, Debug)]
-pub struct Infer {
+#[derive(Debug)]
+pub struct Infer<'interner> {
     unique: usize,
+    interner: &'interner mut Interner,
     constraints: LinkedList<Constraint>,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-struct Constraint(Type, Type);
 
-impl Constraint {
-    pub fn apply_mut(&mut self, sub: &Subst) {
-        self.0 = self.0.clone().apply(sub);
-        self.1 = self.1.clone().apply(sub);
-    }
-    pub fn unify<'a>(self) -> Result<Subst, TypeError> {
-        use self::Type::*;
-        match self {
-            Constraint(Var(n), t) |
-            Constraint(t, Var(n)) => {
-                let mut s = HashMap::new();
-                s.insert(n, t);
-                Ok(s)
-            },
-            Constraint(Arr(l1, l2), Arr(r1, r2)) |
-            Constraint(Prod(l1, l2), Prod(r1, r2)) |
-            Constraint(Comp(l1, l2), Comp(r1, r2)) => {
-                let mut u1 = Constraint(*l1, *r1).unify()?;
-                let u2 = Constraint(*l2, *r2).apply(&u1).unify()?;
-                u1.extend(u2);
-                Ok(u1)
-            },
-            Constraint(el, er) => {
-                if el == er {
-                    Ok(HashMap::new())
-                } else {
-                    Err(TypeError::MisMatch(el, er))
-                }
-            }
-        }
-    }
-}
-
-
-impl Substituable for Constraint {
-    fn apply(self, sub: &Subst) -> Self {
-        Constraint(self.0.apply(sub), self.1.apply(sub))
-    }
-    fn ftv(&self) -> HashSet<Name> {
-        let mut r = self.0.ftv();
-        r.extend(self.1.ftv());
-        r
-    }
-}
-
-
-fn generalize(e: &TypeEnv, ty: Type) -> Scheme {
-    let fvs: Vec<_> = ty.ftv()
-        .into_iter()
-        .filter(|fv| !e.exist(fv))
-        .collect();
-    if fvs.is_empty() {
-        Scheme::Mono(ty)
-    } else {
-        Scheme::Poly(fvs, ty)
-    }
-}
+//fn generalize(e: &TypeEnv, ty: Type) -> Scheme {
+//}
 
 fn to_mono(ty: Type) -> Scheme {
     Scheme::Mono(ty)
 }
 
 
-impl Infer {
-    pub fn new() -> Infer {
+impl<'i> Infer<'i> {
+    pub fn new(interner: &'i mut Interner) -> Infer<'i> {
         Infer {
             unique: 0,
             constraints: LinkedList::new(),
+            interner,
         }
     }
 
@@ -225,7 +164,7 @@ impl Infer {
             Binary(ref op, ref mut left, ref mut right) => {
                 let ty_left = self.infer(e, left)?.body();
                 let ty_right = self.infer(e, right)?.body();
-                if let Some(ty_op) = e.lookup(&op.as_str().to_string()) {
+                if let Some(ty_op) = e.lookup(&self.interner.intern(&op.as_str())) {
                     let ty_lr = Type::product(ty_left.clone(), ty_right.clone());
 
                     form.tag.ty = to_mono(self.fresh());
@@ -309,7 +248,7 @@ impl Infer {
             let name_scms = program
                 .iter()
                 .filter(|ref v| v.is_form())
-                .map(|ref d| (d.name().to_string(), match d.form_annot() {
+                .map(|ref d| (d.name(), match d.form_annot() {
                     Some(s) => s.clone(),
                     _ => to_mono(self.fresh())
                 }));
@@ -326,7 +265,15 @@ impl Infer {
                 };
                 d.form_body_mut().apply_mut(&sub);
 
-                let general = generalize(&env, d.form_type().body().to_owned());
+                let general = {
+                    let ty = d.form_type().body().to_owned();
+                    let fvs: Vec<_> = ty.ftv().into_iter().collect();
+                    if fvs.is_empty() {
+                        Scheme::Mono(ty)
+                    } else {
+                        Scheme::Poly(fvs, ty)
+                    }
+                };
 
                 d.form_body_mut().tag.set_scheme(general);
 
@@ -343,13 +290,22 @@ impl Infer {
         let mut sub = HashMap::<Name, Type>::new();
         // let mut constraints = self.constraints;
         let mut constraints = mem::replace(&mut self.constraints, LinkedList::new());
+        // println!("Type constraints: ");
+        // println!("{:#?}", constraints);
+        let mut step: usize = 1;
         while let Some(cons) = constraints.pop_front() {
+            // println!("Type solve step {:?}: ", step);
             let new_sub = cons.unify()?;
+            // println!("current unify: ");
+            // println!("{:#?}", new_sub);
             for ref mut c in constraints.iter_mut() {
-                c.apply_mut(&sub);
+                c.apply_mut(&new_sub);
             }
             sub = sub.into_iter().map(|(k, v)| (k, v.apply(&new_sub))).collect();
             sub.extend(new_sub);
+            // println!("Type substituation: ");
+            // println!("{:#?}", sub);
+            step = step + 1;
         }
         Ok(sub)
     }
@@ -369,8 +325,8 @@ mod tests {
     // use pest::*;
 
 
-    fn parse_expr(src: &str) -> Form {
-        parser::expression(src, &mut Interner::new()).unwrap()
+    fn parse_expr(inter: &mut Interner, src: &str) -> Form {
+        parser::expression(src, inter).unwrap()
     }
 
 
@@ -388,7 +344,8 @@ mod tests {
 
     #[test]
     fn infer_lit() {
-        let mut inf = Infer::new();
+        let mut interner = Interner::new();
+        let mut inf = Infer::new(&interner);
         let mut env = TypeEnv::new();
 
         assert_eq!(inf.infer(&mut env,
@@ -401,6 +358,7 @@ mod tests {
         use self::Expr::*;
         use self::Scheme::*;
         use self::Type::*;
+        let mut interner = Interner::new();
         let ty_op = Scheme::Poly(vec!["a".to_string()],
                                  Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
                                                           P(Type::Var("a".to_string())))),
@@ -410,7 +368,7 @@ mod tests {
 
         let mut env = TypeEnv::from_iter(PRIMITIVES.iter().map(|&(n, s)| (n.to_string(), s.clone())));
         let sub = {
-            let mut inf = Infer::new();
+            let mut inf = Infer::new(&interner);
             inf.infer(&mut env, &mut syn);
             inf.solve().unwrap()
         };
@@ -422,18 +380,18 @@ mod tests {
             parser::type_scheme("Fuck * Fuck -> Fuck", &mut Interner::new()).unwrap(),
             Abs(Lambda {
                 param: vec![
-                    VarDecl("a".to_string(), Scheme::con("Fuck")),
-                    VarDecl("b".to_string(), Scheme::con("Fuck"))
+                    VarDecl(interner.inter("a"), Scheme::con("Fuck")),
+                    VarDecl(interner.inter("b"), Scheme::con("Fuck"))
                 ],
                 body: box Form::typed(
                     Span::new(15, 38),
                     Scheme::con("Fuck"),
                     Let(
-                        VarDecl(s("c"), Mono(Type::Con(s("Fuck")))),
+                        VarDecl(interner.inter("c"), Mono(Type::Con(s("Fuck")))),
                         box Form::typed(
                             Span::new(23, 25),
                             Scheme::con("Fuck"),
-                            Expr::Var(s("a"))
+                            Expr::Var(interner.inter("a"))
                         ),
                         box Form::typed(
                             Span::new(28, 38),
@@ -446,11 +404,11 @@ mod tests {
                                         box Form::typed(
                                             Span::new(30, 32),
                                             Scheme::con("Fuck"),
-                                            Expr::Var(s("c"))),
+                                            Expr::Var(interner.inter("c"))),
                                         box Form::typed(
                                             Span::new(34, 36),
                                             Scheme::con("Fuck"),
-                                                Expr::Var(s("b")))))
+                                                Expr::Var(interner.inter("b")))))
                             ])
                         )
                     )

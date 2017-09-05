@@ -5,7 +5,6 @@ use miko::types::*;
 use miko::typeinfer::*;
 use miko::codegen::emit::*;
 use miko::core::*;
-use miko::internal::*;
 use std::io;
 use std::io::Write;
 use std::ops::Deref;
@@ -15,7 +14,19 @@ fn repl() {
     let mut stdout = io::stdout();
     let mut input = String::new();
 
-    let mut generator = LLVMEmit::new("repl");
+    let mut interner = Interner::new();
+
+    let ty_op = Scheme::Poly(vec!["a".to_string()],
+                                Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
+                                                    P(Type::Var("a".to_string())))),
+                                        P(Type::Var("a".to_string()))));
+
+    let mut _ty_env = Infer::new_env();
+    let prelude = {
+        let ops = ["+", "-", "*", "/"];
+        let v: Vec<_> = ops.into_iter().map(|n| (interner.intern(n), ty_op.clone())).collect();
+        _ty_env.extend_n(v)
+    };
 
     'main: loop {
         print!("> ");
@@ -25,31 +36,27 @@ fn repl() {
         if input.as_str() == ".quit\n" {
             break;
         }
-        let mut res: Vec<_> = parse(input.as_str(), &mut Interner::new()).unwrap();
+        let mut res: Vec<_> = parse(input.as_str(), &mut interner).unwrap();
         println!("Parsed syntax tree:");
         println!("{:#?}", res);
 
-        let ty_op = Scheme::Poly(vec!["a".to_string()],
-                                 Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
-                                                        P(Type::Var("a".to_string())))),
-                                           P(Type::Var("a".to_string()))));
+        println!("String intern: ");
+        println!("{:#?}", interner);
 
-
-        let mut ty_infer = infer::Infer::new();
-        let mut ty_env = infer::Infer::new_env();
-
-        ty_env.insert(String::from("+"), ty_op);
-
-        let inf = ty_infer.infer_defs(&ty_env, &mut res);
-        match inf {
+        let infered = {
+            let mut ty_infer = Infer::new(&mut interner);
+            ty_infer.infer_defs(&prelude, &mut res)
+        };
+        match infered {
             Ok(_) => {
                 // let env = types.unwrap();
                 println!("Typed AST:");
                 println!("{:#?}", res);
                 println!("Core term:");
-                let (top, _) = K::go(res);
+                let (top, _) = K::go(res, &mut interner);
                 println!("{:#?}", top);
                 println!("LLVM IR:");
+                let mut generator = LLVMEmit::new("repl", &mut interner);
                 for def in top.values() {
                     generator.gen_top_level(def.deref(), &VarEnv::new());
                 }
@@ -57,6 +64,7 @@ fn repl() {
             }
             Err(e) => println!("{:#?}", e),
         }
+
 
 
     }

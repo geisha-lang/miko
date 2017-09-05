@@ -5,8 +5,8 @@ authors = ["nameoverflow <i@hcyue.me>"]
 build = "build.rs"
 
 [dependencies]
-llvm-sys = "39"
 bytecount = "0.1.4"
+libllvm = { path="./libllvm" }
 
 [features]
 avx-accel = ["bytecount/avx-accel"]

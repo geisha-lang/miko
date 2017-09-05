@@ -10,41 +10,13 @@ use std::iter::DoubleEndedIterator;
 use utils::*;
 use types::*;
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-pub struct Id(usize);
-
-pub struct Interner {
-    forward: HashMap<String, Id>,
-    backward: Vec<String>
-}
-
-impl Interner {
-    pub fn new() -> Interner {
-        Interner { forward: HashMap::new(), backward: Vec::new() }
-    }
-
-    pub fn intern(&mut self, s: &str) -> Id {
-        if let Some(&id) = self.forward.get(s) { id } else {
-            let id = Id(self.backward.len());
-            self.backward.push(s.to_owned());
-            self.forward.insert(s.to_owned(), id);
-            id
-        }
-    }
-
-    pub fn trace(&self, i: usize) -> Option<&str> {
-        self.backward.get(i).map(|s| s.as_str())
-    }
-}
-
-
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct VarDecl(pub Name, pub Scheme);
+pub struct VarDecl(pub Id, pub Scheme);
 
 impl VarDecl {
-    pub fn name(&self) -> &str {
-        self.0.as_str()
+    pub fn name(&self) -> Id {
+        self.0.clone()
     }
 }
 

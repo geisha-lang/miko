@@ -1,5 +1,3 @@
-mod wrapper;
-
 use std::char;
 use std::ffi::{CString, NulError};
 use std::io::{self, BufReader, Read, Write};
@@ -14,7 +12,7 @@ use internal::*;
 use types::*;
 use utils::*;
 
-pub use codegen::llvm::wrapper::*;
+pub use libllvm::*;
 
 
 #[derive(Debug, Clone)]

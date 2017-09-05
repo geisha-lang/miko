@@ -38,8 +38,10 @@ string_content -> &'input str = $(((!"\"" .) / "\\\"")*)
 
 // Lex rules
 
-identifier -> &'input str
-    = lexeme<$([a-zA-Z_\x80-\xff] identifier_char*)>
+identifier -> Id
+    = id:lexeme<$([a-zA-Z_] identifier_char*)> {
+        interner.intern(id)
+    }
 
 type_constant_identifier -> &'input str
     = lexeme<$([A-Z] identifier_char*)>
@@ -81,30 +83,30 @@ pub definition -> Def
     }
     / type_definition
 
-forward_declaration -> (Name, Scheme)
-    = n:identifier lexeme<":"> t:type_scheme { (n.to_string(), t) }
+forward_declaration -> (Id, Scheme)
+    = n:identifier lexeme<":"> t:type_scheme { (n, t) }
 
-form_definition -> (Name, Form)
+form_definition -> (Id, Form)
     = value_definition
     / function_definition
 
-value_definition -> (Name, Form)
-    = reserved<"def"> name:identifier lexeme<"="> value:expression { (name.to_string(), value) }
+value_definition -> (Id, Form)
+    = reserved<"def"> name:identifier lexeme<"="> value:expression { (name, value) }
 
-function_definition -> (Name, Form)
+function_definition -> (Id, Form)
     = reserved<"def"> name:identifier
       lexeme<"("> ps:parameter_sequence lexeme<")">
       lexeme<"="> body:expression {
           let span = body.tag.pos.clone();
           let lambda = Expr::Abs(Lambda { param: ps, body: box body });
-          (name.to_string(), Form::new(span, lambda))
+          (name, Form::new(span, lambda))
       }
 
 type_definition -> Def
     = reserved<"type"> a:spanned<type_alias> {
         let (span, (name, item)) = a;
         Def {
-            ident: name,
+            ident: interner.intern(name.as_str()),
             pos: span,
             node: item
         }
@@ -112,32 +114,32 @@ type_definition -> Def
     / reserved<"data"> a:spanned<type_algebra> {
         let (span, (name, item)) = a;
         Def {
-            ident: name,
+            ident: interner.intern(name.as_str()),
             pos: span,
             node: item
         }
     }
 
-type_alias -> (Name, Item)
+type_alias -> (String, Item)
     = n:type_constant_identifier p:type_parameter_sequence lexeme<"="> a:type_scheme {
-        let param = p.into_iter().map(|s| s.to_string()).collect();
+        let param = p.into_iter().map(|s| interner.intern(s)).collect();
         (n.to_string(), Item::Alias(param, box a))
     }
 
-type_algebra -> (Name, Item)
+type_algebra -> (String, Item)
     = n:type_constant_identifier p:type_parameter_sequence
       lexeme<"{"> v:(type_algebra_variant ++ lexeme<",">) lexeme<"}"> {
-         let param = p.into_iter().map(|s| s.to_string()).collect();
+        let param = p.into_iter().map(|s| interner.intern(s)).collect();
          (n.to_string(), Item::Alg(param, v))
       }
 
 type_algebra_variant -> Variant
     = n:identifier ts:parens<type_expression ++ lexeme<",">> {
         let body = ts.into_iter().enumerate().map(|(i, t)| Field { name: None, ty: box t }).collect();
-        Variant { name: n.to_string(), body: VariantBody::Tuple(body) }
+        Variant { name: interner.trace(n).to_string(), body: VariantBody::Tuple(body) }
     }
     / n:identifier fs:struct_fields {
-        Variant { name: n.to_string(), body: VariantBody::Struct(fs) }
+        Variant { name: interner.trace(n).to_string(), body: VariantBody::Struct(fs) }
     }
 
 struct_fields -> Vec<Field>
@@ -145,7 +147,7 @@ struct_fields -> Vec<Field>
 
 struct_field_declaration -> Field
     = n:identifier lexeme<":"> t:type_expression {
-        Field { name: Some(n.to_string()), ty: box t }
+        Field { name: Some(interner.trace(n).to_string()), ty: box t }
     }
 
 // Type scheme
@@ -247,7 +249,7 @@ lambda -> Expr
     }
 
 var -> Expr
-    = n:identifier { Expr::Var(n.to_string()) }
+    = n:identifier { Expr::Var(n) }
 
 list -> Expr
     = lexeme<"["> l:(expression ** lexeme<",">) lexeme<"]"> {
@@ -300,8 +302,8 @@ apply_list -> Vec<Form>
 parameter_sequence -> Vec<VarDecl> = variable_declaration ** lexeme<",">
 variable_declaration -> VarDecl
     = n:identifier lexeme<":"> t:type_expression {
-        VarDecl(n.to_string(), Scheme::Mono(t))
+        VarDecl(n, Scheme::Mono(t))
     }
-    / n:identifier { VarDecl(n.to_string(), Scheme::Slot) }
+    / n:identifier { VarDecl(n, Scheme::Slot) }
 
 

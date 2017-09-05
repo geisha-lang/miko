@@ -1,11 +1,42 @@
 use std::collections::HashMap;
 
-pub type Name = String;
 pub type P<T> = Box<T>;
 /// Shorter alias of Box
 pub fn P<T>(t: T) -> Box<T> {
     Box::new(t)
 }
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Id(usize);
+
+pub type Name = String;
+
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct Interner {
+    forward: HashMap<String, Id>,
+    backward: Vec<String>
+}
+
+impl Interner {
+    pub fn new() -> Interner {
+        Interner { forward: HashMap::new(), backward: Vec::new() }
+    }
+
+    pub fn intern(&mut self, s: &str) -> Id {
+        if let Some(&id) = self.forward.get(s) { id } else {
+            let id = Id(self.backward.len());
+            self.backward.push(s.to_owned());
+            self.forward.insert(s.to_owned(), id);
+            id
+        }
+    }
+
+    pub fn trace(&self, i: Id) -> &str {
+        self.backward[i.0].as_str()
+    }
+}
+
+
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct SymTable<'a, K, T: 'a>

@@ -19,6 +19,14 @@ pub trait SubstMut {
     fn apply_mut(&mut self, sub: &Subst);
 }
 
+impl SubstMut for Subst {
+    fn apply_mut(&mut self, sub: &Subst) {
+        for target in self.values_mut() {
+            *target = target.to_owned().apply(sub);
+        }
+    }
+}
+
 impl Substituable for Type {
     fn apply(self, sub: &Subst) -> Self {
         use self::Type::*;

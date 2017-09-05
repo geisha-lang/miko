@@ -41,6 +41,14 @@ pub fn parse(src: &str, interner: &mut Interner) -> Result<Vec<Def>, ParseError>
     module(src, interner)
 }
 
+use types::Scheme;
+pub fn parse_type(src: &str, interner: &mut Interner) -> Scheme {
+    match type_scheme(src, interner) {
+        Ok(scm) => scm,
+        Err(err) => panic!("Parse type failed")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,32 +168,34 @@ mod tests {
     #[test]
     fn case_parse_function_definition() {
         {
+            let mut i = Interner::new();
             let form = Form::new(Span::new(16, 22), Expr::Abs(
                 Lambda {
-                    param: vec![VarDecl("a".to_string(), Scheme::Slot), VarDecl("b".to_string(), Scheme::Slot)],
+                    param: vec![VarDecl(i.intern("a"), Scheme::Slot), VarDecl(i.intern("b"), Scheme::Slot)],
                     body: box Form::new(Span::new(16,22), Expr::Binary(
                         BinOp::Add,
-                        box Form::new(Span::new(16,18), Expr::Var("a".to_string())),
-                        box Form::new(Span::new(20,22), Expr::Var("b".to_string()))
+                        box Form::new(Span::new(16,18), Expr::Var(i.intern("a"))),
+                        box Form::new(Span::new(20,22), Expr::Var(i.intern("b")))
                     ))
                 }
             ));
-            let output = vec![Def::value(Span::new(0,22), "fuck".to_string(), box form)];
-            assert_eq!(module("def fuck(a, b) = a + b", &mut Interner::new()), Ok(output))
+            let output = vec![Def::value(Span::new(0,22), i.intern("fuck"), box form)];
+            assert_eq!(module("def fuck(a, b) = a + b", &mut i), Ok(output))
         }
         {
+            let mut i = Interner::new();
             let form = Form::new(Span::new(13, 19), Expr::Abs(
                 Lambda {
-                    param: vec![VarDecl("a".to_string(), Scheme::Slot)],
+                    param: vec![VarDecl(i.intern("a"), Scheme::Slot)],
                     body: box Form::new(Span::new(13,19), Expr::Binary(
                         BinOp::Add,
-                        box Form::new(Span::new(13,15), Expr::Var("a".to_string())),
+                        box Form::new(Span::new(13,15), Expr::Var(i.intern("a"))),
                         box Form::new(Span::new(17,19), Expr::Lit(Lit::Int(1)))
                     ))
                 }
             ));
-            let output = vec![Def::value(Span::new(0,19), "fuck".to_string(), box form)];
-            assert_eq!(module("def fuck(a) = a + 1", &mut Interner::new()), Ok(output))
+            let output = vec![Def::value(Span::new(0,19), i.intern("fuck"), box form)];
+            assert_eq!(module("def fuck(a) = a + 1", &mut i), Ok(output))
         }
         {
             let src = 

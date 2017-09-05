@@ -1,7 +1,6 @@
 extern crate miko;
 use miko::utils::*;
 use miko::syntax::parser::*;
-use miko::types::*;
 use miko::typeinfer::*;
 use miko::codegen::emit::*;
 use miko::core::*;
@@ -16,15 +15,13 @@ fn repl() {
 
     let mut interner = Interner::new();
 
-    let ty_op = Scheme::Poly(vec!["a".to_string()],
-                                Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
-                                                    P(Type::Var("a".to_string())))),
-                                        P(Type::Var("a".to_string()))));
+    let ty_op = parse_type("forall a. a * a -> a", &mut interner);
 
     let mut _ty_env = Infer::new_env();
     let prelude = {
         let ops = ["+", "-", "*", "/"];
-        let v: Vec<_> = ops.into_iter().map(|n| (interner.intern(n), ty_op.clone())).collect();
+        let mut v: Vec<_> = ops.into_iter().map(|n| (interner.intern(n), ty_op.clone())).collect();
+        v.push((interner.intern("puts"), parse_type("String -> Void", &mut interner)));
         _ty_env.extend_n(v)
     };
 

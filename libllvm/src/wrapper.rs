@@ -1,14 +1,15 @@
-pub use llvm_sys::prelude::{LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMPassManagerRef,
-                            LLVMTypeRef, LLVMValueRef, LLVMBasicBlockRef};
-pub use llvm_sys::execution_engine::{LLVMExecutionEngineRef, LLVMGenericValueRef,
-                                     LLVMGenericValueToFloat, LLVMRunFunction};
-pub use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyFunction};
-pub use llvm_sys::LLVMRealPredicate;
+use llvm_sys::prelude::{LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMPassManagerRef,
+                        LLVMTypeRef, LLVMValueRef, LLVMBasicBlockRef};
+use llvm_sys::execution_engine::{LLVMExecutionEngineRef, LLVMGenericValueRef,
+                                 LLVMGenericValueToFloat, LLVMRunFunction};
+use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyFunction};
+use llvm_sys::LLVMRealPredicate;
 pub use llvm_sys::core::*;
+use llvm_sys::transforms;
 
-pub use libc::{c_char, c_uint, c_ulonglong};
-use std::char;
-use std::ffi::{CString};
+use std::ptr;
+use libc::{c_char, c_uint, c_ulonglong};
+use std::ffi::CString;
 
 
 
@@ -46,6 +47,7 @@ macro_rules! make_LLVM_wrapper {
 
 make_LLVM_wrapper!(LLVMModuleRef, LLVMModule);
 make_LLVM_wrapper!(LLVMContextRef, LLVMContext);
+make_LLVM_wrapper!(LLVMPassManagerRef, LLVMFunctionPassManager);
 make_LLVM_wrapper!(LLVMValueRef, LLVMValue, Copy);
 make_LLVM_wrapper!(LLVMValueRef, LLVMFunction, Copy);
 make_LLVM_wrapper!(LLVMTypeRef, LLVMType, Copy);
@@ -97,6 +99,15 @@ impl LLVMContext {
                                     flag)
         };
         LLVMType(t)
+    }
+
+    pub fn get_const_string(&self, s: &str) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMConstStringInContext(self.raw_ptr(),
+                                                         raw_string(s),
+                                                         s.len() as ::libc::c_uint,
+                                                         0))
+        }
     }
 
     pub fn get_double_const(&self, val: f64) -> LLVMValue {
@@ -157,9 +168,34 @@ impl LLVMModule {
     }
 }
 
+impl LLVMFunctionPassManager {
+    pub fn init_for_module(m: &LLVMModule) -> Self {
+        unsafe {
+            let llfpm = LLVMCreateFunctionPassManagerForModule(m.raw_ptr());
+            transforms::scalar::LLVMAddBasicAliasAnalysisPass(llfpm);
+            transforms::scalar::LLVMAddInstructionCombiningPass(llfpm);
+            transforms::scalar::LLVMAddReassociatePass(llfpm);
+            transforms::scalar::LLVMAddGVNPass(llfpm);
+            transforms::scalar::LLVMAddCFGSimplificationPass(llfpm);
+            // transforms::scalar::LLVMAddDeadStoreEliminationPass(llfpm);
+            transforms::scalar::LLVMAddMergedLoadStoreMotionPass(llfpm);
+            LLVMInitializeFunctionPassManager(llfpm);
+            LLVMFunctionPassManager(llfpm)
+        }
+    }
+    pub fn run(&self, f: &LLVMFunction) {
+        unsafe {
+            LLVMRunFunctionPassManager(self.raw_ptr(), f.raw_ptr());
+        }
+    }
+}
+
 impl LLVMType {
     pub fn get_ptr(&self, address_space: usize) -> Self {
         unsafe { LLVMType(LLVMPointerType(self.0.clone(), address_space as c_uint)) }
+    }
+    pub fn get_element(&self) -> Self {
+        unsafe { LLVMType(LLVMGetElementType(self.0.clone())) }
     }
 }
 
@@ -172,9 +208,7 @@ impl LLVMValue {
         LLVMFunction::from_ref(self.0)
     }
     pub fn get_type(&self) -> LLVMType {
-        unsafe {
-            LLVMType::from_ref(LLVMTypeOf(self.0))
-        }
+        unsafe { LLVMType::from_ref(LLVMTypeOf(self.0)) }
     }
 }
 
@@ -196,6 +230,10 @@ impl LLVMFunction {
 
     pub fn get_entry_basic_block(&self) -> LLVMBasicBlock {
         unsafe { LLVMBasicBlock::from_ref(LLVMGetEntryBasicBlock(self.raw_ptr())) }
+    }
+
+    pub fn verify(&self, action: LLVMVerifierFailureAction) {
+        unsafe { LLVMVerifyFunction(self.raw_ptr(), action) };
     }
 }
 
@@ -238,11 +276,17 @@ impl LLVMBuilder {
     method_build_instr!(ret, LLVMBuildRet, val: &LLVMValue);
     method_build_instr!(bit_cast, LLVMBuildBitCast, val: &LLVMValue, dest_ty: &LLVMType => name: &str);
 
+    pub fn ret_void(&self) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildRet(self.raw_ptr(), ptr::null_mut()))
+        }
+    }
     pub fn call(&self, fun: &LLVMFunction, args: &mut Vec<LLVMValue>, name: &str) -> LLVMValue {
         let mut _args: Vec<_> = args.iter_mut().map(|arg| arg.raw_ptr()).collect();
         unsafe {
+            let f = fun.raw_ptr();
             let ret = LLVMBuildCall(self.raw_ptr(),
-                                    fun.raw_ptr(),
+                                    f,
                                     _args.as_mut_ptr(),
                                     args.len() as c_uint,
                                     raw_string(name));
@@ -253,7 +297,8 @@ impl LLVMBuilder {
 
     pub fn struct_field_ptr(&self, ptr: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
         unsafe {
-            let ret = LLVMBuildStructGEP(self.raw_ptr(), ptr.raw_ptr(), idx as u32, raw_string(name));
+            let ret =
+                LLVMBuildStructGEP(self.raw_ptr(), ptr.raw_ptr(), idx as u32, raw_string(name));
             LLVMValue::from_ref(ret)
         }
     }
@@ -290,10 +335,16 @@ impl Drop for LLVMBuilder {
         }
     }
 }
+impl Drop for LLVMFunctionPassManager {
+    fn drop(&mut self) {
+        unsafe {
+            LLVMDisposePassManager(self.0);
+        }
+    }
+}
 
 pub type LLVMOperateBuild = unsafe extern "C" fn(LLVMBuilderRef,
-                                             LLVMValueRef,
-                                             LLVMValueRef,
-                                             *const ::libc::c_char)
-                                             -> LLVMValueRef;
-
+                                                 LLVMValueRef,
+                                                 LLVMValueRef,
+                                                 *const ::libc::c_char)
+                                                 -> LLVMValueRef;

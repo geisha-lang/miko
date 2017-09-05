@@ -19,11 +19,7 @@ pub struct LLVMEmit<'i> {
 
 pub type VarEnv<'a> = SymTable<'a, Id, LLVMValue>;
 
-fn with_var<'a, 'b: 'a, F, R>(
-    sym: &mut VarEnv<'a>,
-    var: Id,
-    val: LLVMValue,
-    mut cb: F) -> R
+fn with_var<'a, 'b: 'a, F, R>(sym: &mut VarEnv<'a>, var: Id, val: LLVMValue, mut cb: F) -> R
     where F: FnMut(&mut VarEnv<'a>) -> R
 {
     let old = sym.insert(var, val);
@@ -41,7 +37,7 @@ impl<'i> LLVMEmit<'i> {
     pub fn new(name: &str, interner: &'i mut Interner) -> Self {
         LLVMEmit {
             generator: LLVMCodegen::new(name),
-            interner
+            interner,
         }
     }
     pub fn dump(&mut self) {
@@ -50,9 +46,15 @@ impl<'i> LLVMEmit<'i> {
     pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
         // A global function definition
         let fun_type = def.ref_type();
+        let void_ret: bool = if let &Type::Arr(_, box Type::Void) = fun_type {
+            true
+        } else {
+            false
+        };
         let llvm_fun_type = self.generator.get_llvm_type(fun_type);
         let def_name = def.name();
         let fun = self.generator.module.get_or_add_function(def_name, &llvm_fun_type);
+        let arg_count = fun.count_params();
 
         // Check redefinition
 
@@ -66,64 +68,63 @@ impl<'i> LLVMEmit<'i> {
         // Create a sub environment for current function generating
         let mut symtbl = prelude.sub_env();
 
-        let mut params_ref: Vec<_> = def.parameters().iter().collect();
-
-        let last_param: Option<&VarDecl> = if let Some(&VarDecl(_, ref _last_type)) =
-            def.parameters().last() {
-            match _last_type.body() {
-                &Type::Prod(..) => params_ref.pop(),
-                _ => None,
+        let param_defs = def.parameters();
+        let mut param_count = param_defs.len();
+        let param_allocas = self.alloca_for_vars(&fun, param_defs);
+        if param_allocas.len() + 1 < arg_count {
+            let last_formal = param_defs.last();
+            if let Some(p) = last_formal {
+                let &VarDecl(ref id, ref ty) = p;
+                param_count = param_count - 1;
+                // Actual parameters counts more than formal, last formal parameter type is production
+                let flatten_count = ty.body().prod_to_vec().len();
+                let last_alloca = self.alloca_for_var(&fun, p);
+                for i in 0..flatten_count {
+                    let idx_name = i.to_string();
+                    let arg = fun.get_param(i + param_count);
+                    let arg_name = self.trace_id(id.to_owned()).to_owned() + idx_name.as_str();
+                    arg.set_name(arg_name.as_str());
+                    let field = self.builder().struct_field_ptr(&last_alloca, i, idx_name.as_str());
+                    self.builder().store(&arg, &field);
+                }
+                symtbl.insert(id.to_owned(), last_alloca);
             }
-        } else {
-            None
-        };
-
-
-        // Spread length
-        let len_head = params_ref.len();
-
-        // For each parameter, set argument name,
-        //   create store instruction, add to
-        //   symbol table.
-        for (i, param) in params_ref.into_iter().enumerate() {
-            let &VarDecl(pname, ref ptype) = param;
+        }
+        for i in 0..param_count {
+            let var = param_allocas[i];
             let arg = fun.get_param(i);
+            let pname = param_defs[i].name();
             arg.set_name(self.trace_id(pname));
-
-            let alloca = self.alloca_for_var(&fun, param);
-
-            self.builder().store(&arg, &alloca);
-            symtbl.insert(pname, alloca);
+            self.builder().store(&arg, &var);
+            symtbl.insert(pname, var);
         }
 
-        if let Some(param) = last_param {
-            let &VarDecl(ref last_name, ref last_type) = param;
-            let flatten_count = last_type.body().prod_to_vec().len();
 
-            // Handle the last parameter
-            let last_alloca = self.alloca_for_var(&fun, param);
+        let p_fvs = fun.get_param(arg_count - 1);
+        p_fvs.set_name("fvs");
 
-            for i in 0..flatten_count {
-                let idx_name = i.to_string();
-                let arg = fun.get_param(i + len_head);
-                let arg_name = self.trace_id(last_name.to_owned()).to_owned() + idx_name.as_str();
-                arg.set_name(arg_name.as_str());
-                let field = self.builder().struct_field_ptr(&last_alloca, i, idx_name.as_str());
-                self.builder().store(&arg, &field);
-            }
+        let formal_fvs = def.fv();
+        let fv_allocas = self.alloca_for_vars(&fun, formal_fvs);
+        let fv_tys = fv_allocas.iter().map(|v| v.get_type().get_element()).collect();
+        let fv_ty_actual = self.generator.context.get_struct_type(&fv_tys, false);
+        let fv_ptr_actual = self.builder().bit_cast(&p_fvs, &fv_ty_actual.get_ptr(0), "fv");
+        for (i, fv) in fv_allocas.into_iter().enumerate() {
+            let fv_id = formal_fvs[i].name();
+            let fv_name = self.interner.trace(fv_id);
+            let fv_val_ptr =
+                self.builder().struct_field_ptr(&fv_ptr_actual, i, "tmp");
+            let fv_val = self.builder().load(&fv_val_ptr, fv_name);
+            self.builder().store(&fv_val, &fv);
+            symtbl.insert(fv_id, fv);
         }
 
 
         let fun_body = self.gen_expr(def.body(), &mut symtbl);
+
         self.builder().ret(&fun_body);
 
-        unsafe {
-            if LLVMVerifyFunction(fun.raw_ptr(),
-                                LLVMVerifierFailureAction::LLVMPrintMessageAction) !=
-            0 {
-                println!("Function verify failed");
-            }
-        }
+        fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction);
+        self.generator.passer.run(&fun);
     }
     pub fn gen_expr<'a: 'b, 'b>(&mut self,
                                 term: &'a TaggedTerm,
@@ -136,16 +137,10 @@ impl<'i> LLVMEmit<'i> {
                 let var_name = self.interner.trace(vn);
                 match symbols.lookup(&vn) {
                     Some(v) => self.builder().load(v, var_name),
-                    _ => unreachable!(), // global functions should be converted to closure
-
-                    // // It must be a global definition because of type check
-                    // None => {
-                    //     let llvm_type = self.generator.get_llvm_type_or_ptr(term.ref_scheme().body());
-                    //     self.0
-                    //         .module
-                    //         .get_or_add_function(var_name, &llvm_type)
-                    //         .into_value()
-                    // }
+                    _ => {
+                        println!("cannot find variable {}", self.interner.trace(vn));
+                        unreachable!()
+                    } // global functions should be converted to closure
                 }
             }
             Binary(op, ref lhs, ref rhs) => {
@@ -167,12 +162,9 @@ impl<'i> LLVMEmit<'i> {
                 self.builder().store(&init, &alloca);
 
 
-                with_var(symbols, var, alloca, |sym| {
-                    self.gen_expr(exp.deref(), sym)
-                })
+                with_var(symbols, var, alloca, |sym| self.gen_expr(exp.deref(), sym))
             }
             ApplyCls(ref callee, ref args) => {
-                let callee_ty = self.generator.get_llvm_type(callee.ref_scheme().body());
                 // get the pointer to closure struct
                 let callee_ptr = self.gen_expr(callee, symbols); //.into_function();
 
@@ -180,15 +172,20 @@ impl<'i> LLVMEmit<'i> {
                     args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
 
                 // get fvs from closure struct
-                let fvs_ptr = self.builder().struct_field_ptr(&callee_ptr, 1, "cls.fv");
                 // add fv into arguments
-                argsv.push(fvs_ptr);
+                let fvs = {
+                    let fvs_ptr = self.builder().struct_field_ptr(&callee_ptr, 1, "cls.fvptr");
+                    self.builder().load(&fvs_ptr, "cls.fv")
+                };
+                argsv.push(fvs);
 
                 // get actual function entry
                 let fn_entry_ptr = self.builder().struct_field_ptr(&callee_ptr, 0, "cls.fn");
                 // get a void* pointer
                 let fn_entry = self.builder().load(&fn_entry_ptr, "cls.fn.actual");
                 // cast to function pointer
+                let callee_ty = self.generator.get_llvm_type(callee.ref_scheme().body()).get_ptr(0);
+                // self.builder().bit_cast(&fn_entry, &callee_ty, "cls.callee")
                 let fun =
                     self.builder().bit_cast(&fn_entry, &callee_ty, "cls.callee").into_function();
 
@@ -212,15 +209,20 @@ impl<'i> LLVMEmit<'i> {
                 // make a closure type
                 let fv_ty: Vec<LLVMType> = cls.fv()
                     .into_iter()
-                    .map(|fv_name| symbols.lookup(&fv_name).unwrap().get_type())
+                    .map(|fv_name| {
+                             symbols.lookup(&fv_name)
+                                 .unwrap()
+                                 .get_type()
+                                 .get_element()
+                         })
                     .collect();
                 let cls_actual_ty = self.generator.get_actual_cls_type(&fv_ty);
 
                 // allocate for closure
-                let alloca = self.builder().alloca(&cls_actual_ty, "cls.actual");
+                let cls_ptr = self.builder().alloca(&cls_actual_ty, "cls.actual");
 
                 // set function entry
-                let elm_ptr_fun = self.builder().struct_field_ptr(&alloca, 0, "cls.fn");
+                let elm_ptr_fun = self.builder().struct_field_ptr(&cls_ptr, 0, "cls.fn");
                 let fn_ent = self.generator
                     .module
                     .get_or_add_function(cls.entry(), &fun_ty)
@@ -233,7 +235,7 @@ impl<'i> LLVMEmit<'i> {
                 self.builder().store(&fn_ent_ptr, &elm_ptr_fun);
 
                 // store free vars
-                let elm_ptr_fv = self.builder().struct_field_ptr(&alloca, 1, "cls.fv");
+                let elm_ptr_fv = self.builder().struct_field_ptr(&cls_ptr, 1, "cls.fv");
                 for (i, fv_id) in cls.fv().into_iter().enumerate() {
                     // if variable stored a pointer, it will get (type **)
                     // if stored a value, (type *)
@@ -246,12 +248,16 @@ impl<'i> LLVMEmit<'i> {
                     self.builder().store(&val, &fv);
                 }
 
-                let cls_ty = self.generator.get_closure_type();
-                let cls_var = self.builder().bit_cast(&alloca, &cls_ty, "cls");
+                let cls_var = {
+                    let cls_ty = self.generator.get_closure_type().get_ptr(0);
+                    let val = self.builder().bit_cast(&cls_ptr, &cls_ty, "cls");
+                    self.get_value_ptr(&val)
+                };
 
-                with_var(symbols, var_decl.name(), cls_var, |sym| {
-                    self.gen_expr(exp, sym)
-                })
+                with_var(symbols,
+                         var_decl.name(),
+                         cls_var,
+                         |sym| self.gen_expr(exp, sym))
             }
             List(_) => unimplemented!(),
             Unary(_, _) => unimplemented!(),
@@ -270,10 +276,20 @@ impl<'i> LLVMEmit<'i> {
         self.generator.create_entry_block_alloca(&fun, name, ty)
     }
 
+    fn alloca_for_vars(&mut self, fun: &LLVMFunction, vars: &Vec<VarDecl>) -> Vec<LLVMValue> {
+        vars.iter().map(|v| self.alloca_for_var(fun, v)).collect()
+    }
+
     fn trace_id(&mut self, id: Id) -> &str {
         self.interner.trace(id)
     }
 
+    fn get_value_ptr(&mut self, val: &LLVMValue) -> LLVMValue {
+        let ty = val.get_type();
+        let alloca = self.builder().alloca(&ty, "ptr");
+        self.builder().store(val, &alloca);
+        alloca
+    }
 }
 
 impl EmitProvider for LLVMCodegen {

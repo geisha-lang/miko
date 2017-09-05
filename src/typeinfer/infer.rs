@@ -19,7 +19,7 @@ use std::mem;
 
 use super::subst::*;
 use super::constraint::{ Constraint };
-use super::error::{ TypeError };
+pub use super::error::{ TypeError };
 
 #[derive(Debug)]
 pub struct Infer<'interner> {
@@ -133,7 +133,11 @@ impl<'i> Infer<'i> {
                     extends.push((p.0.to_owned(), p.1.clone()));
                     types.push(p.1.body().clone());
                 }
-                let typaram = Type::product_n(types);
+                let typaram = if types.is_empty() {
+                    Type::Void
+                } else {
+                    Type::product_n(types)
+                };
                 let new_env = e.extend_n(extends);
                 let tbody = self.infer(&new_env, fun.body.deref_mut())?;
                 form.tag.ty = Scheme::arrow(typaram, tbody.body().clone());
@@ -315,13 +319,13 @@ impl<'i> Infer<'i> {
 
 #[cfg(test)]
 mod tests {
-    use typeinfer::infer::*;
-    use typeinfer::subst::*;
-    use typeinfer::typeenv::*;
+    use typeinfer::*;
     use syntax::form::*;
+    use types::*;
     use syntax::parser;
     use utils::*;
     use internal::*;
+    use internal;
     // use pest::*;
 
 
@@ -345,7 +349,7 @@ mod tests {
     #[test]
     fn infer_lit() {
         let mut interner = Interner::new();
-        let mut inf = Infer::new(&interner);
+        let mut inf = Infer::new(&mut interner);
         let mut env = TypeEnv::new();
 
         assert_eq!(inf.infer(&mut env,
@@ -364,51 +368,59 @@ mod tests {
                                                           P(Type::Var("a".to_string())))),
                                              P(Type::Var("a".to_string()))));
         let PRIMITIVES: Vec<(&str, &Scheme)> = vec![("+", &ty_op)];
-        let mut syn: Form = parse_expr("(a: Fuck, b) -> let c = a in { c + b }");
+        let mut syn: Form = parse_expr(&mut interner, "(a, b) -> let c = a in { c + b + 1 }");
 
-        let mut env = TypeEnv::from_iter(PRIMITIVES.iter().map(|&(n, s)| (n.to_string(), s.clone())));
+        let mut env = TypeEnv::from_iter(PRIMITIVES.iter().map(|&(n, s)| (interner.intern(n), s.clone())));
         let sub = {
-            let mut inf = Infer::new(&interner);
+            let mut inf = Infer::new(&mut interner);
             inf.infer(&mut env, &mut syn);
             inf.solve().unwrap()
         };
-
+        use typeinfer::subst::SubstMut;
         syn.apply_mut(&sub);
 
         assert_eq!(syn, Form::typed(
-            Span::new(0, 38),
-            parser::type_scheme("Fuck * Fuck -> Fuck", &mut Interner::new()).unwrap(),
+            Span::new(0, 36),
+            parser::type_scheme("Int * Int -> Int", &mut Interner::new()).unwrap(),
             Abs(Lambda {
                 param: vec![
-                    VarDecl(interner.inter("a"), Scheme::con("Fuck")),
-                    VarDecl(interner.inter("b"), Scheme::con("Fuck"))
+                    VarDecl(interner.intern("a"), Scheme::con("Int")),
+                    VarDecl(interner.intern("b"), Scheme::con("Int"))
                 ],
                 body: box Form::typed(
-                    Span::new(15, 38),
-                    Scheme::con("Fuck"),
+                    Span::new(9, 36),
+                    Scheme::con("Int"),
                     Let(
-                        VarDecl(interner.inter("c"), Mono(Type::Con(s("Fuck")))),
+                        VarDecl(interner.intern("c"), Mono(Type::Con(s("Int")))),
                         box Form::typed(
-                            Span::new(23, 25),
-                            Scheme::con("Fuck"),
-                            Expr::Var(interner.inter("a"))
+                            Span::new(17, 19),
+                            Scheme::con("Int"),
+                            Expr::Var(interner.intern("a"))
                         ),
                         box Form::typed(
-                            Span::new(28, 38),
-                            Scheme::con("Fuck"),
+                            Span::new(22, 36),
+                            Scheme::con("Int"),
                             Block(vec![
                                 box Form::typed(
-                                    Span::new(30, 36),
-                                    Scheme::con("Fuck"),
+                                    Span::new(24, 34),
+                                    Scheme::con("Int"),
                                     Binary(BinOp::Add,
                                         box Form::typed(
-                                            Span::new(30, 32),
-                                            Scheme::con("Fuck"),
-                                            Expr::Var(interner.inter("c"))),
+                                            Span::new(24, 30),
+                                            Scheme::con("Int"),
+                                            Binary(BinOp::Add,
+                                                box Form::typed(
+                                                    Span::new(24, 26),
+                                                    Scheme::con("Int"),
+                                                    Expr::Var(interner.intern("c"))),
+                                                box Form::typed(
+                                                    Span::new(28, 30),
+                                                    Scheme::con("Int"),
+                                                        Expr::Var(interner.intern("b"))))),
                                         box Form::typed(
-                                            Span::new(34, 36),
-                                            Scheme::con("Fuck"),
-                                                Expr::Var(interner.inter("b")))))
+                                            Span::new(32, 34),
+                                            Scheme::con("Int"),
+                                                Expr::Lit(internal::Lit::Int(1)))))
                             ])
                         )
                     )

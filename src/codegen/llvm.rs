@@ -20,6 +20,7 @@ pub struct LLVMCodegen {
     pub module: LLVMModule,
     pub builder: LLVMBuilder,
     pub context: LLVMContext,
+    pub passer: LLVMFunctionPassManager,
     unique: usize,
 }
 
@@ -48,7 +49,7 @@ pub fn get_llvm_op(op: BinOp, operand_ty: &Type) -> LLVMOperateBuild {
 pub fn is_primitive_type(t: &Type) -> bool {
     if let &Type::Con(ref n) = t {
         match n.as_str() {
-            "Int" | "Float" | "Char" => true,
+            "Int" | "Float" | "Char" | "String" | "Void" => true,
             _ => false,
         }
     } else {
@@ -61,37 +62,39 @@ impl LLVMCodegen {
         let context = LLVMContext::new();
         let module = LLVMModule::in_ctx(name, &context);
         let builder = LLVMBuilder::in_ctx(&context);
+        let passer = LLVMFunctionPassManager::init_for_module(&module);
         LLVMCodegen {
             module,
             context,
             builder,
+            passer,
             unique: 0,
         }
     }
 
 
     pub fn new_symbol(&mut self) -> Result<CString, NulError> {
-        let f = String::new() + self.unique.to_string().as_str();
+        let f = String::from("tmp") + self.unique.to_string().as_str();
         self.unique = self.unique + 1;
         CString::new(f)
     }
 
     pub fn new_symbol_string(&mut self) -> String {
-        let f = String::new() + self.unique.to_string().as_str();
+        let f = String::from("tmp") + self.unique.to_string().as_str();
         self.unique = self.unique + 1;
         f
     }
 
     pub fn get_closure_type(&self) -> LLVMType {
         // closure = [i8*, i8*]
-        let mut mem = vec![self.context.get_int8_type().get_ptr(0),
-                           self.context.get_int8_type().get_ptr(0)];
+        let mem = vec![self.context.get_int8_type().get_ptr(0),
+                       self.context.get_int8_type().get_ptr(0)];
         self.context.get_struct_type(&mem, false)
     }
 
     pub fn get_actual_cls_type(&self, fv_ty: &Vec<LLVMType>) -> LLVMType {
-        let mut mem = vec![self.context.get_int8_type().get_ptr(0),
-                           self.context.get_struct_type(&fv_ty, false)];
+        let mem = vec![self.context.get_int8_type().get_ptr(0),
+                       self.context.get_struct_type(&fv_ty, false)];
         self.context.get_struct_type(&mem, false)
     }
 
@@ -115,6 +118,9 @@ impl LLVMCodegen {
                     "Int" => self.context.get_int32_type(),
                     "Float" => self.context.get_double_type(),
                     "Char" => self.context.get_int8_type(),
+                    "Bool" => self.context.get_int1_type(),
+                    "String" => self.context.get_int8_type().get_ptr(0),
+                    "Void" => self.context.get_void_type(),
 
                     // User defined types
                     t => self.gen_user_type(t),
@@ -122,12 +128,19 @@ impl LLVMCodegen {
             }
             &Arr(box ref p, box ref ret) => {
                 // Type of parameters and returned value should be pointer if not primitive
-                let cls_type = self.get_closure_type().get_ptr(0);
-                let retty = self.get_llvm_type_or_ptr(ret);
-                let psty = p.prod_to_vec();
+                let fvs_ty = self.context.get_int8_type().get_ptr(0);
+                let retty = if let &Type::Arr(..) = ret {
+                    self.get_closure_type().get_ptr(0)
+                } else {
+                    self.get_llvm_type_or_ptr(ret)
+                };
+                let psty = match p {
+                    &Type::Void => vec![],
+                    _ => p.prod_to_vec()
+                };
                 let mut llvm_psty: Vec<_> =
                     psty.into_iter().map(|t| self.get_llvm_type_or_ptr(t)).collect();
-                llvm_psty.push(cls_type);
+                llvm_psty.push(fvs_ty);
                 LLVMContext::get_function_type(&retty, &llvm_psty, false)
             }
             &Void => self.context.get_void_type(),
@@ -152,7 +165,7 @@ impl LLVMCodegen {
             &Bool(true) => self.context.get_int1_const(1),
             &Bool(false) => self.context.get_int1_const(0),
             // TODO: String represent
-            &Str(ref s) => unimplemented!(),
+            &Str(ref s) => self.context.get_const_string(s.as_str()),
         }
     }
 

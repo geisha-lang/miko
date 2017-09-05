@@ -1,4 +1,4 @@
-#include "gc_bitmap.h"
+#include "../include/gc_bitmap.h"
 
 #include <stdio.h>
 

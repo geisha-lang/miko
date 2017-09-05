@@ -63,7 +63,7 @@ impl<'i> K<'i> {
 
     /// Generate a name for closure
     fn make_cls_name(&mut self, bound: &str) -> String {
-        self.current.clone() + "$closure$" + bound + self.unique().to_string().as_str()
+        self.current.clone() + ".inner.closure." + bound + self.unique().to_string().as_str()
     }
 
     /// Convert a global definition to term
@@ -266,23 +266,25 @@ impl<'i> K<'i> {
                 Term::Binary(op, box self.transform(*left), box self.transform(*right))
             }
             Let(v, val, exp) => {
+                let VarDecl(id, scm) = v.clone();
+                let origin = self.close_var(id, scm.clone());
                 let exp_term = self.transform(*exp);
-                if let Abs(lambda) = val.node {
+                let ret = if let Abs(lambda) = val.node {
                     // Handle closure
 
                     let (cls_name, cls_fv) = {
-                        let VarDecl(ref bound, ref var_ty) = v;
-                        let origin = self.close_var(bound.to_owned(), var_ty.to_owned());
+                        // let VarDecl(ref bound, ref var_ty) = v;
+                        // let origin = self.close_var(bound.to_owned(), var_ty.to_owned());
 
                         let (ps, fv, bd) = self.trans_lambda(lambda);
-                        self.release_var(bound);
-                        if let Some(v) = origin {
-                            self.close_var(bound.to_owned(), v);
-                        }
+                        // self.release_var(bound);
+                        // if let Some(v) = origin {
+                        //     self.close_var(bound.to_owned(), v);
+                        // }
 
-                        let bound_str = self.interner.trace(bound.to_owned()).to_owned();
+                        let bound_str = self.interner.trace(id).to_owned();
                         let _cls_name = self.make_cls_name(bound_str.as_str());
-                        self.define_fn(_cls_name, var_ty.clone(), ps, fv, bd)
+                        self.define_fn(_cls_name, scm, ps, fv, bd)
                     };
 
                     let cls = Closure::new(cls_name, cls_fv);
@@ -292,7 +294,11 @@ impl<'i> K<'i> {
                     // Normal variable bingding
                     let val_term = self.transform(*val);
                     Term::Let(v, box val_term, box exp_term)
+                };
+                if let Some(v) = origin {
+                    self.close_var(id, v);
                 }
+                ret
             }
 
             Apply(callee, params) => {

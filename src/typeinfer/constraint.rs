@@ -24,7 +24,7 @@ impl Constraint {
             Constraint(Prod(l1, l2), Prod(r1, r2)) |
             Constraint(Comp(l1, l2), Comp(r1, r2)) => {
                 let mut u1 = Constraint(*l1, *r1).unify()?;
-                let mut u2 = Constraint(*l2, *r2).apply(&u1).unify()?;
+                let u2 = Constraint(*l2, *r2).apply(&u1).unify()?;
                 u1.apply_mut(&u2);
                 u1.extend(u2);
                 Ok(u1)

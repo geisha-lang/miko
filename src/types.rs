@@ -107,12 +107,17 @@ impl Type {
     {
 
         let mut it = ts.into_iter().rev();
-        let last = it.next().unwrap();
-        let mut res = last;
-        for ty in it {
-            res = Type::Prod(P(ty), P(res));
+        let last = it.next();
+        match last {
+            Some(last) => {
+                let mut res = last;
+                for ty in it {
+                    res = Type::Prod(P(ty), P(res));
+                }
+                res
+            }
+            _ => panic!("Empty vec to product")
         }
-        res
     }
     pub fn compose_n<I>(ts: I) -> Type
         where I: IntoIterator<Item = Type>

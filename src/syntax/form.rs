@@ -149,6 +149,9 @@ impl Form {
             },
         }
     }
+    pub fn span(&self) -> Span {
+        self.tag.pos.clone()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

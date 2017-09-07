@@ -47,6 +47,24 @@ pub struct SymTable<'a, K, T: 'a>
 }
 
 impl<'a: 'b, 'b, K: 'a, T: 'a> SymTable<'a, K, T>
+    where K: 'a + ::std::cmp::Eq + ::std::hash::Hash + Clone
+{
+    pub fn with_var<F, R>(&mut self, var: K, val: T, mut cb: F) -> R
+        where F: FnMut(&mut Self) -> R
+    {
+        let old = self.insert(var.to_owned(), val);
+        let res = cb(self);
+        if let Some(o) = old {
+            self.insert(var, o);
+        } else {
+            self.remove(&var);
+        }
+        res
+    }
+
+}
+
+impl<'a: 'b, 'b, K: 'a, T: 'a> SymTable<'a, K, T>
     where K: 'a + ::std::cmp::Eq + ::std::hash::Hash
 {
     pub fn new() -> SymTable<'a, K, T> {

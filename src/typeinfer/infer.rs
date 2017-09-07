@@ -65,8 +65,8 @@ impl<'i> Infer<'i> {
     }
 
     /// Add a constraint
-    fn uni(&mut self, left: &Type, right: &Type) {
-        self.constraints.push_back(Constraint(left.clone(), right.clone()));
+    fn uni(&mut self, left: (&Type, Span), right: (&Type, Span)) {
+        self.constraints.push_back(Constraint(left.0.clone(), right.0.clone()));
     }
 
     /// Temporary instantiate a polymorphism type
@@ -112,7 +112,7 @@ impl<'i> Infer<'i> {
                     form.tag.ty = (*ty).clone();
                     // form.set_scheme();
                 } else {
-                    return Err(NotInScope(form.to_owned()));
+                    return Err(NotInScope(self.interner.trace(*n).to_owned(), form.tag.pos));
                 }
             }
 
@@ -146,13 +146,14 @@ impl<'i> Infer<'i> {
             // A function apply.
             // Types of arguments should be able to unify with callee.
             // Infer the returned type.
-            Apply(ref mut callee, ref mut args) => {
-                let ty_callee = self.infer(e, (*callee).deref_mut())?;
+            Apply(box ref mut callee, ref mut args) => {
+                let callee_pos = callee.tag.pos;
+                let ty_callee = self.infer(e, callee)?;
                 let callee_inst = self.instantiate(ty_callee);
                 let mut ty_args: Vec<Type> = vec![];
 
                 for arg in args.iter_mut() {
-                    ty_args.push(self.infer(e, (*arg).deref_mut())?
+                    ty_args.push(self.infer(e, arg)?
                                      .body()
                                      .clone());
                 }
@@ -161,7 +162,7 @@ impl<'i> Infer<'i> {
 
                 let tyfun = Scheme::arrow(Type::product_n(ty_args), form.tag.clone_type());
 
-                self.uni(&callee_inst, tyfun.body());
+                self.uni((&callee_inst, callee_pos), (tyfun.body(), form.tag.pos));
             }
 
             // Type of binary ops should exist in environment.
@@ -174,19 +175,20 @@ impl<'i> Infer<'i> {
                     form.tag.ty = to_mono(self.fresh());
 
                     let ty_fun = Scheme::arrow(ty_lr, form.tag.clone_type());
-                    self.uni(ty_op.body(), ty_fun.body());
+                    self.uni((ty_op.body(), form.tag.pos), (ty_fun.body(), form.tag.pos));
                 } else {
                     return Err(TypeError::UnknownOperator(op.clone(), form.tag.pos.clone()));
                 }
             }
 
             // Let bound
-            Let(VarDecl(ref name, ref mut ty), ref mut val, ref mut body) => {
+            Let(VarDecl(ref name, ref mut ty), box ref mut val, box ref mut body) => {
+                let val_pos = val.tag.pos;
                 let tyval = self.infer(e, val)?;
                 if *ty == Scheme::Slot {
                     *ty = to_mono(self.fresh());
                 }
-                self.uni(ty.body(), tyval.body());
+                self.uni((ty.body(), body.tag.pos), (tyval.body(), val_pos));
 
                 let tyexp = self.infer(&e.extend(name.to_owned(), tyval.to_owned()), body)?;
                 form.tag.ty = tyexp.clone();
@@ -195,13 +197,16 @@ impl<'i> Infer<'i> {
             // If expression
             // Condition should be `Bool`,
             //   all branches should be unified.
-            If(ref mut cond, ref mut tr, ref mut fl) => {
+            If(box ref mut cond, box ref mut tr, box ref mut fl) => {
+                let cond_pos = cond.tag.pos;
+                let tr_pos = tr.tag.pos;
+                let fl_pos = fl.tag.pos;
                 let tycond = self.infer(e, cond)?;
                 let tytr = self.infer(e, tr)?;
                 let tyfl = self.infer(e, fl)?;
 
-                self.uni(tycond.body(), &Type::Con("Bool".to_string()));
-                self.uni(tytr.body(), tyfl.body());
+                self.uni((tycond.body(), cond_pos), (&Type::Con("Bool".to_string()), cond_pos));
+                self.uni((tytr.body(), tr_pos), (tyfl.body(), fl_pos));
                 form.tag.set_scheme(tytr.clone());
             }
 
@@ -219,8 +224,9 @@ impl<'i> Infer<'i> {
             List(ref mut exps) => {
                 let tyitem: Type = self.fresh();
                 for f in exps.iter_mut() {
+                    let pos = f.tag.pos;
                     let ty = self.infer(e, f)?;
-                    self.uni(ty.body(), &tyitem);
+                    self.uni((ty.body(), form.tag.pos), (&tyitem, pos));
                 }
 
                 form.tag.set_scheme(to_mono(
@@ -234,7 +240,7 @@ impl<'i> Infer<'i> {
         // If there is a type annotation, unify it with inferred type
         if let Some(ref annot) = form.tag.annotate {
             let anno_inst = self.instantiate(annot);
-            self.uni(&anno_inst, form.tag.ref_type());
+            self.uni((&anno_inst, form.tag.pos), (form.tag.ref_type(), form.tag.pos));
         }
 
         Ok(form.tag.ref_scheme())

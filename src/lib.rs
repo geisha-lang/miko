@@ -8,9 +8,11 @@
 #![feature(placement_new_protocol)]
 #![feature(libc)]
 #![feature(box_syntax, box_patterns)]
-
+#![feature(slice_patterns)]
 
 extern crate libllvm;
+
+extern crate llvm_sys;
 
 extern crate bytecount;
 extern crate libc;

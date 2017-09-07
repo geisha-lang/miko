@@ -4,8 +4,8 @@ use internal::*;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum TypeError {
-    NotInScope(Form),
+    NotInScope(String, Span),
     MisMatch(Type, Type),
-    HighRank(Form),
+    HighRank(Type, Span),
     UnknownOperator(BinOp, Span),
 }

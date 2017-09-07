@@ -1,16 +1,16 @@
-use llvm_sys::prelude::{LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMPassManagerRef,
+pub use llvm_sys::prelude::{LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMPassManagerRef,
                         LLVMTypeRef, LLVMValueRef, LLVMBasicBlockRef};
 use llvm_sys::execution_engine::{LLVMExecutionEngineRef, LLVMGenericValueRef,
                                  LLVMGenericValueToFloat, LLVMRunFunction};
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyFunction};
-use llvm_sys::LLVMRealPredicate;
-pub use llvm_sys::core::*;
+pub use llvm_sys::{ LLVMIntPredicate, LLVMRealPredicate };
 use llvm_sys::transforms;
 
 use std::ptr;
 use libc::{c_char, c_uint, c_ulonglong};
 use std::ffi::CString;
 
+pub use llvm_sys::core::*;
 
 
 pub trait LLVMWrapper<T> {
@@ -179,6 +179,8 @@ impl LLVMFunctionPassManager {
             transforms::scalar::LLVMAddCFGSimplificationPass(llfpm);
             // transforms::scalar::LLVMAddDeadStoreEliminationPass(llfpm);
             transforms::scalar::LLVMAddMergedLoadStoreMotionPass(llfpm);
+            transforms::scalar::LLVMAddConstantPropagationPass(llfpm);
+            transforms::scalar::LLVMAddPromoteMemoryToRegisterPass(llfpm);
             LLVMInitializeFunctionPassManager(llfpm);
             LLVMFunctionPassManager(llfpm)
         }
@@ -266,15 +268,33 @@ impl LLVMBuilder {
         unsafe { LLVMPositionBuilderAtEnd(self.raw_ptr(), block.raw_ptr()) }
     }
 
-    pub fn insert_block(&self) -> LLVMBasicBlock {
+    pub fn get_insert_block(&self) -> LLVMBasicBlock {
         unsafe { LLVMBasicBlock::from_ref(LLVMGetInsertBlock(self.raw_ptr())) }
     }
 
-    method_build_instr!(alloca, LLVMBuildAlloca, ty: &LLVMType => target: &str);
-    method_build_instr!(load, LLVMBuildLoad, ptr: &LLVMValue => target: &str);
+    method_build_instr!(alloca, LLVMBuildAlloca, ty: &LLVMType => dest: &str);
+    method_build_instr!(phi, LLVMBuildPhi, ty: &LLVMType => dest: &str);
+    method_build_instr!(load, LLVMBuildLoad, ptr: &LLVMValue => dest: &str);
     method_build_instr!(store, LLVMBuildStore, val: &LLVMValue, ptr: &LLVMValue);
     method_build_instr!(ret, LLVMBuildRet, val: &LLVMValue);
-    method_build_instr!(bit_cast, LLVMBuildBitCast, val: &LLVMValue, dest_ty: &LLVMType => name: &str);
+    method_build_instr!(cond_br, LLVMBuildCondBr, cond: &LLVMValue, then: &LLVMBasicBlock, el: &LLVMBasicBlock);
+    method_build_instr!(br, LLVMBuildBr, cont: &LLVMBasicBlock);
+    method_build_instr!(bit_cast, LLVMBuildBitCast, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
+
+    pub fn phi_node<'a, I>(&self, ty: &LLVMType, incoming: I, dest: &str) -> LLVMValue
+        where I: IntoIterator<Item=&'a (&'a LLVMValue, &'a LLVMBasicBlock)>
+    {
+        unsafe {
+            let phi = LLVMBuildPhi(self.raw_ptr(), ty.raw_ptr(), raw_string(dest));
+            let (mut vals, mut blks): (Vec<_>, Vec<_>) = incoming
+                .into_iter()
+                .map(|&(val, blk)| (val.raw_ptr(), blk.raw_ptr()))
+                .unzip();
+            let count = vals.len();
+            LLVMAddIncoming(phi, vals.as_mut_ptr(), blks.as_mut_ptr(), count as c_uint);
+            LLVMValue::from_ref(phi)
+        }
+    }
 
     pub fn ret_void(&self) -> LLVMValue {
         unsafe {

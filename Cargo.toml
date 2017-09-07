@@ -6,6 +6,8 @@ build = "build.rs"
 
 [dependencies]
 bytecount = "0.1.4"
+llvm-sys = "39"
+argparse = "*"
 libllvm = { path="./libllvm" }
 
 [features]

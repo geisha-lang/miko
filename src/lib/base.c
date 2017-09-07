@@ -13,4 +13,12 @@ void putChar(const char c, void *fv)
     putchar(c);
 }
 
+void putNumber(const uint32_t n, void *fv)
+{
+    printf("%d", n);
+}
 
+void putFloat(const double f, void *fv)
+{
+    printf("%lf", f);
+}

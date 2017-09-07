@@ -24,26 +24,43 @@ pub struct LLVMCodegen {
     unique: usize,
 }
 
-
-pub fn get_llvm_op(op: BinOp, operand_ty: &Type) -> LLVMOperateBuild {
+type LLVMOpBuilder<'a> = Fn(LLVMBuilderRef,
+                            LLVMValueRef,
+                            LLVMValueRef,
+                            *const ::libc::c_char)
+                            -> LLVMValueRef + 'a;
+pub fn get_llvm_op<'a>(op: BinOp, operand_ty: &'a Type) -> Box<LLVMOpBuilder<'a>> {
     use self::BinOp::*;
     use self::Type::*;
-    if let &Con(ref ty_name) = operand_ty {
-        let name_ref = ty_name.as_str();
-        match (op, name_ref) {
-            (Add, "Int") => LLVMBuildAdd,
-            (Add, "Float") => LLVMBuildFAdd,
-            (Sub, "Int") => LLVMBuildSub,
-            (Sub, "Float") => LLVMBuildFSub,
-            (Mul, "Int") => LLVMBuildMul,
-            (Mul, "Float") => LLVMBuildFMul,
-            (Div, _) => LLVMBuildFDiv, // TODO: I dont know exactly which builder
-            (Rem, _) => LLVMBuildURem, //       should I use for these two
-            _ => unimplemented!(),
+    box move |builder, lhs, rhs, dest|
+        if let &Con(ref ty_name) = operand_ty {
+            let name_ref = ty_name.as_str();
+            unsafe {
+                match (op, name_ref) {
+                    (Add, "Int") => LLVMBuildAdd(builder, lhs, rhs, dest),
+                    (Add, "Float") => LLVMBuildFAdd(builder, lhs, rhs, dest),
+                    (Sub, "Int") => LLVMBuildSub(builder, lhs, rhs, dest),
+                    (Sub, "Float") => LLVMBuildFSub(builder, lhs, rhs, dest),
+                    (Mul, "Int") => LLVMBuildMul(builder, lhs, rhs, dest),
+                    (Mul, "Float") => LLVMBuildFMul(builder, lhs, rhs, dest),
+                    (Eq, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, lhs, rhs, dest),
+                    (Lt, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLT, lhs, rhs, dest),
+                    (Le, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLE, lhs, rhs, dest),
+                    (Gt, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGT, lhs, rhs, dest),
+                    (Ge, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGE, lhs, rhs, dest),
+                    (Eq, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOEQ, lhs, rhs, dest),
+                    (Lt, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOLT, lhs, rhs, dest),
+                    (Le, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOLE, lhs, rhs, dest),
+                    (Gt, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGT, lhs, rhs, dest),
+                    (Ge, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGE, lhs, rhs, dest),
+                    (Div, _) => LLVMBuildFDiv(builder, lhs, rhs, dest), // TODO: I dont know exactly which builder
+                    (Rem, _) => LLVMBuildURem(builder, lhs, rhs, dest), //       should I use for these two
+                    _ => unimplemented!(),
+                }
+            }
+        } else {
+            unreachable!()
         }
-    } else {
-        unreachable!()
-    }
 }
 
 pub fn is_primitive_type(t: &Type) -> bool {
@@ -106,6 +123,12 @@ impl LLVMCodegen {
         } else {
             ret
         }
+    }
+
+    pub fn get_main_type(&self) -> LLVMType {
+        let retty = self.context.get_int32_type();
+        let pty = self.context.get_void_type();
+        LLVMContext::get_function_type(&retty, &vec![pty], false)
     }
 
     pub fn get_llvm_type(&self, ty: &Type) -> LLVMType {

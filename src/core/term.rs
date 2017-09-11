@@ -36,7 +36,7 @@ impl TypeDef {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct FunDef {
-    name: Name,
+    name: Id,
     params: Vec<VarDecl>,
     freevars: Vec<VarDecl>,
     body: Node,
@@ -44,24 +44,24 @@ pub struct FunDef {
 }
 
 impl FunDef {
-    pub fn new(name: Name,
+    pub fn new(name: Id,
                ty: Scheme,
                params: Vec<VarDecl>,
                freevars: Vec<VarDecl>,
                body: TaggedTerm)
                -> FunDef {
         FunDef {
-            name: name,
-            params: params,
-            freevars: freevars,
+            ty,
+            name,
+            params,
+            freevars,
             body: box body,
-            ty: ty, 
 //            inst: None
         }
     }
 
-    pub fn name<'a>(&'a self) -> &str {
-        self.name.as_str()
+    pub fn name<'a>(&'a self) -> Id {
+        self.name.clone()
     }
 
     pub fn fv<'a>(&'a self) -> &'a Vec<VarDecl> {
@@ -121,6 +121,8 @@ pub enum Term {
 
     /// Apply a closure
     ApplyCls(Node, Vec<Node>),
+    /// Apply function without free vars
+    ApplyDir(VarDecl, Vec<Node>),
 
     //** For now, all functions will represent as closure
     /// Apply a global function directly
@@ -145,15 +147,15 @@ pub enum Term {
 ///   global definition and a actual free variable list.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Closure {
-    entry: String,
+    entry: Id,
     actualFv: Vec<Id>,
 }
 
 impl Closure {
-    pub fn new(ent: &str, fv: Vec<Id>) -> Closure {
+    pub fn new(entry: Id, actualFv: Vec<Id>) -> Closure {
         Closure {
-            entry: ent.to_string(),
-            actualFv: fv,
+            entry,
+            actualFv,
         }
     }
 
@@ -161,7 +163,7 @@ impl Closure {
         self.actualFv.clone()
     }
 
-    pub fn entry(&self) -> &str {
-        self.entry.as_str()
+    pub fn entry(&self) -> Id {
+        self.entry.clone()
     }
 }

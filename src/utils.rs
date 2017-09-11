@@ -34,6 +34,10 @@ impl Interner {
     pub fn trace(&self, i: Id) -> &str {
         self.backward[i.0].as_str()
     }
+
+    pub fn trace_string(&self, i: Id) -> String {
+        self.backward[i.0].clone()
+    }
 }
 
 
@@ -47,7 +51,7 @@ pub struct SymTable<'a, K, T: 'a>
 }
 
 impl<'a: 'b, 'b, K: 'a, T: 'a> SymTable<'a, K, T>
-    where K: 'a + ::std::cmp::Eq + ::std::hash::Hash + Clone
+    where K: ::std::cmp::Eq + ::std::hash::Hash + Clone
 {
     pub fn with_var<F, R>(&mut self, var: K, val: T, mut cb: F) -> R
         where F: FnMut(&mut Self) -> R
@@ -61,7 +65,6 @@ impl<'a: 'b, 'b, K: 'a, T: 'a> SymTable<'a, K, T>
         }
         res
     }
-
 }
 
 impl<'a: 'b, 'b, K: 'a, T: 'a> SymTable<'a, K, T>

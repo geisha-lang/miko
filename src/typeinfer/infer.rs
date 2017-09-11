@@ -87,7 +87,7 @@ impl<'i> Infer<'i> {
     /// The main inference algorithm
     /// Infering type and tagging form
     fn infer<'a>(&mut self,
-                     e: &TypeEnv,
+                     e: &mut TypeEnv,
                      form: &'a mut Form)
                      -> Result<&'a Scheme, TypeError> {
         use self::Expr::*;
@@ -138,8 +138,8 @@ impl<'i> Infer<'i> {
                 } else {
                     Type::product_n(types)
                 };
-                let new_env = e.extend_n(extends);
-                let tbody = self.infer(&new_env, fun.body.deref_mut())?;
+                let mut new_env = e.extend_n(extends);
+                let tbody = self.infer(&mut new_env, fun.body.deref_mut())?;
                 form.tag.ty = Scheme::arrow(typaram, tbody.body().clone());
             }
 
@@ -184,13 +184,27 @@ impl<'i> Infer<'i> {
             // Let bound
             Let(VarDecl(ref name, ref mut ty), box ref mut val, box ref mut body) => {
                 let val_pos = val.tag.pos;
-                let tyval = self.infer(e, val)?;
                 if *ty == Scheme::Slot {
                     *ty = to_mono(self.fresh());
                 }
+                let tyval =
+                    if let Abs(..) = val.node {
+                        let old = e.insert(name.to_owned(), ty.to_owned());
+                        let ret = self.infer(e, val)?;
+                        if let Some(t) = old {
+                            e.insert(name.to_owned(), t);
+                        }
+                        ret
+                    } else {
+                        self.infer(e, val)?
+                    };
                 self.uni((ty.body(), body.tag.pos), (tyval.body(), val_pos));
 
-                let tyexp = self.infer(&e.extend(name.to_owned(), tyval.to_owned()), body)?;
+                let old = e.insert(name.to_owned(), tyval.to_owned());
+                let tyexp = self.infer(e, body)?;
+                if let Some(t) = old {
+                    e.insert(name.to_owned(), t);
+                }
                 form.tag.ty = tyexp.clone();
             }
 
@@ -270,7 +284,7 @@ impl<'i> Infer<'i> {
         for d in program.iter_mut() {
             if d.is_form() {
                 let sub = {
-                    self.infer(&env, d.form_body_mut())?;
+                    self.infer(&mut env, d.form_body_mut())?;
                     self.solve()?
                 };
                 d.form_body_mut().apply_mut(&sub);

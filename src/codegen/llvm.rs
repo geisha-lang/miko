@@ -53,6 +53,8 @@ pub fn get_llvm_op<'a>(op: BinOp, operand_ty: &'a Type) -> Box<LLVMOpBuilder<'a>
                     (Le, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOLE, lhs, rhs, dest),
                     (Gt, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGT, lhs, rhs, dest),
                     (Ge, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGE, lhs, rhs, dest),
+                    (And, "Bool") => LLVMBuildAnd(builder, lhs, rhs, dest),
+                    (Or, "Bool") => LLVMBuildOr(builder, lhs, rhs, dest),
                     (Div, _) => LLVMBuildFDiv(builder, lhs, rhs, dest), // TODO: I dont know exactly which builder
                     (Rem, _) => LLVMBuildURem(builder, lhs, rhs, dest), //       should I use for these two
                     _ => unimplemented!(),
@@ -197,6 +199,17 @@ impl LLVMCodegen {
         unimplemented!()
     }
 
+    pub fn get_or_add_function(&self, fun_name: &str, fty: &Type) -> LLVMFunction {
+        match self.module.get_function(fun_name) {
+            Some(f) => f,
+            None => {
+                let ty = self.get_llvm_type(fty);
+                self.module.add_function(fun_name, &ty)
+            }
+        }
+    }
+
+
     pub fn create_entry_block_alloca(&self,
                                      fun: &LLVMFunction,
                                      var_name: &str,
@@ -205,7 +218,10 @@ impl LLVMCodegen {
         let builder = LLVMBuilder::in_ctx(&self.context);
         let block = fun.get_entry_basic_block();
         let fi = block.get_first_instr();
-        let llvm_ty = self.get_llvm_type(ty);
+        let llvm_ty = match ty {
+            &Type::Arr(..) => self.get_closure_type().get_ptr(0),
+            _ => self.get_llvm_type(ty)
+        };
         builder.set_position(&block, &fi);
         builder.alloca(&llvm_ty, var_name)
     }

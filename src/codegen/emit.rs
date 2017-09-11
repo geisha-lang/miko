@@ -15,6 +15,7 @@ pub trait EmitProvider {
 pub struct LLVMEmit<'i> {
     pub generator: LLVMCodegen,
     interner: &'i mut Interner,
+    funpass: bool,
 }
 
 pub type VarEnv<'a> = SymTable<'a, Id, LLVMValue>;
@@ -38,22 +39,25 @@ impl<'i> LLVMEmit<'i> {
         LLVMEmit {
             generator: LLVMCodegen::new(name),
             interner,
+            funpass: true
         }
     }
     pub fn dump(&mut self) {
         self.generator.module.dump()
     }
+    pub fn close_function_pass(&mut self) {
+        self.funpass = false;
+    }
     pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
         // A global function definition
         let fun_type = def.ref_type();
-        let void_ret: bool = if let &Type::Arr(_, box Type::Void) = fun_type {
+        let void_ret = if let &Type::Arr(_, box Type::Void) = fun_type {
             true
         } else {
             false
         };
-        let llvm_fun_type = self.generator.get_llvm_type(fun_type);
-        let def_name = def.name();
-        let fun = self.module().get_or_add_function(def_name, &llvm_fun_type);
+        let def_name = self.interner.trace(def.name()).to_owned();
+        let fun = self.generator.get_or_add_function(&def_name, fun_type);
         let arg_count = fun.count_params();
 
         // Check redefinition
@@ -71,6 +75,7 @@ impl<'i> LLVMEmit<'i> {
         let param_defs = def.parameters();
         let mut param_count = param_defs.len();
         let param_allocas = self.alloca_for_vars(&fun, param_defs);
+
         if param_allocas.len() + 1 < arg_count {
             let last_formal = param_defs.last();
             if let Some(p) = last_formal {
@@ -108,10 +113,15 @@ impl<'i> LLVMEmit<'i> {
         let fv_tys = fv_allocas.iter().map(|v| v.get_type().get_element()).collect();
         let fv_ty_actual = self.context().get_struct_type(&fv_tys, false);
         let fv_ptr_actual = self.builder().bit_cast(&p_fvs, &fv_ty_actual.get_ptr(0), "fv");
+        p_fvs.dump();
+        fv_ptr_actual.dump();
         for (i, fv) in fv_allocas.into_iter().enumerate() {
             let fv_id = formal_fvs[i].name();
             let fv_name = self.interner.trace(fv_id);
             let fv_val_ptr = self.builder().struct_field_ptr(&fv_ptr_actual, i, "tmp");
+            let fv_ty_actual = fv.get_type();
+//            println!("22222222222222FUCK::::::::::::::::::");
+//            let fv_val_ptr_cast = self.builder().bit_cast(&fv_val_ptr, &fv_ty_actual.get_ptr(0), "cast");
             let fv_val = self.builder().load(&fv_val_ptr, fv_name);
             self.builder().store(&fv_val, &fv);
             symtbl.insert(fv_id, fv);
@@ -123,12 +133,12 @@ impl<'i> LLVMEmit<'i> {
         self.builder().ret(&fun_body);
 
         fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction);
-        self.generator.passer.run(&fun);
+        if self.funpass { self.generator.passer.run(&fun); }
     }
 
     pub fn gen_main(&mut self, def: &FunDef, prelude: &VarEnv) {
         let main_ty = self.generator.get_main_type();
-        let fun = self.module().get_or_add_function("main", &main_ty);
+        let fun = self.module().add_function("main", &main_ty);
         let block = self.context().append_basic_block(&fun, "entry");
         self.builder().set_position_at_end(&block);
         let zero = self.context().get_int32_const(0);
@@ -138,15 +148,15 @@ impl<'i> LLVMEmit<'i> {
         self.builder().store(&res, &alloca);
         self.builder().ret(&zero);
         fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction);
-        self.generator.passer.run(&fun);
+        if self.funpass { self.generator.passer.run(&fun); }
     }
     /// Long bull shit
     fn gen_expr<'a: 'b, 'b>(&mut self,
-                                term: &'a TaggedTerm,
-                                symbols: &mut VarEnv<'b>)
-                                -> LLVMValue {
+                            term: &'a TaggedTerm,
+                            symbols: &mut VarEnv<'b>)
+                            -> LLVMValue {
         use self::Term::*;
-        match *term.body() {
+        let ret = match *term.body() {
             Lit(ref lit) => self.generator.gen_lit(lit),
             Var(vn) => {
                 let var_name = self.interner.trace(vn);
@@ -155,7 +165,7 @@ impl<'i> LLVMEmit<'i> {
                     _ => {
                         println!("cannot find variable {}", self.interner.trace(vn));
                         unreachable!()
-                    } // global functions should be converted to closure
+                    }
                 }
             }
             Binary(op, ref lhs, ref rhs) => {
@@ -183,15 +193,14 @@ impl<'i> LLVMEmit<'i> {
                 // get the pointer to closure struct
                 let callee_ptr = self.gen_expr(callee, symbols); //.into_function();
 
-                let mut argsv: Vec<_> =
-                    args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+                let mut argsv: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.gen_expr(arg, symbols))
+                    .collect();
 
                 // get fvs from closure struct
                 // add fv into arguments
-                let fvs = {
-                    let fvs_ptr = self.builder().struct_field_ptr(&callee_ptr, 1, "cls.fvptr");
-                    self.builder().load(&fvs_ptr, "cls.fv")
-                };
+                let fvs = self.builder().struct_field_ptr(&callee_ptr, 1, "cls.fv");
                 argsv.push(fvs);
 
                 // get actual function entry
@@ -205,6 +214,17 @@ impl<'i> LLVMEmit<'i> {
                     self.builder().bit_cast(&fn_entry, &callee_ty, "cls.callee").into_function();
 
                 self.builder().call(&fun, &mut argsv, "call")
+            }
+            ApplyDir(VarDecl(fun, ref fun_ty), ref args) => {
+                let empty_fv_ty = self.context().get_int8_type();
+                let empty_fv_ptr = self.builder().alloca(&empty_fv_ty, "fv");
+                let mut argsv: Vec<_> =
+                    args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+                argsv.push(empty_fv_ptr);
+                let callee_name = self.interner.trace(fun);
+                let callee = self.generator.get_or_add_function(callee_name, fun_ty.body());
+
+                self.builder().call(&callee, &mut argsv, "calldirect")
             }
             Block(ref fs) => {
                 let mut it = fs.iter();
@@ -220,61 +240,73 @@ impl<'i> LLVMEmit<'i> {
             }
             MakeCls(ref var_decl, box ref cls, box ref exp) => {
                 let &VarDecl(ref var, ref tyvar) = var_decl;
-                let fun_ty = self.generator.get_llvm_type(tyvar.body());
-                // make a closure type
-                let fv_ty: Vec<LLVMType> = cls.fv()
-                    .into_iter()
-                    .map(|fv_name| {
-                             symbols.lookup(&fv_name)
-                                 .unwrap()
-                                 .get_type()
-                                 .get_element()
-                         })
-                    .collect();
-                let cls_actual_ty = self.generator.get_actual_cls_type(&fv_ty);
 
-                // allocate for closure
-                let cls_ptr = self.builder().alloca(&cls_actual_ty, "cls.actual");
-
-                // set function entry
-                let elm_ptr_fun = self.builder().struct_field_ptr(&cls_ptr, 0, "cls.fn");
-                let fn_ent = self.module().get_or_add_function(cls.entry(), &fun_ty).into_value();
-                let ptr_ty = self.context().get_int8_type().get_ptr(0);
-                let fn_ent_ptr = self.builder().bit_cast(&fn_ent, &ptr_ty, "fn");
-                self.builder().store(&fn_ent_ptr, &elm_ptr_fun);
-
-                // store free vars
-                let elm_ptr_fv = self.builder().struct_field_ptr(&cls_ptr, 1, "cls.fv");
-                for (i, fv_id) in cls.fv().into_iter().enumerate() {
-                    // if variable stored a pointer, it will get (type **)
-                    // if stored a value, (type *)
-                    let val_ptr = symbols.lookup(&fv_id).unwrap();
-                    let val = self.builder().load(&val_ptr, "tmp");
-                    let fv = {
-                        let fv_name = self.interner.trace(fv_id);
-                        self.builder().struct_field_ptr(&elm_ptr_fv, i, fv_name)
-                    };
-                    self.builder().store(&val, &fv);
-                }
-
-                let cls_var = {
-                    let cls_ty = self.generator.get_closure_type().get_ptr(0);
-                    let val = self.builder().bit_cast(&cls_ptr, &cls_ty, "cls");
-                    self.get_value_ptr(&val)
+                // make a alloca of closure pointer
+                let cls_ty = self.generator.get_closure_type().get_ptr(0);
+                let cls_ptr = {
+                    self.builder().alloca(&cls_ty, "cls")
                 };
 
-                symbols.with_var(var_decl.name(),
-                         cls_var,
-                         |sym| self.gen_expr(exp, sym))
+                let fv_tys: Vec<_> = symbols.with_var(*var, cls_ptr, |sym| {
+                    cls.fv()
+                        .into_iter()
+                        .map(|fv_name| {
+                            match sym.lookup(&fv_name) {
+                                Some(v) => v.get_type().get_element(),
+                                None => {
+                                    eprintln!("unexpected free var: {}", self.interner.trace(fv_name));
+                                    panic!()
+                                }
+                            }
+                        })
+                        .collect()
+                });
+
+
+                // make a closure type
+                let cls_ty_actual = self.generator.get_actual_cls_type(&fv_tys);
+                // allocate for closure
+                let cls_value = self.builder().alloca(&cls_ty_actual, "cls.actual");
+                let cls_cast = self.builder().bit_cast(&cls_value, &cls_ty, "cls.cast");
+                self.builder().store(&cls_cast, &cls_ptr);
+
+
+                cls_value.dump();
+                // set function entry
+                let cls_fun = self.builder().struct_field_ptr(&cls_value, 0, "cls.fn");
+                let fn_ent = {
+                    let ent_name = self.interner.trace_string(cls.entry());
+                    self.generator.get_or_add_function(&ent_name, tyvar.body()).into_value()
+                };
+                let fn_ent_ptr = {
+                    let ptr_ty = self.context().get_int8_type().get_ptr(0);
+                    self.builder().bit_cast(&fn_ent, &ptr_ty, "fn")
+                };
+                self.builder().store(&fn_ent_ptr, &cls_fun);
+
+                symbols.with_var(var_decl.name(), cls_ptr, |sym| {
+                    // store free vars
+                    let cls_fv = self.builder().struct_field_ptr(&cls_value, 1, "cls.fv");
+                    for (i, val_id) in cls.fv().into_iter().enumerate() {
+                        // if variable stored a pointer, it will get (type **)
+                        // if stored a value, (type *)
+                        let val_ptr = sym.lookup(&val_id).expect("cant found free var in evironment");
+                        let val = self.builder().load(&val_ptr, "tmp");
+                        let fv = self.builder().struct_field_ptr(&cls_fv, i, "tmp");
+                        self.builder().store(&val, &fv);
+                    }
+                    self.gen_expr(exp, sym)
+                })
+
             }
             If(box ref c, box ref t, box ref f) => {
-//                unimplemented!()
+                //                unimplemented!()
                 let cond = self.gen_expr(c, symbols);
                 let zero = self.context().get_int1_const(0);
 
                 let blk = self.builder().get_insert_block();
                 let parent = blk.get_parent();
-                let then_blk = self.context().append_basic_block(&parent, "if.then");;
+                let then_blk = self.context().append_basic_block(&parent, "if.then");
                 let else_blk = self.context().append_basic_block(&parent, "if.else");
                 let cont_blk = self.context().append_basic_block(&parent, "if.cont");
 
@@ -297,10 +329,11 @@ impl<'i> LLVMEmit<'i> {
 
                 let ret_ty = then.get_type();
                 self.builder().phi_node(&ret_ty, &[(&then, &then_blk), (&els, &else_blk)], "if.res")
-            },
+            }
             List(_) => unimplemented!(),
             Unary(_, _) => unimplemented!(),
-        }
+        };
+        ret
     }
 
     fn builder(&self) -> &LLVMBuilder {

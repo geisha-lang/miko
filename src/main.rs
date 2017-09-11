@@ -54,6 +54,8 @@ fn load_prelude<'a, 'b: 'a>(interner: &mut Interner, env: &'b TypeEnv) -> TypeEn
         "<=" : "forall a. a * a -> Bool",
         ">=" : "forall a. a * a -> Bool",
         "==" : "forall a. a * a -> Bool",
+        "||" : "Bool * Bool -> Bool",
+        "&&" : "Bool * Bool -> Bool",
         "printLn" : "String -> Void",
         "putNumber" : "Int -> Void"
     );
@@ -131,13 +133,16 @@ fn compile(name: &str, src: &str) -> Result<LLVMCodegen, CompileError> {
     })
     .and_then(|defs|{
         let (mut top, _) = K::go(defs, &mut inter);
+        let main_id = inter.intern("main");
         let mut emitter = LLVMEmit::new(name, &mut inter);
-        let main_fn = top.remove("main");
+    //    emitter.close_function_pass();
+        let main_fn = top.remove(&main_id);
         let env = VarEnv::new();
         if let Some(mf) = main_fn {
             emitter.gen_main(mf.deref(), &env);
         }
         for def in top.values() {
+            println!("{:#?}", def);
             emitter.gen_top_level(def.deref(), &env);
         }
         Ok(emitter.generator)
@@ -188,7 +193,7 @@ fn main() {
     }
 
     fs::File::open(input_file.as_str())
-        .map_err(|e| CompileError::Normal(e.description().to_string()))
+        .map_err(|e| CompileError::Normal("open file failed: ".to_string() + e.description()))
         .and_then(|mut f| {
             let mut src = String::new();
             f.read_to_string(&mut src);

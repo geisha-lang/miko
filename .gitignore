@@ -6,3 +6,6 @@ Cargo.lock
 *.err
 **/*.o
 **/*.s
+cls.exe
+cls.exe.manifest
+CMakeLists.txt

@@ -154,18 +154,26 @@ impl LLVMModule {
         unsafe { LLVMDumpModule(self.raw_ptr()) }
     }
 
-    pub fn get_or_add_function(&self, fun_name: &str, fty: &LLVMType) -> LLVMFunction {
+    pub fn get_function(&self, fun_name: &str) -> Option<LLVMFunction> {
         unsafe {
             let n = raw_string(fun_name);
             let f = LLVMGetNamedFunction(self.0.clone(), n);
-            let t = if f.is_null() {
-                LLVMAddFunction(self.raw_ptr(), raw_string(fun_name), fty.raw_ptr())
+            if f.is_null() {
+                None
             } else {
-                f
-            };
-            LLVMFunction::from_ref(t)
+                Some(LLVMFunction::from_ref(f))
+            }
         }
     }
+
+    pub fn add_function(&self, fun_name: &str, fty: &LLVMType) -> LLVMFunction {
+        unsafe {
+            let n = raw_string(fun_name);
+            let f = LLVMAddFunction(self.raw_ptr(), raw_string(fun_name), fty.raw_ptr());
+            LLVMFunction::from_ref(f)
+        }
+    }
+
 }
 
 impl LLVMFunctionPassManager {
@@ -211,6 +219,11 @@ impl LLVMValue {
     }
     pub fn get_type(&self) -> LLVMType {
         unsafe { LLVMType::from_ref(LLVMTypeOf(self.0)) }
+    }
+    pub fn dump(&self) {
+        unsafe {
+            LLVMDumpValue(self.raw_ptr())
+        }
     }
 }
 

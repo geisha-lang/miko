@@ -142,7 +142,6 @@ fn compile(name: &str, src: &str) -> Result<LLVMCodegen, CompileError> {
             emitter.gen_main(mf.deref(), &env);
         }
         for def in top.values() {
-            println!("{:#?}", def);
             emitter.gen_top_level(def.deref(), &env);
         }
         Ok(emitter.generator)

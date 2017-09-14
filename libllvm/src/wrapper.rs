@@ -189,6 +189,7 @@ impl LLVMFunctionPassManager {
             transforms::scalar::LLVMAddMergedLoadStoreMotionPass(llfpm);
             transforms::scalar::LLVMAddConstantPropagationPass(llfpm);
             transforms::scalar::LLVMAddPromoteMemoryToRegisterPass(llfpm);
+            transforms::scalar::LLVMAddTailCallEliminationPass(llfpm);
             LLVMInitializeFunctionPassManager(llfpm);
             LLVMFunctionPassManager(llfpm)
         }
@@ -206,6 +207,12 @@ impl LLVMType {
     }
     pub fn get_element(&self) -> Self {
         unsafe { LLVMType(LLVMGetElementType(self.0.clone())) }
+    }
+
+    pub fn get_null_ptr(&self) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMConstNull(self.raw_ptr()))
+        }
     }
 }
 
@@ -247,8 +254,8 @@ impl LLVMFunction {
         unsafe { LLVMBasicBlock::from_ref(LLVMGetEntryBasicBlock(self.raw_ptr())) }
     }
 
-    pub fn verify(&self, action: LLVMVerifierFailureAction) {
-        unsafe { LLVMVerifyFunction(self.raw_ptr(), action) };
+    pub fn verify(&self, action: LLVMVerifierFailureAction) -> bool {
+        unsafe { LLVMVerifyFunction(self.raw_ptr(), action) == 0 }
     }
 }
 

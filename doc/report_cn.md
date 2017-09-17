@@ -2,7 +2,7 @@
 
 ## 整体设计
 
-本项目使用 Rust 语言编写，利用 [rust-peg](https://github.com/kevinmehall/rust-peg) 生成语法分析程序，以 LLVM 为代码生成后端，实现了自创编程语言的编译。支持类型推导、闭包等功能。
+利用了 [rust-peg](https://github.com/kevinmehall/rust-peg) 生成语法分析程序，以 LLVM 为代码生成后端。
 
 整体处理流程：
 
@@ -21,8 +21,6 @@ miko -o output.o input.gs
 ```
 cc -o output base.o output.o
 ```
-
-程序使用了 MIT 协议开源的代码，并基于 MIT 协议[开源](https://github.com/nameoverflow/miko)。
 
 ## 语言定义
 
@@ -75,7 +73,7 @@ def main() =
 
 ### 文法定义
 
-位于 `CGF` 文件 ，略。
+位于 `CFG` 文件（与当前实现有差异）。
 
 ### 类型系统
 
@@ -438,8 +436,6 @@ pub struct Closure {
 考虑到代码生成的质量和跨平台，使用 LLVM 作为代码生成目标。编译器使用 LLVM API 生成 LLVM IR 并转化为汇编代码或二进制库文件。代码生成模块主要位于 `src/codegen/emit.rs` 。
 
 这里使用了 rust 版本的 LLVM 基础库 [llvm-sys](https://github.com/tari/llvm-sys.rs) 并进行了额外封装，封装代码位于 `libllvm/src` 和 `src/codegen/llvm.rs`。
-
-由 LLVM 的协助，编译器应用了指令合并、尾递归优化、函数内联、寄存器优化、数据相关优化等优化，可以生成质量较高的机器代码。
 
 ## 运行时
 

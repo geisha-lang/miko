@@ -1,7 +1,3 @@
----
-typora-copy-images-to: ./
----
-
 # 编译器设计
 
 ## 整体设计

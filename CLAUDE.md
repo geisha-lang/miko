@@ -23,6 +23,9 @@ cc -o output base.o output.o
 
 # Emit LLVM IR (for debugging)
 ./target/debug/miko -e input.gs
+
+# Run REPL mode (experimental, not fully implemented)
+./target/debug/miko -r
 ```
 
 ## Architecture
@@ -64,6 +67,38 @@ Built-in functions: `printLn`, `putNumber`
 
 Type annotations: `def foo(x: Int): Int = x + 1`
 Polymorphic types: `forall a. a * a -> a`
+Constrained polymorphism: `forall a. (Eq a) => a * a -> Bool`
+
+### Algebraic Data Types (ADTs)
+
+```
+data TypeName {              # Define ADT
+    Variant1,                 # Unit variant
+    Variant2(Type1, Type2)    # Variant with fields
+}
+```
+
+### Pattern Matching
+
+```
+match expr {
+    Pattern1 -> result1,
+    Constructor(x, y) -> result2,
+    _ -> default               # Wildcard pattern
+}
+```
+
+### Concepts (Type Classes)
+
+```
+concept Eq a {               # Define concept
+    eq: a * a -> Bool
+}
+
+instance Eq Int {            # Implement for type
+    def eq(x, y) = x == y
+}
+```
 
 ## Dependencies
 
@@ -78,3 +113,8 @@ Polymorphic types: `forall a. a * a -> a`
 - Example Geisha programs in `test/` (fibonacci.gs, factorial.gs, etc.)
 - Formal grammar specification in `CFG` file at project root
 - Some deprecated LLVM API warnings exist (opaque pointers) but don't affect functionality
+- REPL mode (`-r`) is experimental and not fully implemented
+- Complete compilation workflow:
+  ```bash
+  cargo build && ./target/debug/miko -o out.o test/fibonacci.gs && cc -o fib base.o out.o && ./fib
+  ```

@@ -6,10 +6,10 @@ use std::ops::DerefMut;
 use std::iter::IntoIterator;
 use std::iter::DoubleEndedIterator;
 
-use utils::*;
-use types::*;
+use crate::utils::*;
+use crate::types::*;
 
-use internal::*;
+use crate::internal::*;
 
 pub type E = P<Form>;
 

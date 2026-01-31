@@ -1,9 +1,9 @@
-use core::*;
-use types::*;
-use internal::*;
-use utils::*;
+use crate::core::*;
+use crate::types::*;
+use crate::internal::*;
+use crate::utils::*;
 
-use codegen::llvm::*;
+use crate::codegen::llvm::*;
 
 use std::ops::Deref;
 
@@ -51,8 +51,8 @@ impl<'i> LLVMEmit<'i> {
     pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
         // A global function definition
         let fun_type = def.ref_type();
-        let void_ret = if let &Type::Arr(_, box Type::Void) = fun_type {
-            true
+        let void_ret = if let Type::Arr(_, ret) = fun_type {
+            matches!(ret.as_ref(), Type::Void)
         } else {
             false
         };
@@ -202,8 +202,10 @@ impl<'i> LLVMEmit<'i> {
                     .collect();
 
                 // get fvs from closure struct
-                // add fv into arguments
-                let fvs = self.builder().struct_field_ptr(&callee_ptr, 1, "cls.fv");
+                // add fv into arguments (cast to i8*)
+                let fvs_ptr = self.builder().struct_field_ptr(&callee_ptr, 1, "cls.fv");
+                let fvs_ty = self.context().get_int8_type().get_ptr(0);
+                let fvs = self.builder().bit_cast(&fvs_ptr, &fvs_ty, "cls.fv.cast");
                 argsv.push(fvs);
 
                 // get actual function entry
@@ -211,12 +213,12 @@ impl<'i> LLVMEmit<'i> {
                 // get a void* pointer
                 let fn_entry = self.builder().load(&fn_entry_ptr, "cls.fn.actual");
                 // cast to function pointer
-                let callee_ty = self.generator.get_llvm_type(callee.ref_scheme().body()).get_ptr(0);
-                // self.builder().bit_cast(&fn_entry, &callee_ty, "cls.callee")
+                let callee_fn_ty = self.generator.get_llvm_type(callee.ref_scheme().body());
+                let callee_ptr_ty = callee_fn_ty.get_ptr(0);
                 let fun =
-                    self.builder().bit_cast(&fn_entry, &callee_ty, "cls.callee").into_function();
+                    self.builder().bit_cast(&fn_entry, &callee_ptr_ty, "cls.callee").into_function();
 
-                self.builder().call(&fun, &mut argsv, "call")
+                self.builder().call_with_type(&callee_fn_ty, &fun, &mut argsv, "call")
             }
             ApplyDir(VarDecl(fun, ref fun_ty), ref args) => {
                 let empty_fv_ty = self.context().get_int8_type().get_ptr(0);
@@ -241,7 +243,9 @@ impl<'i> LLVMEmit<'i> {
                     panic!("Empty block")
                 }
             }
-            MakeCls(ref var_decl, box ref cls, box ref exp) => {
+            MakeCls(ref var_decl, ref cls, ref exp) => {
+                let cls = cls.as_ref();
+                let exp = exp.as_ref();
                 let &VarDecl(ref var, ref tyvar) = var_decl;
 
                 // make a alloca of closure pointer
@@ -301,16 +305,19 @@ impl<'i> LLVMEmit<'i> {
                 })
 
             }
-            If(box ref c, box ref t, box ref f) => {
+            If(ref c, ref t, ref f) => {
+                let c = c.as_ref();
+                let t = t.as_ref();
+                let f = f.as_ref();
                 //                unimplemented!()
                 let cond = self.gen_expr(c, symbols);
                 let zero = self.context().get_int1_const(0);
 
                 let blk = self.builder().get_insert_block();
                 let parent = blk.get_parent();
-                let mut then_blk = self.context().append_basic_block(&parent, "if.then");
-                let mut else_blk = self.context().append_basic_block(&parent, "if.else");
-                let mut cont_blk = self.context().append_basic_block(&parent, "if.cont");
+                let then_blk = self.context().append_basic_block(&parent, "if.then");
+                let else_blk = self.context().append_basic_block(&parent, "if.else");
+                let cont_blk = self.context().append_basic_block(&parent, "if.cont");
 
                 self.builder().cond_br(&cond, &then_blk, &else_blk);
 

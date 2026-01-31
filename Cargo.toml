@@ -2,17 +2,13 @@
 name = "miko"
 version = "0.1.0"
 authors = ["nameoverflow <i@hcyue.me>"]
+edition = "2021"
 build = "build.rs"
 
 [dependencies]
-bytecount = "0.1.4"
-llvm-sys = "39"
-argparse = "*"
-libllvm = { path="./libllvm" }
-
-[features]
-avx-accel = ["bytecount/avx-accel"]
-simd-accel = ["bytecount/simd-accel"]
-
-[build-dependencies]
-peg = { version = "0.5" }
+bytecount = "0.6"
+llvm-sys = "140"
+clap = { version = "4", features = ["derive"] }
+libllvm = { path = "./libllvm" }
+libc = "0.2"
+peg = "0.8"

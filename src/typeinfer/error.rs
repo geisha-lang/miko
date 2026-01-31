@@ -1,6 +1,6 @@
-use types::*;
-use syntax::form::*;
-use internal::*;
+use crate::types::*;
+use crate::syntax::form::*;
+use crate::internal::*;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum TypeError {

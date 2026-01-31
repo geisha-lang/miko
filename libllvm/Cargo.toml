@@ -2,6 +2,8 @@
 name = "libllvm"
 version = "0.1.0"
 authors = ["nameoverflow <i@hcyue.me>"]
+edition = "2021"
 
 [dependencies]
-llvm-sys = "39"
+llvm-sys = "140"
+libc = "0.2"

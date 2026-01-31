@@ -8,7 +8,7 @@ use std::iter::DoubleEndedIterator;
 
 use std::collections::HashMap;
 
-use utils::*;
+use crate::utils::*;
 
 
 /// Represents a variant of `data` type
@@ -127,7 +127,7 @@ impl Type {
         let last = it.next().unwrap();
         let mut res = last;
         for ty in it {
-            res = Type::Comp(box res, box ty);
+            res = Type::Comp(Box::new(res), Box::new(ty));
         }
         res
     }
@@ -137,9 +137,9 @@ impl Type {
         let mut v = vec![];
         let mut r: &Type = self;
         loop {
-            if let &Prod(box ref t, box ref rest) = r {
-                v.push(t);
-                r = rest;
+            if let Prod(t, rest) = r {
+                v.push(t.as_ref());
+                r = rest.as_ref();
             } else {
                 v.push(r);
                 break;
@@ -153,11 +153,11 @@ impl ToString for Type {
     fn to_string(&self) -> String {
         use self::Type::*;
         match self {
-            &Void => String::from("Void"),
-            &Var(ref n) | &Con(ref n) => n.clone(),
-            &Arr(box ref l, box ref r) => l.to_string() + "->" + r.to_string().as_str(),
-            &Prod(box ref l, box ref r) => l.to_string() + "*" + r.to_string().as_str(),
-            &Comp(box ref l, box ref r) => l.to_string() + "+" + r.to_string().as_str(),
+            Void => String::from("Void"),
+            Var(n) | Con(n) => n.clone(),
+            Arr(l, r) => l.to_string() + "->" + r.to_string().as_str(),
+            Prod(l, r) => l.to_string() + "*" + r.to_string().as_str(),
+            Comp(l, r) => l.to_string() + "+" + r.to_string().as_str(),
         }
     }
 }

@@ -7,9 +7,9 @@ use std::ops::DerefMut;
 use std::iter::IntoIterator;
 use std::iter::DoubleEndedIterator;
 
-use internal::*;
-use types::*;
-use utils::*;
+use crate::internal::*;
+use crate::types::*;
+use crate::utils::*;
 
 
 type Node = Box<TaggedTerm>;
@@ -55,7 +55,7 @@ impl FunDef {
             name,
             params,
             freevars,
-            body: box body,
+            body: Box::new(body),
 //            inst: None
         }
     }

@@ -6,12 +6,12 @@ use std::iter::FromIterator;
 use std::ops::Deref;
 use std::ops::DerefMut;
 
-use utils::*;
-use types::*;
-use syntax::form::*;
-use internal::*;
+use crate::utils::*;
+use crate::types::*;
+use crate::syntax::form::*;
+use crate::internal::*;
 
-use core::term::*;
+use crate::core::term::*;
 
 type Direct = HashMap<Id, Id>;
 
@@ -99,7 +99,8 @@ impl<'i> K<'i> {
         let Def { ident, node, .. } = def;
         let name = self.interner.trace(ident).to_owned();
         match node {
-            Item::Form(box form) => {
+            Item::Form(form) => {
+                let form = *form;
                 let Form { node, tag } = form;
                 let ty = tag.ty;
                 self.current = ident;
@@ -116,12 +117,12 @@ impl<'i> K<'i> {
             }
             Item::Alg(ps, vs) => {
                 let params = ps.into_iter().map(|id| self.interner.trace(id).to_owned()).collect();
-                let d = box TypeDef::new(name.clone(), params, TypeKind::Algebra(vs));
+                let d = Box::new(TypeDef::new(name.clone(), params, TypeKind::Algebra(vs)));
                 self.typedefs.insert(ident, d);
             }
             Item::Alias(ps, t) => {
                 let params = ps.into_iter().map(|id| self.interner.trace(id).to_owned()).collect();
-                let d = box TypeDef::new(name.clone(), params, TypeKind::Alias(t));
+                let d = Box::new(TypeDef::new(name.clone(), params, TypeKind::Alias(t)));
                 self.typedefs.insert(ident, d);
             }
         }
@@ -261,7 +262,7 @@ impl<'i> K<'i> {
     }
 
     fn transform_list(&mut self, lst: Vec<P<Form>>) -> Vec<P<TaggedTerm>> {
-        lst.into_iter().map(|f| box self.transform(*f)).collect()
+        lst.into_iter().map(|f| Box::new(self.transform(*f))).collect()
     }
 
     /// Transform syntax form into core term
@@ -285,14 +286,14 @@ impl<'i> K<'i> {
                 }
             }
             List(e) | Block(e) => Term::List(self.transform_list(e)),
-            Unary(op, e) => Term::Unary(op, box self.transform(*e)),
+            Unary(op, e) => Term::Unary(op, Box::new(self.transform(*e))),
             If(cond, tr, fl) => {
-                Term::If(box self.transform(*cond),
-                         box self.transform(*tr),
-                         box self.transform(*fl))
+                Term::If(Box::new(self.transform(*cond)),
+                         Box::new(self.transform(*tr)),
+                         Box::new(self.transform(*fl)))
             }
             Binary(op, left, right) => {
-                Term::Binary(op, box self.transform(*left), box self.transform(*right))
+                Term::Binary(op, Box::new(self.transform(*left)), Box::new(self.transform(*right)))
             }
             Let(v, val, exp) => {
                 let VarDecl(id, scm) = v.clone();
@@ -332,7 +333,7 @@ impl<'i> K<'i> {
                             self.transform(*exp)
                         };
 
-                        Term::MakeCls(v, box cls, box exp_term)
+                        Term::MakeCls(v, Box::new(cls), Box::new(exp_term))
                     }
                     Var(id) => {
                         let val_term = self.transform(*val);
@@ -352,13 +353,13 @@ impl<'i> K<'i> {
                         } else {
                             self.transform(*exp)
                         };
-                        Term::Let(v, box val_term, box exp_term)
+                        Term::Let(v, Box::new(val_term), Box::new(exp_term))
                     }
                     _ => {
                         // Normal variable binding
                         let val_term = self.transform(*val);
                         let exp_term = self.transform(*exp);
-                        Term::Let(v, box val_term, box exp_term)
+                        Term::Let(v, Box::new(val_term), Box::new(exp_term))
                     }
                 };
                 if let Some(v) = origin {
@@ -377,10 +378,10 @@ impl<'i> K<'i> {
                             Term::ApplyDir(VarDecl(label.to_owned(), callee_term.ref_scheme().clone()),
                                            params_term)
                         } else {
-                            Term::ApplyCls(box callee_term, params_term)
+                            Term::ApplyCls(Box::new(callee_term), params_term)
                         }
                     }
-                    _ => Term::ApplyCls(box callee_term, params_term)
+                    _ => Term::ApplyCls(Box::new(callee_term), params_term)
                 }
             }
 
@@ -397,8 +398,8 @@ impl<'i> K<'i> {
                 let cls = Closure::new(cls_name, cls_fv);
 
                 Term::MakeCls(VarDecl(tmp_id, ty.clone()),
-                              box cls,
-                              box TaggedTerm::new(ty, Term::Var(tmp_id)))
+                              Box::new(cls),
+                              Box::new(TaggedTerm::new(ty, Term::Var(tmp_id))))
             }
         };
         TaggedTerm::new(tform, t)

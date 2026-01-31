@@ -7,8 +7,8 @@ use std::ops::DerefMut;
 use std::iter::IntoIterator;
 use std::iter::DoubleEndedIterator;
 
-use utils::*;
-use types::*;
+use crate::utils::*;
+use crate::types::*;
 
 
 #[derive(Debug, PartialEq, Clone)]

@@ -1,7 +1,5 @@
 pub use llvm_sys::prelude::{LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMPassManagerRef,
                         LLVMTypeRef, LLVMValueRef, LLVMBasicBlockRef};
-use llvm_sys::execution_engine::{LLVMExecutionEngineRef, LLVMGenericValueRef,
-                                 LLVMGenericValueToFloat, LLVMRunFunction};
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyFunction};
 pub use llvm_sys::{ LLVMIntPredicate, LLVMRealPredicate };
 use llvm_sys::transforms;
@@ -168,7 +166,6 @@ impl LLVMModule {
 
     pub fn add_function(&self, fun_name: &str, fty: &LLVMType) -> LLVMFunction {
         unsafe {
-            let n = raw_string(fun_name);
             let f = LLVMAddFunction(self.raw_ptr(), raw_string(fun_name), fty.raw_ptr());
             LLVMFunction::from_ref(f)
         }
@@ -180,15 +177,14 @@ impl LLVMFunctionPassManager {
     pub fn init_for_module(m: &LLVMModule) -> Self {
         unsafe {
             let llfpm = LLVMCreateFunctionPassManagerForModule(m.raw_ptr());
-            transforms::scalar::LLVMAddBasicAliasAnalysisPass(llfpm);
+            // Note: Some passes have been removed or moved in newer LLVM versions
+            // Using available passes for LLVM 14+
             transforms::scalar::LLVMAddInstructionCombiningPass(llfpm);
             transforms::scalar::LLVMAddReassociatePass(llfpm);
             transforms::scalar::LLVMAddGVNPass(llfpm);
             transforms::scalar::LLVMAddCFGSimplificationPass(llfpm);
-            // transforms::scalar::LLVMAddDeadStoreEliminationPass(llfpm);
             transforms::scalar::LLVMAddMergedLoadStoreMotionPass(llfpm);
-            transforms::scalar::LLVMAddConstantPropagationPass(llfpm);
-            transforms::scalar::LLVMAddPromoteMemoryToRegisterPass(llfpm);
+            transforms::util::LLVMAddPromoteMemoryToRegisterPass(llfpm);
             transforms::scalar::LLVMAddTailCallEliminationPass(llfpm);
             LLVMInitializeFunctionPassManager(llfpm);
             LLVMFunctionPassManager(llfpm)
@@ -218,7 +214,7 @@ impl LLVMType {
 
 impl LLVMValue {
     pub fn set_name(&self, name: &str) {
-        unsafe { LLVMSetValueName(self.0.clone(), raw_string(name)) }
+        unsafe { LLVMSetValueName2(self.0.clone(), raw_string(name), name.len()) }
     }
 
     pub fn into_function(self) -> LLVMFunction {
@@ -237,6 +233,9 @@ impl LLVMValue {
 impl LLVMFunction {
     pub fn into_value(self) -> LLVMValue {
         LLVMValue::from_ref(self.0)
+    }
+    pub fn get_function_type(&self) -> LLVMType {
+        unsafe { LLVMType::from_ref(LLVMGlobalGetValueType(self.raw_ptr())) }
     }
     pub fn count_basic_blocks(&self) -> usize {
         unsafe { LLVMCountBasicBlocks(self.raw_ptr()) as usize }
@@ -294,8 +293,14 @@ impl LLVMBuilder {
 
     method_build_instr!(alloca, LLVMBuildAlloca, ty: &LLVMType => dest: &str);
     method_build_instr!(phi, LLVMBuildPhi, ty: &LLVMType => dest: &str);
-    method_build_instr!(load, LLVMBuildLoad, ptr: &LLVMValue => dest: &str);
     method_build_instr!(store, LLVMBuildStore, val: &LLVMValue, ptr: &LLVMValue);
+
+    pub fn load(&self, ptr: &LLVMValue, dest: &str) -> LLVMValue {
+        let ty = ptr.get_type().get_element();
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildLoad2(self.raw_ptr(), ty.raw_ptr(), ptr.raw_ptr(), raw_string(dest)))
+        }
+    }
     method_build_instr!(ret, LLVMBuildRet, val: &LLVMValue);
     method_build_instr!(cond_br, LLVMBuildCondBr, cond: &LLVMValue, then: &LLVMBasicBlock, el: &LLVMBasicBlock);
     method_build_instr!(br, LLVMBuildBr, cont: &LLVMBasicBlock);
@@ -322,23 +327,37 @@ impl LLVMBuilder {
         }
     }
     pub fn call(&self, fun: &LLVMFunction, args: &mut Vec<LLVMValue>, name: &str) -> LLVMValue {
+        let fn_ty = fun.get_function_type();
+        self.call_with_type(&fn_ty, fun, args, name)
+    }
+
+    pub fn call_with_type(&self, fn_ty: &LLVMType, fun: &LLVMFunction, args: &mut Vec<LLVMValue>, name: &str) -> LLVMValue {
         let mut _args: Vec<_> = args.iter_mut().map(|arg| arg.raw_ptr()).collect();
         unsafe {
             let f = fun.raw_ptr();
-            let ret = LLVMBuildCall(self.raw_ptr(),
-                                    f,
-                                    _args.as_mut_ptr(),
-                                    args.len() as c_uint,
-                                    raw_string(name));
+            // Void-returning functions cannot have a named result
+            let ret_ty = LLVMGetReturnType(fn_ty.raw_ptr());
+            let call_name = if LLVMGetTypeKind(ret_ty) == llvm_sys::LLVMTypeKind::LLVMVoidTypeKind {
+                raw_string("")
+            } else {
+                raw_string(name)
+            };
+            let ret = LLVMBuildCall2(self.raw_ptr(),
+                                     fn_ty.raw_ptr(),
+                                     f,
+                                     _args.as_mut_ptr(),
+                                     args.len() as c_uint,
+                                     call_name);
             LLVMValue::from_ref(ret)
         }
 
     }
 
     pub fn struct_field_ptr(&self, ptr: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
+        let struct_ty = ptr.get_type().get_element();
         unsafe {
             let ret =
-                LLVMBuildStructGEP(self.raw_ptr(), ptr.raw_ptr(), idx as u32, raw_string(name));
+                LLVMBuildStructGEP2(self.raw_ptr(), struct_ty.raw_ptr(), ptr.raw_ptr(), idx as u32, raw_string(name));
             LLVMValue::from_ref(ret)
         }
     }

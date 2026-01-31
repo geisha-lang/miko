@@ -3,10 +3,10 @@ use std::collections::HashMap;
 
 use std::ops::DerefMut;
 
-use syntax::form::*;
-use internal::*;
-use utils::*;
-use types::*;
+use crate::syntax::form::*;
+use crate::internal::*;
+use crate::utils::*;
+use crate::types::*;
 
 pub type Subst = HashMap<Name, Type>;
 pub trait Substituable {
@@ -73,8 +73,8 @@ impl Substituable for Scheme {
             Mono(ty) => Mono(ty.apply(sub)),
             Poly(bounds, ty) => {
                 let mut s_ = sub.clone();
-                for ref n in &bounds {
-                    s_.remove(n.clone());
+                for n in &bounds {
+                    s_.remove(n);
                 }
                 Poly(bounds, ty.apply(&s_))
             }
@@ -88,8 +88,8 @@ impl Substituable for Scheme {
             Mono(ref ty) => (*ty).ftv(),
             Poly(ref bounds, ref ty) => {
                 let mut res = ty.ftv();
-                for ref n in bounds {
-                    res.remove(n.clone());
+                for n in bounds {
+                    res.remove(n);
                 }
                 return res;
             }

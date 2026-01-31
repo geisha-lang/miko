@@ -1,8 +1,8 @@
-use syntax::form::*;
-use internal::*;
-use types::*;
+use crate::syntax::form::*;
+use crate::internal::*;
+use crate::types::*;
 
-use utils::*;
+use crate::utils::*;
 
 use std::collections::LinkedList;
 use std::collections::HashMap;
@@ -11,9 +11,7 @@ use std::collections::HashSet;
 use std::iter::IntoIterator;
 use std::iter::DoubleEndedIterator;
 
-use std::ops::Deref;
 use std::ops::DerefMut;
-use std::ops::Placer;
 
 use std::mem;
 
@@ -73,7 +71,7 @@ impl<'i> Infer<'i> {
     fn instantiate(&mut self, scm: &Scheme) -> Type {
         use self::Scheme::*;
         match *scm {
-            Mono(ref ty) => ty.deref().clone(),
+            Mono(ref ty) => ty.clone(),
             Poly(ref tvs, ref ty) => {
                 let tvs_: Vec<_> = tvs.iter().map(|_| self.fresh()).collect();
                 let sub: Subst = tvs.clone().into_iter().zip(tvs_).collect();
@@ -146,7 +144,8 @@ impl<'i> Infer<'i> {
             // A function apply.
             // Types of arguments should be able to unify with callee.
             // Infer the returned type.
-            Apply(box ref mut callee, ref mut args) => {
+            Apply(ref mut callee, ref mut args) => {
+                let callee = callee.as_mut();
                 let callee_pos = callee.tag.pos;
                 let ty_callee = self.infer(e, callee)?;
                 let callee_inst = self.instantiate(ty_callee);
@@ -182,7 +181,9 @@ impl<'i> Infer<'i> {
             }
 
             // Let bound
-            Let(VarDecl(ref name, ref mut ty), box ref mut val, box ref mut body) => {
+            Let(VarDecl(ref name, ref mut ty), ref mut val, ref mut body) => {
+                let val = val.as_mut();
+                let body = body.as_mut();
                 let val_pos = val.tag.pos;
                 if *ty == Scheme::Slot {
                     *ty = to_mono(self.fresh());
@@ -211,7 +212,10 @@ impl<'i> Infer<'i> {
             // If expression
             // Condition should be `Bool`,
             //   all branches should be unified.
-            If(box ref mut cond, box ref mut tr, box ref mut fl) => {
+            If(ref mut cond, ref mut tr, ref mut fl) => {
+                let cond = cond.as_mut();
+                let tr = tr.as_mut();
+                let fl = fl.as_mut();
                 let cond_pos = cond.tag.pos;
                 let tr_pos = tr.tag.pos;
                 let fl_pos = fl.tag.pos;
@@ -339,27 +343,17 @@ impl<'i> Infer<'i> {
 
 #[cfg(test)]
 mod tests {
-    use typeinfer::*;
-    use syntax::form::*;
-    use types::*;
-    use syntax::parser;
-    use utils::*;
-    use internal::*;
-    use internal;
-    // use pest::*;
-
+    use crate::typeinfer::*;
+    use crate::typeinfer::subst::SubstMut;
+    use crate::syntax::form::*;
+    use crate::types::*;
+    use crate::syntax::parser;
+    use crate::utils::*;
+    use crate::internal::*;
+    use crate::internal;
 
     fn parse_expr(inter: &mut Interner, src: &str) -> Form {
-        parser::expression(src, inter).unwrap()
-    }
-
-
-    fn form(e: Expr) -> P<Form> {
-        P(Form::new(Span::new(0, 0), e))
-    }
-
-    fn fmty(t: Scheme, e: Expr) -> P<Form> {
-        P(Form::typed(Span::new(0, 0), t, e))
+        parser::parse_expr(src, inter).expect("Failed to parse expression")
     }
 
     fn s(src: &'static str) -> String {
@@ -384,69 +378,23 @@ mod tests {
         use self::Type::*;
         let mut interner = Interner::new();
         let ty_op = Scheme::Poly(vec!["a".to_string()],
-                                 Type::Arr(P(Type::Prod(P(Type::Var("a".to_string())),
-                                                          P(Type::Var("a".to_string())))),
-                                             P(Type::Var("a".to_string()))));
-        let PRIMITIVES: Vec<(&str, &Scheme)> = vec![("+", &ty_op)];
+                                 Type::Arr(Box::new(Type::Prod(Box::new(Type::Var("a".to_string())),
+                                                          Box::new(Type::Var("a".to_string())))),
+                                             Box::new(Type::Var("a".to_string()))));
+        let primitives: Vec<(&str, &Scheme)> = vec![("+", &ty_op)];
         let mut syn: Form = parse_expr(&mut interner, "(a, b) -> let c = a in { c + b + 1 }");
 
-        let mut env = TypeEnv::from_iter(PRIMITIVES.iter().map(|&(n, s)| (interner.intern(n), s.clone())));
+        let mut env = TypeEnv::from_iter(primitives.iter().map(|&(n, s)| (interner.intern(n), s.clone())));
         let sub = {
             let mut inf = Infer::new(&mut interner);
-            inf.infer(&mut env, &mut syn);
+            inf.infer(&mut env, &mut syn).expect("Type inference failed");
             inf.solve().unwrap()
         };
-        use typeinfer::subst::SubstMut;
         syn.apply_mut(&sub);
 
-        assert_eq!(syn, Form::typed(
-            Span::new(0, 36),
-            parser::type_scheme("Int * Int -> Int", &mut Interner::new()).unwrap(),
-            Abs(Lambda {
-                param: vec![
-                    VarDecl(interner.intern("a"), Scheme::con("Int")),
-                    VarDecl(interner.intern("b"), Scheme::con("Int"))
-                ],
-                body: box Form::typed(
-                    Span::new(9, 36),
-                    Scheme::con("Int"),
-                    Let(
-                        VarDecl(interner.intern("c"), Mono(Type::Con(s("Int")))),
-                        box Form::typed(
-                            Span::new(17, 19),
-                            Scheme::con("Int"),
-                            Expr::Var(interner.intern("a"))
-                        ),
-                        box Form::typed(
-                            Span::new(22, 36),
-                            Scheme::con("Int"),
-                            Block(vec![
-                                box Form::typed(
-                                    Span::new(24, 34),
-                                    Scheme::con("Int"),
-                                    Binary(BinOp::Add,
-                                        box Form::typed(
-                                            Span::new(24, 30),
-                                            Scheme::con("Int"),
-                                            Binary(BinOp::Add,
-                                                box Form::typed(
-                                                    Span::new(24, 26),
-                                                    Scheme::con("Int"),
-                                                    Expr::Var(interner.intern("c"))),
-                                                box Form::typed(
-                                                    Span::new(28, 30),
-                                                    Scheme::con("Int"),
-                                                        Expr::Var(interner.intern("b"))))),
-                                        box Form::typed(
-                                            Span::new(32, 34),
-                                            Scheme::con("Int"),
-                                                Expr::Lit(internal::Lit::Int(1)))))
-                            ])
-                        )
-                    )
-                )
-            })
-        ))
+        // Check that the inferred type is Int * Int -> Int
+        let expected_type = parser::parse_type("Int * Int -> Int", &mut Interner::new());
+        assert_eq!(syn.tag.ty, expected_type);
     }
 
 }

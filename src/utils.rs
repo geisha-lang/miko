@@ -11,7 +11,7 @@ pub struct Id(usize);
 
 pub type Name = String;
 
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub struct Interner {
     forward: HashMap<String, Id>,
     backward: Vec<String>

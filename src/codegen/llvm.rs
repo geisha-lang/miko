@@ -7,10 +7,10 @@ use std::iter::*;
 
 use std::ops::Deref;
 
-use core::*;
-use internal::*;
-use types::*;
-use utils::*;
+use crate::core::*;
+use crate::internal::*;
+use crate::types::*;
+use crate::utils::*;
 
 pub use libllvm::*;
 
@@ -24,7 +24,7 @@ pub struct LLVMCodegen {
     unique: usize,
 }
 
-type LLVMOpBuilder<'a> = Fn(LLVMBuilderRef,
+type LLVMOpBuilder<'a> = dyn Fn(LLVMBuilderRef,
                             LLVMValueRef,
                             LLVMValueRef,
                             *const ::libc::c_char)
@@ -32,8 +32,8 @@ type LLVMOpBuilder<'a> = Fn(LLVMBuilderRef,
 pub fn get_llvm_op<'a>(op: BinOp, operand_ty: &'a Type) -> Box<LLVMOpBuilder<'a>> {
     use self::BinOp::*;
     use self::Type::*;
-    box move |builder, lhs, rhs, dest|
-        if let &Con(ref ty_name) = operand_ty {
+    Box::new(move |builder, lhs, rhs, dest|
+        if let Con(ty_name) = operand_ty {
             let name_ref = ty_name.as_str();
             unsafe {
                 match (op, name_ref) {
@@ -62,11 +62,11 @@ pub fn get_llvm_op<'a>(op: BinOp, operand_ty: &'a Type) -> Box<LLVMOpBuilder<'a>
             }
         } else {
             unreachable!()
-        }
+        })
 }
 
 pub fn is_primitive_type(t: &Type) -> bool {
-    if let &Type::Con(ref n) = t {
+    if let Type::Con(n) = t {
         match n.as_str() {
             "Int" | "Float" | "Char" | "String" | "Void" => true,
             _ => false,
@@ -129,14 +129,13 @@ impl LLVMCodegen {
 
     pub fn get_main_type(&self) -> LLVMType {
         let retty = self.context.get_int32_type();
-        let pty = self.context.get_void_type();
-        LLVMContext::get_function_type(&retty, &vec![pty], false)
+        LLVMContext::get_function_type(&retty, &vec![], false)
     }
 
     pub fn get_llvm_type(&self, ty: &Type) -> LLVMType {
         use self::Type::*;
         match ty {
-            &Con(ref n) => {
+            Con(n) => {
                 match n.as_str() {
 
                     // Primary types
@@ -151,16 +150,16 @@ impl LLVMCodegen {
                     t => self.gen_user_type(t),
                 }
             }
-            &Arr(box ref p, box ref ret) => {
+            Arr(p, ret) => {
                 // Type of parameters and returned value should be pointer if not primitive
                 let fvs_ty = self.context.get_int8_type().get_ptr(0);
-                let retty = if let &Type::Arr(..) = ret {
+                let retty = if let Type::Arr(..) = ret.as_ref() {
                     self.get_closure_type().get_ptr(0)
                 } else {
                     self.get_llvm_type_or_ptr(ret)
                 };
-                let psty = match p {
-                    &Type::Void => vec![],
+                let psty = match p.as_ref() {
+                    Type::Void => vec![],
                     _ => p.prod_to_vec()
                 };
                 let mut llvm_psty: Vec<_> =
@@ -168,17 +167,17 @@ impl LLVMCodegen {
                 llvm_psty.push(fvs_ty);
                 LLVMContext::get_function_type(&retty, &llvm_psty, false)
             }
-            &Void => self.context.get_void_type(),
-            &Prod(..) => {
+            Void => self.context.get_void_type(),
+            Prod(..) => {
                 let tys: Vec<_> = ty.prod_to_vec()
                     .iter()
                     .map(|t| self.get_llvm_type(t))
                     .collect();
                 self.context.get_struct_type(&tys, true)
             }
-            &Comp(ref c, ref p) => unimplemented!(), // TODO: determine the type
+            Comp(_c, _p) => unimplemented!(), // TODO: determine the type
 
-            &Var(..) => panic!("Unmaterized type"),
+            Var(..) => panic!("Unmaterized type"),
         }
     }
 
@@ -219,7 +218,7 @@ impl LLVMCodegen {
         let block = fun.get_entry_basic_block();
         let fi = block.get_first_instr();
         let llvm_ty = match ty {
-            &Type::Arr(..) => self.get_closure_type().get_ptr(0),
+            Type::Arr(..) => self.get_closure_type().get_ptr(0),
             _ => self.get_llvm_type(ty)
         };
         builder.set_position(&block, &fi);
@@ -233,11 +232,9 @@ impl LLVMCodegen {
                         operand_ty: &Type)
                         -> LLVMValue {
         let fun = get_llvm_op(op, operand_ty);
-        unsafe {
-            LLVMValue::from_ref(fun(self.builder.raw_ptr(),
-                                    lhs.raw_ptr(),
-                                    rhs.raw_ptr(),
-                                    self.new_symbol().unwrap().into_raw()))
-        }
+        LLVMValue::from_ref(fun(self.builder.raw_ptr(),
+                                lhs.raw_ptr(),
+                                rhs.raw_ptr(),
+                                self.new_symbol().unwrap().into_raw()))
     }
 }

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use types::*;
-use utils::*;
+use crate::types::*;
+use crate::utils::*;
 
 use super::subst::*;
 use super::error::*;

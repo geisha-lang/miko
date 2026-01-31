@@ -248,7 +248,7 @@ impl<'i> K<'i> {
                 }
                 r
             }
-            MakeData(_, _, ref fields) => {
+            MakeData { ref fields, .. } => {
                 fields.iter().fold(HashSet::new(), |mut res, v| {
                     res.extend(self.fv(v.deref()));
                     res
@@ -382,7 +382,12 @@ impl<'i> K<'i> {
                                 // Unit constructor - generate MakeData with no fields
                                 return TaggedTerm::new(
                                     tform,
-                                    Term::MakeData(adt_name, tag, vec![])
+                                    Term::MakeData {
+                                        type_name: adt_name,
+                                        tag,
+                                        fields: vec![],
+                                        field_types: vec![],
+                                    }
                                 );
                             }
                         }
@@ -453,25 +458,35 @@ impl<'i> K<'i> {
 
                         Term::MakeCls(v, Box::new(cls), Box::new(exp_term))
                     }
-                    Var(id) => {
-                        let val_term = self.transform(*val);
-                        let exp_term = if self.find_var(&id) == None {
-                            let origin = if let Some(label) =
-                                self.direct.get(&id).map(|l| l.to_owned()) {
-                                self.direct.insert(id, label.to_owned())
-                            } else {
-                                eprintln!("variable not fount: {}", self.interner.trace(id));
-                                panic!("variable not fount");
-                            };
+                    Var(var_id) => {
+                        // Check if this is a constructor first
+                        let var_name = self.interner.trace(var_id).to_string();
+                        if self.find_constructor_info(&var_name).is_some() {
+                            // Constructor - use the normal path
+                            let val_term = self.transform(*val);
                             let exp_term = self.transform(*exp);
-                            if let Some(o) = origin {
-                                self.direct.insert(id, o);
-                            }
-                            exp_term
+                            Term::Let(v, Box::new(val_term), Box::new(exp_term))
                         } else {
-                            self.transform(*exp)
-                        };
-                        Term::Let(v, Box::new(val_term), Box::new(exp_term))
+                            // Regular variable - original logic
+                            let val_term = self.transform(*val);
+                            let exp_term = if self.find_var(&var_id) == None {
+                                let origin = if let Some(label) =
+                                    self.direct.get(&var_id).map(|l| l.to_owned()) {
+                                    self.direct.insert(var_id, label.to_owned())
+                                } else {
+                                    eprintln!("variable not fount: {}", self.interner.trace(var_id));
+                                    panic!("variable not fount");
+                                };
+                                let exp_term = self.transform(*exp);
+                                if let Some(o) = origin {
+                                    self.direct.insert(var_id, o);
+                                }
+                                exp_term
+                            } else {
+                                self.transform(*exp)
+                            };
+                            Term::Let(v, Box::new(val_term), Box::new(exp_term))
+                        }
                     }
                     _ => {
                         // Normal variable binding
@@ -493,9 +508,18 @@ impl<'i> K<'i> {
                     if let Some((adt_name, tag)) = self.find_constructor_info(&callee_name) {
                         // This is a constructor application - generate MakeData
                         let params_term = self.transform_list(params);
+                        // Extract concrete field types from the transformed parameters
+                        let field_types: Vec<Type> = params_term.iter()
+                            .map(|t| t.ref_scheme().body().clone())
+                            .collect();
                         return TaggedTerm::new(
                             tform,
-                            Term::MakeData(adt_name, tag, params_term)
+                            Term::MakeData {
+                                type_name: adt_name,
+                                tag,
+                                fields: params_term,
+                                field_types,
+                            }
                         );
                     }
                 }

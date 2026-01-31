@@ -316,6 +316,40 @@ impl LLVMCodegen {
         self.context.get_int64_type()
     }
 
+    /// Get LLVM type for a concrete instantiated field type.
+    /// Unlike get_field_llvm_type, this handles type variables with a warning
+    /// since they should have been instantiated by the type inference phase.
+    pub fn get_instantiated_field_type(&self, ty: &Type) -> LLVMType {
+        match ty {
+            Type::Con(name) => match name.as_str() {
+                "Int" => self.context.get_int32_type(),
+                "Float" => self.context.get_double_type(),
+                "Char" => self.context.get_int8_type(),
+                "Bool" => self.context.get_int1_type(),
+                "String" => self.context.get_int8_type().get_ptr(0),
+                "Void" => self.context.get_void_type(),
+                // ADT pointer
+                _ => self.context.get_int8_type().get_ptr(0),
+            },
+            Type::Comp(_, _) => {
+                // Polymorphic ADT type - use opaque pointer
+                self.context.get_int8_type().get_ptr(0)
+            }
+            Type::Arr(..) => self.get_closure_type().get_ptr(0),
+            Type::Var(v) => {
+                eprintln!("Warning: unresolved type var {} at codegen", v);
+                self.context.get_int64_type() // Fallback with warning
+            }
+            Type::Prod(..) => {
+                let tys: Vec<_> = ty.prod_to_vec().iter()
+                    .map(|t| self.get_instantiated_field_type(t))
+                    .collect();
+                self.context.get_struct_type(&tys, false)
+            }
+            Type::Void => self.context.get_void_type(),
+        }
+    }
+
     /// Get the LLVM type for an ADT (Algebraic Data Type)
     /// ADTs are represented as a tagged union: { i32 tag, payload }
     /// where payload is the largest variant's fields or an opaque byte array

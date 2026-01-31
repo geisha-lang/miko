@@ -184,9 +184,21 @@ impl<'i> LLVMEmit<'i> {
                 let fun = block.get_parent();
 
                 let init = self.gen_expr(val, symbols);
+
+                // For ADT values, use the actual value type instead of the declared type
+                // because the declared type may have unresolved type variables (i64 fallback)
+                // while the actual value has concrete instantiated types
                 let alloca = {
                     let var_name = self.interner.trace(var);
-                    self.generator.create_entry_block_alloca(&fun, var_name, tyvar.body())
+
+                    // Check if this is an ADT type - if so, use the actual init value type
+                    // to preserve the concrete instantiated types
+                    if is_adt_type(tyvar.body()) {
+                        let init_ty = init.get_type();
+                        self.builder().alloca(&init_ty, var_name)
+                    } else {
+                        self.generator.create_entry_block_alloca(&fun, var_name, tyvar.body())
+                    }
                 };
                 self.builder().store(&init, &alloca);
 
@@ -357,18 +369,29 @@ impl<'i> LLVMEmit<'i> {
             Unary(_, _) => unimplemented!(),
 
             // ADT Operations
-            MakeData(ref type_name, tag, ref fields) => {
+            MakeData { ref type_name, tag, ref fields, ref field_types } => {
                 // Create an ADT value with the given tag and fields
                 // ADT is represented as: { i32 tag, payload_struct }
                 // Returns a pointer to the allocated ADT struct
-
-                // Get the ADT type from the registry
-                let adt_ty = self.generator.gen_user_type(type_name);
 
                 // Get field values
                 let field_vals: Vec<LLVMValue> = fields.iter()
                     .map(|f| self.gen_expr(f, symbols))
                     .collect();
+
+                // Build payload type from instantiated field_types
+                let tag_ty = self.context().get_int32_type();
+                let adt_ty = if field_types.is_empty() {
+                    // Unit variant - just tag
+                    self.context().get_struct_type(&vec![tag_ty], false)
+                } else {
+                    // Variant with payload - use instantiated types
+                    let payload_llvm_types: Vec<LLVMType> = field_types.iter()
+                        .map(|t| self.generator.get_instantiated_field_type(t))
+                        .collect();
+                    let payload_ty = self.context().get_struct_type(&payload_llvm_types, false);
+                    self.context().get_struct_type(&vec![tag_ty, payload_ty], false)
+                };
 
                 // Allocate on stack
                 let adt_ptr = self.builder().alloca(&adt_ty, "adt");
@@ -411,6 +434,7 @@ impl<'i> LLVMEmit<'i> {
                 // Generate code for pattern matching using a switch on the tag
                 // For ADT patterns, scrutinee_val is a pointer to the ADT struct
                 let scrutinee_val = self.gen_expr(scrutinee, symbols);
+                let scrutinee_type = scrutinee.ref_scheme().body().clone();
 
                 // Get current function and create basic blocks
                 let blk = self.builder().get_insert_block();
@@ -458,7 +482,7 @@ impl<'i> LLVMEmit<'i> {
 
                         // Bind pattern variables (scrutinee_val is a pointer)
                         let mut arm_symbols = symbols.sub_env();
-                        self.bind_pattern_vars_ptr(&scrutinee_val, pattern, &mut arm_symbols);
+                        self.bind_pattern_vars_ptr(&scrutinee_val, pattern, &scrutinee_type, &mut arm_symbols);
 
                         let result = self.gen_expr(body, &mut arm_symbols);
                         self.builder().br(&cont_blk);
@@ -585,7 +609,14 @@ impl<'i> LLVMEmit<'i> {
     }
 
     /// Bind pattern variables when scrutinee is a pointer to ADT struct
-    fn bind_pattern_vars_ptr<'b>(&mut self, scrutinee_ptr: &LLVMValue, pattern: &Pattern, symbols: &mut VarEnv<'b>) {
+    /// Uses the scrutinee's concrete type to compute instantiated field types
+    fn bind_pattern_vars_ptr<'b>(
+        &mut self,
+        scrutinee_ptr: &LLVMValue,
+        pattern: &Pattern,
+        scrutinee_type: &Type,
+        symbols: &mut VarEnv<'b>
+    ) {
         match pattern {
             Pattern::Var(id) => {
                 // Bind the pointer directly (variable holds pointer to ADT)
@@ -597,10 +628,35 @@ impl<'i> LLVMEmit<'i> {
             Pattern::Wildcard | Pattern::Lit(_) => {
                 // No bindings for wildcards or literals
             }
-            Pattern::Constructor(_, sub_patterns) => {
+            Pattern::Constructor(ctor_name, sub_patterns) => {
                 // Extract payload fields via pointer and bind sub-patterns
                 if !sub_patterns.is_empty() {
-                    let payload_ptr = self.builder().struct_field_ptr(scrutinee_ptr, 1, "pat.payload.ptr");
+                    // Get instantiated field types from the ADT registry and scrutinee type
+                    // If scrutinee_type is a type variable, try to infer from constructor name
+                    let instantiated_field_types = self.get_instantiated_variant_field_types(
+                        scrutinee_type,
+                        ctor_name
+                    );
+
+                    // If we couldn't get types from scrutinee, try looking up directly from constructor
+                    let field_types = if instantiated_field_types.is_empty() {
+                        // Fall back to looking up variant field types directly
+                        self.get_variant_field_types_by_ctor(ctor_name)
+                    } else {
+                        instantiated_field_types
+                    };
+
+                    // Build the payload struct type with instantiated types
+                    let payload_llvm_types: Vec<LLVMType> = field_types.iter()
+                        .map(|t| self.generator.get_instantiated_field_type(t))
+                        .collect();
+                    let payload_ty = self.context().get_struct_type(&payload_llvm_types, false);
+                    let payload_ptr_ty = payload_ty.get_ptr(0);
+
+                    // Cast the payload pointer to the correct type
+                    let raw_payload_ptr = self.builder().struct_field_ptr(scrutinee_ptr, 1, "pat.payload.ptr");
+                    let payload_ptr = self.builder().bit_cast(&raw_payload_ptr, &payload_ptr_ty, "pat.payload.typed");
+
                     for (i, sub_pat) in sub_patterns.iter().enumerate() {
                         let field_ptr = self.builder().struct_field_ptr(&payload_ptr, i, "pat.field.ptr");
                         let field_val = self.builder().load(&field_ptr, "pat.field");
@@ -608,6 +664,98 @@ impl<'i> LLVMEmit<'i> {
                     }
                 }
             }
+        }
+    }
+
+    /// Get instantiated field types for a variant by substituting type parameters
+    fn get_instantiated_variant_field_types(&self, scrutinee_type: &Type, ctor_name: &str) -> Vec<Type> {
+        // Extract the ADT name and type arguments from scrutinee_type
+        // Type::Comp is a pair (base, arg), not (base, Vec<args>)
+        // For multi-param types like `Map k v`, this is nested: Comp(Comp(Map, k), v)
+        let (adt_name, type_args) = match scrutinee_type {
+            Type::Con(name) => (name.as_str(), vec![]),
+            Type::Comp(base, arg) => {
+                // Flatten the Comp chain to get base and all args
+                let mut args = vec![arg.as_ref().clone()];
+                let mut current = base.as_ref();
+                loop {
+                    match current {
+                        Type::Con(name) => {
+                            return self.lookup_and_substitute(name.as_str(), &args, ctor_name);
+                        }
+                        Type::Comp(inner_base, inner_arg) => {
+                            args.insert(0, inner_arg.as_ref().clone());
+                            current = inner_base.as_ref();
+                        }
+                        _ => return vec![],
+                    }
+                }
+            }
+            _ => return vec![],
+        };
+
+        self.lookup_and_substitute(adt_name, &type_args, ctor_name)
+    }
+
+    /// Helper to look up variant and substitute type parameters
+    fn lookup_and_substitute(&self, adt_name: &str, type_args: &[Type], ctor_name: &str) -> Vec<Type> {
+        // Look up ADT in registry
+        if let Some(adt_info) = self.generator.adt_registry.get(adt_name) {
+            // Find the variant
+            if let Some(variant) = adt_info.variants.iter().find(|v| v.name == ctor_name) {
+                // Substitute type parameters with concrete types
+                let params = &adt_info.type_params;
+                variant.field_types.iter()
+                    .map(|ft| self.substitute_type_params(ft, params, type_args))
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        }
+    }
+
+    /// Get variant field types by constructor name, without substitution
+    /// Used as fallback when scrutinee type is a type variable
+    fn get_variant_field_types_by_ctor(&self, ctor_name: &str) -> Vec<Type> {
+        for (_adt_name, adt_info) in &self.generator.adt_registry {
+            if let Some(variant) = adt_info.variants.iter().find(|v| v.name == ctor_name) {
+                return variant.field_types.clone();
+            }
+        }
+        vec![]
+    }
+
+    /// Substitute type parameters in a type with concrete types
+    fn substitute_type_params(&self, ty: &Type, params: &[String], args: &[Type]) -> Type {
+        match ty {
+            Type::Var(name) => {
+                // Check if this is a type parameter that should be substituted
+                if let Some(idx) = params.iter().position(|p| p == name) {
+                    if idx < args.len() {
+                        return args[idx].clone();
+                    }
+                }
+                ty.clone()
+            }
+            Type::Con(_) => ty.clone(),
+            Type::Comp(base, inner_arg) => {
+                let new_base = Box::new(self.substitute_type_params(base, params, args));
+                let new_arg = Box::new(self.substitute_type_params(inner_arg, params, args));
+                Type::Comp(new_base, new_arg)
+            }
+            Type::Arr(p, r) => {
+                let new_p = Box::new(self.substitute_type_params(p, params, args));
+                let new_r = Box::new(self.substitute_type_params(r, params, args));
+                Type::Arr(new_p, new_r)
+            }
+            Type::Prod(l, r) => {
+                let new_l = Box::new(self.substitute_type_params(l, params, args));
+                let new_r = Box::new(self.substitute_type_params(r, params, args));
+                Type::Prod(new_l, new_r)
+            }
+            Type::Void => Type::Void,
         }
     }
 

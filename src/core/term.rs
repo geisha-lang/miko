@@ -148,8 +148,13 @@ pub enum Term {
     Match(Node, Vec<(Pattern, Option<P<Form>>, Node)>),
 
     /// ADT Operations
-    /// Construct an ADT value: MakeData(type_name, variant_tag, fields)
-    MakeData(Name, usize, Vec<Node>),
+    /// Construct an ADT value with instantiated field types
+    MakeData {
+        type_name: Name,
+        tag: usize,
+        fields: Vec<Node>,
+        field_types: Vec<Type>,  // Instantiated concrete types
+    },
     /// Get the variant tag from an ADT value
     GetTag(Node),
     /// Get a field from an ADT value by index

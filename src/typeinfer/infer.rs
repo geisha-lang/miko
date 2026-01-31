@@ -1,5 +1,6 @@
 use crate::syntax::form::*;
 use crate::internal::*;
+use crate::types;
 use crate::types::*;
 
 use crate::utils::*;
@@ -24,6 +25,8 @@ pub struct Infer<'interner> {
     unique: usize,
     interner: &'interner mut Interner,
     constraints: LinkedList<Constraint>,
+    /// Registry of ADT definitions for pattern matching
+    pub adt_registry: types::AdtRegistry,
 }
 
 
@@ -41,6 +44,7 @@ impl<'i> Infer<'i> {
             unique: 0,
             constraints: LinkedList::new(),
             interner,
+            adt_registry: HashMap::new(),
         }
     }
 
@@ -78,8 +82,181 @@ impl<'i> Infer<'i> {
 
                 ty.clone().apply(&sub)
             }
+            PolyConstrained(ref tvs, ref _constraints, ref ty) => {
+                // For now, treat constrained poly the same as unconstrained
+                // In the future, we'd also generate "wanted" constraints here
+                let tvs_: Vec<_> = tvs.iter().map(|_| self.fresh()).collect();
+                let sub: Subst = tvs.clone().into_iter().zip(tvs_).collect();
+
+                ty.clone().apply(&sub)
+            }
             Slot => unreachable!(),
         }
+    }
+
+    /// Process an ADT definition and register its constructors
+    /// Returns a list of (constructor_name, constructor_type) pairs to add to the environment
+    fn process_adt(&mut self, adt_name: &str, type_params: &[Id], variants: &[Variant]) -> Vec<(Id, Scheme)> {
+        let type_param_names: Vec<Name> = type_params.iter()
+            .map(|id| self.interner.trace(*id).to_string())
+            .collect();
+
+        // Build the result type: e.g., List a for data List a { ... }
+        let result_type = if type_param_names.is_empty() {
+            Type::Con(adt_name.to_string())
+        } else {
+            let base = Type::Con(adt_name.to_string());
+            let params: Vec<Type> = type_param_names.iter()
+                .map(|p| Type::Var(p.clone()))
+                .collect();
+            Type::compose_n(std::iter::once(base).chain(params))
+        };
+
+        let mut constructors = Vec::new();
+        let mut variant_infos = Vec::new();
+
+        for (tag, variant) in variants.iter().enumerate() {
+            let field_types: Vec<Type> = match &variant.body {
+                VariantBody::Unit => vec![],
+                VariantBody::Tuple(fields) => {
+                    fields.iter().map(|f| (*f.ty).clone()).collect()
+                }
+                VariantBody::Struct(fields) => {
+                    fields.iter().map(|f| (*f.ty).clone()).collect()
+                }
+            };
+
+            // Build constructor type
+            // Unit variant: forall a. List a
+            // Tuple variant Cons(a, List a): forall a. a * List a -> List a
+            let constructor_type = if field_types.is_empty() {
+                result_type.clone()
+            } else {
+                let param_type = if field_types.len() == 1 {
+                    field_types[0].clone()
+                } else {
+                    Type::product_n(field_types.clone())
+                };
+                Type::Arr(P(param_type), P(result_type.clone()))
+            };
+
+            // Wrap in Poly if there are type parameters
+            let scheme = if type_param_names.is_empty() {
+                Scheme::Mono(constructor_type.clone())
+            } else {
+                Scheme::Poly(type_param_names.clone(), constructor_type.clone())
+            };
+
+            // Intern the constructor name and add to results
+            let constructor_id = self.interner.intern(&variant.name);
+            constructors.push((constructor_id, scheme.clone()));
+
+            variant_infos.push(types::VariantInfo {
+                name: variant.name.clone(),
+                tag,
+                field_types,
+                scheme,
+            });
+        }
+
+        // Register the ADT in our registry
+        self.adt_registry.insert(adt_name.to_string(), types::AdtInfo {
+            name: adt_name.to_string(),
+            type_params: type_param_names,
+            variants: variant_infos,
+        });
+
+        constructors
+    }
+
+    /// Infer the type of a pattern and return bindings introduced
+    /// Returns (pattern_type, Vec<(binding_name, binding_type)>)
+    fn infer_pattern(&mut self, pattern: &Pattern, env: &TypeEnv) -> Result<(Type, Vec<(Id, Scheme)>), TypeError> {
+        match pattern {
+            Pattern::Var(id) => {
+                // Variable pattern: can match anything, introduces a binding
+                let fresh_ty = self.fresh();
+                Ok((fresh_ty.clone(), vec![(*id, Scheme::Mono(fresh_ty))]))
+            }
+
+            Pattern::Wildcard => {
+                // Wildcard: matches anything, no bindings
+                let fresh_ty = self.fresh();
+                Ok((fresh_ty, vec![]))
+            }
+
+            Pattern::Lit(lit) => {
+                // Literal pattern: type is the literal's type, no bindings
+                let ty = lit.lit_type();
+                Ok((ty, vec![]))
+            }
+
+            Pattern::Constructor(name, sub_patterns) => {
+                // Look up constructor in ADT registry
+                if let Some(adt_info) = self.find_constructor_adt(name) {
+                    // Find the variant
+                    let variant = adt_info.variants.iter()
+                        .find(|v| &v.name == name)
+                        .expect("Constructor not found in ADT");
+
+                    // Instantiate the constructor type
+                    let ctor_type = self.instantiate(&variant.scheme);
+
+                    // Collect bindings from sub-patterns
+                    let mut all_bindings = vec![];
+
+                    if sub_patterns.is_empty() {
+                        // Unit constructor: result type is the constructor type itself
+                        Ok((ctor_type, all_bindings))
+                    } else {
+                        // Extract parameter types and result type from arrow type
+                        if let Type::Arr(param_ty, result_ty) = &ctor_type {
+                            // Get individual field types
+                            let field_types: Vec<&Type> = param_ty.prod_to_vec();
+
+                            if field_types.len() != sub_patterns.len() {
+                                return Err(TypeError::PatternError(
+                                    format!("Constructor {} expects {} arguments, got {}",
+                                            name, field_types.len(), sub_patterns.len()),
+                                    Span::new(0, 0)
+                                ));
+                            }
+
+                            // Check each sub-pattern
+                            for (sub_pat, expected_ty) in sub_patterns.iter().zip(field_types.iter()) {
+                                let (pat_ty, bindings) = self.infer_pattern(sub_pat, env)?;
+                                // Unify sub-pattern type with expected field type
+                                self.uni((&pat_ty, Span::new(0, 0)), (expected_ty, Span::new(0, 0)));
+                                all_bindings.extend(bindings);
+                            }
+
+                            Ok(((**result_ty).clone(), all_bindings))
+                        } else {
+                            // Non-arrow type means unit constructor was given patterns
+                            Err(TypeError::PatternError(
+                                format!("Constructor {} takes no arguments", name),
+                                Span::new(0, 0)
+                            ))
+                        }
+                    }
+                } else {
+                    // Constructor not found - report error
+                    Err(TypeError::NotInScope(name.clone(), Span::new(0, 0)))
+                }
+            }
+        }
+    }
+
+    /// Find which ADT a constructor belongs to
+    fn find_constructor_adt(&self, ctor_name: &str) -> Option<types::AdtInfo> {
+        for (_, adt_info) in &self.adt_registry {
+            for variant in &adt_info.variants {
+                if variant.name == ctor_name {
+                    return Some(adt_info.clone());
+                }
+            }
+        }
+        None
     }
 
     /// The main inference algorithm
@@ -252,6 +429,44 @@ impl<'i> Infer<'i> {
                         Type::Con("List".to_string()),
                         tyitem)));
             },
+
+            // Pattern matching expression
+            Match(ref mut scrutinee, ref mut arms) => {
+                let scrutinee = scrutinee.as_mut();
+                let scrutinee_pos = scrutinee.tag.pos;
+                let ty_scrutinee = self.infer(e, scrutinee)?;
+                let scrutinee_type = ty_scrutinee.body().clone();
+
+                // Result type will be unified across all arms
+                let result_type = self.fresh();
+
+                for arm in arms.iter_mut() {
+                    // Type check the pattern and get bindings
+                    let (pattern_type, bindings) = self.infer_pattern(&arm.pattern, e)?;
+
+                    // Unify pattern type with scrutinee type
+                    self.uni((&pattern_type, form.tag.pos), (&scrutinee_type, scrutinee_pos));
+
+                    // Extend environment with pattern bindings
+                    let mut arm_env = e.extend_n(bindings);
+
+                    // Type check optional guard
+                    if let Some(ref mut guard) = arm.guard {
+                        let guard_ty = self.infer(&mut arm_env, guard.as_mut())?;
+                        self.uni((guard_ty.body(), form.tag.pos), (&Type::Con("Bool".to_string()), form.tag.pos));
+                    }
+
+                    // Type check arm body
+                    let body_pos = arm.body.tag.pos;
+                    let body_ty = self.infer(&mut arm_env, arm.body.as_mut())?;
+
+                    // Unify body type with result type
+                    self.uni((body_ty.body(), body_pos), (&result_type, form.tag.pos));
+                }
+
+                form.tag.set_type(result_type);
+            },
+
             _ => unimplemented!(),
         }
 
@@ -270,7 +485,17 @@ impl<'i> Infer<'i> {
                       _env: &'a TypeEnv<'a>,
                       program: &'a mut Vec<Def>)
                       -> Result<(), TypeError> {
-                
+
+        // First pass: process ADT definitions and collect constructor types
+        let mut constructor_types: Vec<(Id, Scheme)> = Vec::new();
+        for d in program.iter() {
+            if let Item::Alg(ref type_params, ref variants) = d.node {
+                let adt_name = self.interner.trace(d.ident).to_string();
+                let ctors = self.process_adt(&adt_name, type_params, variants);
+                constructor_types.extend(ctors);
+            }
+        }
+
         // Give each definitions a temporary type if no annotation
         let mut env = {
             let name_scms = program
@@ -284,6 +509,11 @@ impl<'i> Infer<'i> {
             // Add them into environment
             _env.extend_n(name_scms)
         };
+
+        // Add constructor types to environment
+        for (ctor_id, ctor_scheme) in constructor_types {
+            env.insert(ctor_id, ctor_scheme);
+        }
 
         for d in program.iter_mut() {
             if d.is_form() {
@@ -395,6 +625,87 @@ mod tests {
         // Check that the inferred type is Int * Int -> Int
         let expected_type = parser::parse_type("Int * Int -> Int", &mut Interner::new());
         assert_eq!(syn.tag.ty, expected_type);
+    }
+
+    #[test]
+    fn infer_adt_constructors() {
+        // Test that ADT constructor types are correctly generated
+        let mut interner = Interner::new();
+        let src = "
+data Option a {
+    None,
+    Some(a)
+}
+
+def test(x) = Some(x)
+";
+        let mut program = parser::parse(src, &mut interner).expect("Parse failed");
+        let env = TypeEnv::new();
+        let mut inf = Infer::new(&mut interner);
+
+        // Check that ADT info is registered
+        inf.infer_defs(&env, &mut program).expect("Type inference failed");
+
+        // Verify Option ADT was registered
+        assert!(inf.adt_registry.contains_key("Option"));
+        let option_info = &inf.adt_registry["Option"];
+        assert_eq!(option_info.name, "Option");
+        assert_eq!(option_info.type_params, vec!["a".to_string()]);
+        assert_eq!(option_info.variants.len(), 2);
+
+        // Check None variant
+        assert_eq!(option_info.variants[0].name, "None");
+        assert_eq!(option_info.variants[0].tag, 0);
+        assert!(option_info.variants[0].field_types.is_empty());
+
+        // Check Some variant
+        assert_eq!(option_info.variants[1].name, "Some");
+        assert_eq!(option_info.variants[1].tag, 1);
+        assert_eq!(option_info.variants[1].field_types.len(), 1);
+    }
+
+    #[test]
+    fn infer_pattern_matching() {
+        // Test type inference for pattern matching
+        let mut interner = Interner::new();
+        let src = "
+data Option a {
+    None,
+    Some(a)
+}
+
+def unwrap(opt) = match opt {
+    None -> 0,
+    Some(x) -> x
+}
+";
+        let mut program = parser::parse(src, &mut interner).expect("Parse failed");
+
+        // Need to add prelude operators
+        let ty_op = Scheme::Poly(vec!["a".to_string()],
+                                 Type::Arr(Box::new(Type::Prod(Box::new(Type::Var("a".to_string())),
+                                                          Box::new(Type::Var("a".to_string())))),
+                                             Box::new(Type::Var("a".to_string()))));
+        let env = TypeEnv::from_iter([
+            (interner.intern("+"), ty_op.clone()),
+            (interner.intern("-"), ty_op.clone()),
+        ].into_iter());
+
+        let mut inf = Infer::new(&mut interner);
+        let result = inf.infer_defs(&env, &mut program);
+
+        // Type inference should succeed
+        assert!(result.is_ok(), "Type inference failed: {:?}", result);
+
+        // Find the 'unwrap' function and verify its type
+        for d in &program {
+            if interner.trace(d.ident) == "unwrap" {
+                // unwrap should have type: Option Int -> Int
+                // (since None -> 0 constrains the result to Int, and Some(x) -> x constrains the input)
+                println!("unwrap type: {:?}", d.form_type());
+                assert!(d.form_type().is_fn());
+            }
+        }
     }
 
 }

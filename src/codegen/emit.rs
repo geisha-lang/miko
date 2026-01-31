@@ -2,6 +2,7 @@ use crate::core::*;
 use crate::types::*;
 use crate::internal::*;
 use crate::utils::*;
+use crate::syntax::form::{Pattern, Form};
 
 use crate::codegen::llvm::*;
 
@@ -337,6 +338,141 @@ impl<'i> LLVMEmit<'i> {
             }
             List(_) => unimplemented!(),
             Unary(_, _) => unimplemented!(),
+
+            // ADT Operations
+            MakeData(ref _type_name, tag, ref fields) => {
+                // Create an ADT value with the given tag and fields
+                // ADT is represented as: { i32 tag, payload_struct }
+
+                // Get field values
+                let field_vals: Vec<LLVMValue> = fields.iter()
+                    .map(|f| self.gen_expr(f, symbols))
+                    .collect();
+
+                // Create the ADT struct type
+                let tag_ty = self.context().get_int32_type();
+
+                if field_vals.is_empty() {
+                    // Unit constructor - just need the tag
+                    let adt_ty = self.context().get_struct_type(&vec![tag_ty], false);
+                    let mut adt_val = adt_ty.get_undef();
+                    let tag_val = self.context().get_int32_const(tag as i32);
+                    adt_val = self.builder().insert_value(&adt_val, &tag_val, 0, "adt.tag");
+                    adt_val
+                } else {
+                    // Constructor with fields
+                    let field_types: Vec<LLVMType> = field_vals.iter()
+                        .map(|v| v.get_type())
+                        .collect();
+                    let payload_ty = self.context().get_struct_type(&field_types, false);
+                    let adt_ty = self.context().get_struct_type(&vec![tag_ty, payload_ty], false);
+
+                    let mut adt_val = adt_ty.get_undef();
+                    let tag_val = self.context().get_int32_const(tag as i32);
+                    adt_val = self.builder().insert_value(&adt_val, &tag_val, 0, "adt.tag");
+
+                    // Build payload struct
+                    let mut payload_val = payload_ty.get_undef();
+                    for (i, fv) in field_vals.iter().enumerate() {
+                        payload_val = self.builder().insert_value(&payload_val, fv, i, "payload.field");
+                    }
+                    adt_val = self.builder().insert_value(&adt_val, &payload_val, 1, "adt.payload");
+                    adt_val
+                }
+            }
+
+            GetTag(ref node) => {
+                // Extract the tag from an ADT value
+                let adt_val = self.gen_expr(node, symbols);
+                self.builder().extract_value(&adt_val, 0, "adt.tag")
+            }
+
+            GetField(ref node, index) => {
+                // Extract a field from an ADT value's payload
+                let adt_val = self.gen_expr(node, symbols);
+                let payload = self.builder().extract_value(&adt_val, 1, "adt.payload");
+                self.builder().extract_value(&payload, index, "adt.field")
+            }
+
+            Match(ref scrutinee, ref arms) => {
+                // Generate code for pattern matching using a switch on the tag
+                let scrutinee_val = self.gen_expr(scrutinee, symbols);
+
+                // Get current function and create basic blocks
+                let blk = self.builder().get_insert_block();
+                let parent = blk.get_parent();
+
+                // Create a continuation block and result phi node
+                let cont_blk = self.context().append_basic_block(&parent, "match.cont");
+
+                // Check if arms use ADT patterns or simple patterns
+                let has_adt_patterns = arms.iter().any(|(p, _, _)| {
+                    matches!(p, Pattern::Constructor(_, _))
+                });
+
+                if has_adt_patterns {
+                    // ADT pattern matching: extract tag and switch on it
+                    let tag_val = self.builder().extract_value(&scrutinee_val, 0, "match.tag");
+
+                    // Create blocks for each arm
+                    let arm_blocks: Vec<LLVMBasicBlock> = arms.iter().enumerate()
+                        .map(|(i, _)| self.context().append_basic_block(&parent, &format!("match.arm.{}", i)))
+                        .collect();
+
+                    // Create default block (unreachable for exhaustive matches)
+                    let default_blk = self.context().append_basic_block(&parent, "match.default");
+                    self.builder().set_position_at_end(&default_blk);
+                    // For now, branch to first arm as default (should be unreachable)
+                    self.builder().br(&cont_blk);
+
+                    // Build switch instruction
+                    self.builder().set_position_at_end(&blk);
+                    let switch_inst = self.builder().switch(&tag_val, &default_blk, arms.len());
+
+                    // Generate code for each arm
+                    let mut results: Vec<(LLVMValue, LLVMBasicBlock)> = Vec::new();
+
+                    for (i, ((pattern, _guard, body), arm_blk)) in arms.iter().zip(arm_blocks.iter()).enumerate() {
+                        // Add case to switch
+                        if let Pattern::Constructor(_, _) = pattern {
+                            let tag_const = self.context().get_int32_const(i as i32);
+                            LLVMBuilder::switch_add_case(&switch_inst, &tag_const, arm_blk);
+                        }
+
+                        // Generate arm body
+                        self.builder().set_position_at_end(arm_blk);
+
+                        // Bind pattern variables
+                        let mut arm_symbols = symbols.sub_env();
+                        self.bind_pattern_vars(&scrutinee_val, pattern, &mut arm_symbols);
+
+                        let result = self.gen_expr(body, &mut arm_symbols);
+                        self.builder().br(&cont_blk);
+                        let end_blk = self.builder().get_insert_block();
+                        results.push((result, end_blk));
+                    }
+
+                    // Build phi node for result
+                    self.builder().set_position_at_end(&cont_blk);
+                    if !results.is_empty() {
+                        let result_ty = results[0].0.get_type();
+                        let incoming: Vec<_> = results.iter()
+                            .map(|(v, b)| (v, b))
+                            .collect();
+                        self.builder().phi_node(&result_ty, &incoming, "match.result")
+                    } else {
+                        // No arms - return undef (shouldn't happen in valid code)
+                        self.context().get_int32_const(0)
+                    }
+                } else {
+                    // Simple pattern matching (literals, wildcards, variables)
+                    // Generate a chain of if-then-else
+
+                    // For simplicity, treat this as a series of comparisons
+                    // This handles literal patterns and wildcards
+                    self.gen_simple_match(&scrutinee_val, arms, symbols, &parent, &cont_blk)
+                }
+            }
         };
         ret
     }
@@ -372,6 +508,140 @@ impl<'i> LLVMEmit<'i> {
         let alloca = self.builder().alloca(&ty, "ptr");
         self.builder().store(val, &alloca);
         alloca
+    }
+
+    /// Bind pattern variables to their values in the current scope
+    fn bind_pattern_vars<'b>(&mut self, scrutinee: &LLVMValue, pattern: &Pattern, symbols: &mut VarEnv<'b>) {
+        match pattern {
+            Pattern::Var(id) => {
+                // Bind the entire scrutinee to this variable
+                let blk = self.builder().get_insert_block();
+                let fun = blk.get_parent();
+                let var_name = self.interner.trace(*id);
+                let alloca = self.builder().alloca(&scrutinee.get_type(), var_name);
+                self.builder().store(scrutinee, &alloca);
+                symbols.insert(*id, alloca);
+            }
+            Pattern::Wildcard | Pattern::Lit(_) => {
+                // No bindings for wildcards or literals
+            }
+            Pattern::Constructor(_, sub_patterns) => {
+                // Extract payload and bind sub-patterns
+                if !sub_patterns.is_empty() {
+                    let payload = self.builder().extract_value(scrutinee, 1, "pat.payload");
+                    for (i, sub_pat) in sub_patterns.iter().enumerate() {
+                        let field = self.builder().extract_value(&payload, i, "pat.field");
+                        self.bind_pattern_vars(&field, sub_pat, symbols);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Generate code for simple pattern matching (literals, wildcards, variables)
+    fn gen_simple_match<'a: 'b, 'b>(
+        &mut self,
+        scrutinee: &LLVMValue,
+        arms: &'a [(Pattern, Option<P<Form>>, Box<TaggedTerm>)],
+        symbols: &mut VarEnv<'b>,
+        parent: &LLVMFunction,
+        cont_blk: &LLVMBasicBlock,
+    ) -> LLVMValue {
+        if arms.is_empty() {
+            // No arms - return a default value
+            return self.context().get_int32_const(0);
+        }
+
+        let mut results: Vec<(LLVMValue, LLVMBasicBlock)> = Vec::new();
+
+        // Generate a chain of conditional branches
+        for (i, (pattern, _guard, body)) in arms.iter().enumerate() {
+            let is_last = i == arms.len() - 1;
+
+            match pattern {
+                Pattern::Wildcard | Pattern::Var(_) => {
+                    // Always matches - generate body directly
+                    let mut arm_symbols = symbols.sub_env();
+                    self.bind_pattern_vars(scrutinee, pattern, &mut arm_symbols);
+
+                    let result = self.gen_expr(body, &mut arm_symbols);
+                    self.builder().br(cont_blk);
+                    let end_blk = self.builder().get_insert_block();
+                    results.push((result, end_blk));
+                    break; // No need to check further arms
+                }
+                Pattern::Lit(lit) => {
+                    // Generate comparison
+                    let lit_val = self.generator.gen_lit(lit);
+                    let cmp = match lit {
+                        Lit::Int(_) => {
+                            unsafe {
+                                LLVMValue::from_ref(llvm_sys::core::LLVMBuildICmp(
+                                    self.builder().raw_ptr(),
+                                    LLVMIntPredicate::LLVMIntEQ,
+                                    scrutinee.raw_ptr(),
+                                    lit_val.raw_ptr(),
+                                    crate::codegen::llvm::raw_string("cmp")
+                                ))
+                            }
+                        }
+                        Lit::Bool(_) => {
+                            unsafe {
+                                LLVMValue::from_ref(llvm_sys::core::LLVMBuildICmp(
+                                    self.builder().raw_ptr(),
+                                    LLVMIntPredicate::LLVMIntEQ,
+                                    scrutinee.raw_ptr(),
+                                    lit_val.raw_ptr(),
+                                    crate::codegen::llvm::raw_string("cmp")
+                                ))
+                            }
+                        }
+                        _ => {
+                            // For other types, fall through (simplified)
+                            self.context().get_int1_const(1)
+                        }
+                    };
+
+                    let then_blk = self.context().append_basic_block(parent, &format!("match.then.{}", i));
+                    let else_blk = if is_last {
+                        cont_blk.clone()
+                    } else {
+                        self.context().append_basic_block(parent, &format!("match.else.{}", i))
+                    };
+
+                    self.builder().cond_br(&cmp, &then_blk, &else_blk);
+
+                    // Generate then block
+                    self.builder().set_position_at_end(&then_blk);
+                    let result = self.gen_expr(body, symbols);
+                    self.builder().br(cont_blk);
+                    let end_blk = self.builder().get_insert_block();
+                    results.push((result, end_blk));
+
+                    // Continue from else block if not last
+                    if !is_last {
+                        self.builder().set_position_at_end(&else_blk);
+                    }
+                }
+                Pattern::Constructor(_, _) => {
+                    // Constructor patterns are handled in the ADT case
+                    // This shouldn't happen in simple match
+                    unreachable!("Constructor pattern in simple match")
+                }
+            }
+        }
+
+        // Build phi node for result
+        self.builder().set_position_at_end(cont_blk);
+        if !results.is_empty() {
+            let result_ty = results[0].0.get_type();
+            let incoming: Vec<_> = results.iter()
+                .map(|(v, b)| (v, b))
+                .collect();
+            self.builder().phi_node(&result_ty, &incoming, "match.result")
+        } else {
+            self.context().get_int32_const(0)
+        }
     }
 }
 

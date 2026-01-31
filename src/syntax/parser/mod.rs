@@ -38,7 +38,7 @@ peg::parser! {
         rule whitespace() = quiet!{[' ' | '\n' | '\r' | '\t']*}
         rule whitespace_inline() = quiet!{[' ' | '\t']*}
 
-        rule keywords() = "def" / "if" / "else" / "let" / "in" / "type" / "data"
+        rule keywords() = "def" / "if" / "else" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance"
 
         rule lexeme<T>(x: rule<T>) -> T
             = whitespace() !keywords() t:x() { t }
@@ -142,6 +142,88 @@ peg::parser! {
                     node: item
                 }
             }
+            / reserved(<"concept">) a:spanned(<concept_definition()>) {
+                let (span, (name, item)) = a;
+                Def {
+                    ident: interner.borrow_mut().intern(name.as_str()),
+                    pos: span,
+                    node: item
+                }
+            }
+            / reserved(<"instance">) a:spanned(<instance_definition()>) {
+                let (span, (name, item)) = a;
+                Def {
+                    ident: interner.borrow_mut().intern(name.as_str()),
+                    pos: span,
+                    node: item
+                }
+            }
+
+        // Concept definition: concept Eq a { eq: a * a -> Bool }
+        rule concept_definition() -> (String, Item)
+            = n:type_constant_identifier() p:type_parameter_sequence()
+              s:concept_superclasses()?
+              lexeme(<"{">) m:concept_method() ** lexeme(<",">) lexeme(<"}">) {
+                let params: Vec<Id> = p.iter().map(|s| interner.borrow_mut().intern(s)).collect();
+                let superclasses = s.unwrap_or_default();
+                (n.to_string(), Item::Concept {
+                    type_params: params,
+                    superclasses,
+                    methods: m,
+                })
+            }
+
+        rule concept_superclasses() -> Vec<TypeConstraint>
+            = lexeme(<"(">) cs:type_constraint() ++ lexeme(<",">) lexeme(<")">) lexeme(<"=>">) { cs }
+
+        rule type_constraint() -> TypeConstraint
+            = c:type_constant_identifier() v:type_variable_identifier() {
+                TypeConstraint {
+                    concept: c.to_string(),
+                    type_var: v.to_string(),
+                }
+            }
+
+        rule concept_method() -> MethodDecl
+            = n:identifier() lexeme(<":">) t:type_scheme() {
+                MethodDecl { name: n, ty: t }
+            }
+
+        // Instance definition: instance Eq Int { def eq(x, y) = x == y }
+        // or with constraints: instance (Eq a) => Eq (List a) { ... }
+        rule instance_definition() -> (String, Item)
+            = cs:instance_constraints()? cn:type_constant_identifier()
+              tas:instance_type_args()
+              lexeme(<"{">) ms:instance_method() ** lexeme(<",">) lexeme(<"}">) {
+                let constraints = cs.unwrap_or_default();
+                // Generate a unique name for the instance
+                let instance_name = format!("instance_{}_{}", cn, tas.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("_"));
+                (instance_name, Item::Instance {
+                    concept_name: cn.to_string(),
+                    type_args: tas,
+                    constraints,
+                    methods: ms,
+                })
+            }
+
+        rule instance_constraints() -> Vec<TypeConstraint>
+            = lexeme(<"(">) cs:type_constraint() ++ lexeme(<",">) lexeme(<")">) lexeme(<"=>">) { cs }
+
+        rule instance_type_args() -> Vec<Type>
+            = ts:instance_type_arg()+ { ts }
+
+        rule instance_type_arg() -> Type
+            = parens(<type_expression()>)
+            / t:type_terminal() { t }
+
+        rule instance_method() -> MethodImpl
+            = reserved(<"def">) n:identifier()
+              lexeme(<"(">) ps:parameter_sequence() lexeme(<")">)
+              lexeme(<"=">) body:expression() {
+                let span = body.tag.pos.clone();
+                let lambda = Expr::Abs(Lambda { param: ps, body: Box::new(body) });
+                MethodImpl { name: n, body: Box::new(Form::new(span, lambda)) }
+            }
 
         rule type_alias() -> (String, Item)
             = n:type_constant_identifier() p:type_parameter_sequence() lexeme(<"=">) a:type_scheme() {
@@ -163,6 +245,10 @@ peg::parser! {
             }
             / n:identifier() fs:struct_fields() {
                 Variant { name: interner.borrow().trace(n).to_string(), body: VariantBody::Struct(fs) }
+            }
+            / n:identifier() {
+                // Unit variant (no fields)
+                Variant { name: interner.borrow().trace(n).to_string(), body: VariantBody::Unit }
             }
 
         rule struct_fields() -> Vec<Field>
@@ -206,11 +292,34 @@ peg::parser! {
             = type_variable_identifier() ++ lexeme(<",">)
 
         pub rule type_scheme() -> Scheme
-            = reserved(<"forall">) f:type_variable_identifier()* lexeme(<".">) b:type_expression() {
+            = reserved(<"forall">) cs:scheme_constraints() lexeme(<".">) b:type_expression() {
+                // forall (Eq a, Ord b). a * b -> Bool
+                // Extract type variables from constraints
+                let binders: Vec<String> = cs.iter().map(|c| c.type_var.clone()).collect();
+                let constraints = cs.into_iter()
+                    .map(|c| crate::types::SchemeConstraint {
+                        concept: c.concept,
+                        type_arg: c.type_var,
+                    })
+                    .collect();
+                Scheme::PolyConstrained(binders, constraints, b)
+            }
+            / reserved(<"forall">) f:type_variable_identifier()* lexeme(<".">) b:type_expression() {
                 let binders = f.into_iter().map(|s| s.to_string()).collect();
                 Scheme::Poly(binders, b)
             }
             / b:type_expression() { Scheme::Mono(b) }
+
+        rule scheme_constraints() -> Vec<TypeConstraint>
+            = lexeme(<"(">) cs:scheme_constraint() ++ lexeme(<",">) lexeme(<")">) { cs }
+
+        rule scheme_constraint() -> TypeConstraint
+            = c:type_constant_identifier() v:type_variable_identifier() {
+                TypeConstraint {
+                    concept: c.to_string(),
+                    type_var: v.to_string(),
+                }
+            }
 
         // Expression form
         rule spanned_form(e: rule<Expr>) -> Form
@@ -257,7 +366,7 @@ peg::parser! {
             = spanned_form(<factor_expr()>) / parens(<expression()>)
 
         rule factor_expr() -> Expr
-            = ifelse() / letin() / lambda() / lit() / var() / list() / block()
+            = ifelse() / letin() / matchexpr() / lambda() / lit() / var() / list() / block()
 
         rule ifelse() -> Expr
             = reserved(<"if">) c:parens(<expression()>)
@@ -269,6 +378,56 @@ peg::parser! {
             = reserved(<"let">) v:variable_declaration() lexeme(<"=">) val:expression()
               reserved(<"in">) e:expression() {
                 Expr::Let(v, Box::new(val), Box::new(e))
+            }
+
+        // Match expression: match expr { pattern -> body, ... }
+        rule matchexpr() -> Expr
+            = reserved(<"match">) scrutinee:expression() lexeme(<"{">)
+              arms:match_arm() ++ lexeme(<",">) lexeme(<"}">) {
+                Expr::Match(Box::new(scrutinee), arms)
+            }
+
+        rule match_arm() -> MatchArm
+            = p:pattern() g:match_guard()? lexeme(<"->">) b:expression() {
+                MatchArm { pattern: p, guard: g, body: Box::new(b) }
+            }
+
+        rule match_guard() -> E
+            = reserved(<"if">) cond:parens(<expression()>) { Box::new(cond) }
+
+        // Pattern matching patterns
+        rule pattern() -> Pattern
+            = constructor_pattern()
+            / literal_pattern()
+            / wildcard_pattern()
+            / variable_pattern()
+
+        rule constructor_pattern() -> Pattern
+            = n:constructor_identifier() ps:parens(<pattern() ** lexeme(<",">)>) {
+                Pattern::Constructor(interner.borrow().trace(n).to_string(), ps)
+            }
+            / n:constructor_identifier() {
+                // Unit constructor (no fields)
+                Pattern::Constructor(interner.borrow().trace(n).to_string(), vec![])
+            }
+
+        rule constructor_identifier() -> Id
+            = id:lexeme(<$(['A'..='Z'] identifier_char()*)>) {
+                interner.borrow_mut().intern(id)
+            }
+
+        rule wildcard_pattern() -> Pattern
+            = lexeme(<"_">) { Pattern::Wildcard }
+
+        rule variable_pattern() -> Pattern
+            = n:identifier() { Pattern::Var(n) }
+
+        rule literal_pattern() -> Pattern
+            = l:lit() {
+                match l {
+                    Expr::Lit(lit) => Pattern::Lit(lit),
+                    _ => unreachable!()
+                }
             }
 
         rule lambda() -> Expr
@@ -532,6 +691,146 @@ type S b = Fuck b
         let cell = RefCell::new(Interner::new());
         println!("{:?}", module(src, &cell));
         assert!(true);
+    }
+
+    #[test]
+    fn case_parse_adt_with_unit_variant() {
+        let src = "
+data Option a {
+    None,
+    Some(a)
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+        let defs = result.unwrap();
+        assert_eq!(defs.len(), 1);
+    }
+
+    #[test]
+    fn case_parse_match_expression() {
+        let src = "
+data Option a {
+    None,
+    Some(a)
+}
+
+def unwrap(opt) = match opt {
+    None -> 0,
+    Some(x) -> x
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn case_parse_match_with_literals() {
+        let src = "
+def check(x) = match x {
+    0 -> 1,
+    1 -> 2,
+    n -> n + 1
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn case_parse_match_with_wildcard() {
+        let src = "
+def foo(x) = match x {
+    0 -> 1,
+    _ -> 0
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn case_parse_concept_definition() {
+        let src = "
+concept Eq a {
+    eq: a * a -> Bool
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+        let defs = result.unwrap();
+        assert_eq!(defs.len(), 1);
+    }
+
+    #[test]
+    fn case_parse_instance_definition() {
+        let src = "
+instance Eq Int {
+    def eq(x, y) = x == y
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn case_parse_instance_with_constraint() {
+        let src = "
+instance (Eq a) => Eq (List a) {
+    def eq(xs, ys) = true
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn case_parse_constrained_forall() {
+        // Test constrained forall type scheme
+        let cell = RefCell::new(Interner::new());
+        let result = type_scheme("forall (Eq a). a * a -> Bool", &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+
+        if let Ok(Scheme::PolyConstrained(vars, constraints, _body)) = result {
+            assert_eq!(vars.len(), 1);
+            assert_eq!(vars[0], "a");
+            assert_eq!(constraints.len(), 1);
+            assert_eq!(constraints[0].concept, "Eq");
+            assert_eq!(constraints[0].type_arg, "a");
+        } else {
+            panic!("Expected PolyConstrained scheme");
+        }
+    }
+
+    #[test]
+    fn case_parse_constrained_forall_multiple() {
+        // Test constrained forall with multiple constraints
+        let cell = RefCell::new(Interner::new());
+        let result = type_scheme("forall (Eq a, Ord b). a * b -> Bool", &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+
+        if let Ok(Scheme::PolyConstrained(vars, constraints, _body)) = result {
+            assert_eq!(vars.len(), 2);
+            assert_eq!(constraints.len(), 2);
+        } else {
+            panic!("Expected PolyConstrained scheme");
+        }
     }
 
 }

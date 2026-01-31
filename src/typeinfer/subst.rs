@@ -78,6 +78,13 @@ impl Substituable for Scheme {
                 }
                 Poly(bounds, ty.apply(&s_))
             }
+            PolyConstrained(bounds, constraints, ty) => {
+                let mut s_ = sub.clone();
+                for n in &bounds {
+                    s_.remove(n);
+                }
+                PolyConstrained(bounds, constraints, ty.apply(&s_))
+            }
             t => t,
         }
     }
@@ -86,7 +93,8 @@ impl Substituable for Scheme {
         use self::Scheme::*;
         match *self {
             Mono(ref ty) => (*ty).ftv(),
-            Poly(ref bounds, ref ty) => {
+            Poly(ref bounds, ref ty) |
+            PolyConstrained(ref bounds, _, ref ty) => {
                 let mut res = ty.ftv();
                 for n in bounds {
                     res.remove(n);
@@ -103,7 +111,8 @@ impl SubstMut for Scheme {
         use self::Scheme::*;
         match self {
             &mut Mono(ref mut ty) |
-            &mut Poly(_, ref mut ty) => *ty = ty.clone().apply(sub),
+            &mut Poly(_, ref mut ty) |
+            &mut PolyConstrained(_, _, ref mut ty) => *ty = ty.clone().apply(sub),
             _ => {}
         }
     }

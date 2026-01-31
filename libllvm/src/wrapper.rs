@@ -210,6 +210,13 @@ impl LLVMType {
             LLVMValue::from_ref(LLVMConstNull(self.raw_ptr()))
         }
     }
+
+    /// Get an undef value of this type (useful for building aggregates)
+    pub fn get_undef(&self) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMGetUndef(self.raw_ptr()))
+        }
+    }
 }
 
 impl LLVMValue {
@@ -359,6 +366,50 @@ impl LLVMBuilder {
             let ret =
                 LLVMBuildStructGEP2(self.raw_ptr(), struct_ty.raw_ptr(), ptr.raw_ptr(), idx as u32, raw_string(name));
             LLVMValue::from_ref(ret)
+        }
+    }
+
+    /// Build a switch instruction
+    pub fn switch(&self, val: &LLVMValue, default_blk: &LLVMBasicBlock, num_cases: usize) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildSwitch(
+                self.raw_ptr(),
+                val.raw_ptr(),
+                default_blk.raw_ptr(),
+                num_cases as c_uint
+            ))
+        }
+    }
+
+    /// Add a case to a switch instruction
+    pub fn switch_add_case(switch: &LLVMValue, on_val: &LLVMValue, dest: &LLVMBasicBlock) {
+        unsafe {
+            LLVMAddCase(switch.raw_ptr(), on_val.raw_ptr(), dest.raw_ptr());
+        }
+    }
+
+    /// Extract a value from an aggregate (struct/array)
+    pub fn extract_value(&self, agg: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildExtractValue(
+                self.raw_ptr(),
+                agg.raw_ptr(),
+                idx as c_uint,
+                raw_string(name)
+            ))
+        }
+    }
+
+    /// Insert a value into an aggregate (struct/array)
+    pub fn insert_value(&self, agg: &LLVMValue, val: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildInsertValue(
+                self.raw_ptr(),
+                agg.raw_ptr(),
+                val.raw_ptr(),
+                idx as c_uint,
+                raw_string(name)
+            ))
         }
     }
 }

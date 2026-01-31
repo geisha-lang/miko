@@ -24,6 +24,8 @@ pub struct K<'i> {
     current: Id,
     interner: &'i mut Interner,
     direct: Direct,
+    /// ADT registry for pattern matching and constructor generation
+    adt_registry: AdtRegistry,
 }
 
 macro_rules! with_var {
@@ -42,7 +44,8 @@ impl<'i> K<'i> {
     /// Do transformation on a syntax module,
     /// generate core term representation
     pub fn go<I>(module: I,
-                 interner: &mut Interner)
+                 interner: &mut Interner,
+                 adt_registry: AdtRegistry)
                  -> (HashMap<Id, P<FunDef>>, HashMap<Id, P<TypeDef>>)
         where I: IntoIterator<Item = Def>
     {
@@ -55,6 +58,7 @@ impl<'i> K<'i> {
             current: current_tmp,
             direct: HashMap::new(),
             interner,
+            adt_registry,
         };
         let defs: Vec<_> = module.into_iter()
             .map(|def| {
@@ -124,6 +128,39 @@ impl<'i> K<'i> {
                 let params = ps.into_iter().map(|id| self.interner.trace(id).to_owned()).collect();
                 let d = Box::new(TypeDef::new(name.clone(), params, TypeKind::Alias(t)));
                 self.typedefs.insert(ident, d);
+            }
+            Item::Concept { .. } => {
+                // Concept definitions are processed during dictionary passing
+                // For now, just record that this concept exists
+                // The actual dictionary type will be generated later
+            }
+            Item::Instance { concept_name, type_args, constraints, methods } => {
+                // Instance definitions will be transformed to dictionary values
+                // For now, generate method implementations as functions
+                for method_impl in methods {
+                    // Each method implementation becomes a global function
+                    // The name is mangled: instance_ConceptName_TypeArgs_methodName
+                    let method_name_str = self.interner.trace(method_impl.name).to_owned();
+                    let type_args_str: Vec<String> = type_args.iter()
+                        .map(|t| t.to_string())
+                        .collect();
+                    let mangled_name = format!(
+                        "instance_{}_{}_{}",
+                        concept_name,
+                        type_args_str.join("_"),
+                        method_name_str
+                    );
+                    let mangled_id = self.interner.intern(&mangled_name);
+
+                    self.current = mangled_id;
+
+                    // Transform the method body
+                    if let Expr::Abs(lambda) = method_impl.body.node.clone() {
+                        let (ps, _, bd) = self.trans_lambda(lambda, false);
+                        let ty = method_impl.body.tag.ty.clone();
+                        self.define_fn(mangled_id, ty, ps, vec![], bd);
+                    }
+                }
             }
         }
     }
@@ -201,6 +238,37 @@ impl<'i> K<'i> {
                 r.extend(self.fv(f.deref()));
                 r
             }
+            Match(ref scrutinee, ref arms) => {
+                let mut r = self.fv(scrutinee.deref());
+                for (pat, _guard, body) in arms {
+                    let mut arm_fv = self.fv(body.deref());
+                    // Remove pattern-bound variables from free variables
+                    Self::remove_pattern_bindings(&mut arm_fv, pat);
+                    r.extend(arm_fv);
+                }
+                r
+            }
+            MakeData(_, _, ref fields) => {
+                fields.iter().fold(HashSet::new(), |mut res, v| {
+                    res.extend(self.fv(v.deref()));
+                    res
+                })
+            }
+            GetTag(ref node) | GetField(ref node, _) => self.fv(node.deref()),
+        }
+    }
+
+    /// Remove variables bound by a pattern from a set
+    fn remove_pattern_bindings(fvs: &mut HashSet<Id>, pat: &crate::syntax::form::Pattern) {
+        use crate::syntax::form::Pattern::*;
+        match pat {
+            Var(id) => { fvs.remove(id); }
+            Wildcard | Lit(_) => {}
+            Constructor(_, pats) => {
+                for p in pats {
+                    Self::remove_pattern_bindings(fvs, p);
+                }
+            }
         }
     }
 
@@ -216,6 +284,37 @@ impl<'i> K<'i> {
     /// Find if a variable is in environment
     fn find_var(&mut self, var: &Id) -> Option<&Scheme> {
         self.env.get(var)
+    }
+
+    /// Collect all variable bindings introduced by a pattern
+    fn collect_pattern_bindings(&mut self, pattern: &Pattern) -> Vec<(Id, Scheme)> {
+        match pattern {
+            Pattern::Var(id) => {
+                // Create a fresh type for pattern variable
+                // In practice, this type should be constrained by the pattern context
+                vec![(*id, Scheme::Slot)]
+            }
+            Pattern::Wildcard | Pattern::Lit(_) => vec![],
+            Pattern::Constructor(_, sub_patterns) => {
+                let mut bindings = vec![];
+                for sub in sub_patterns {
+                    bindings.extend(self.collect_pattern_bindings(sub));
+                }
+                bindings
+            }
+        }
+    }
+
+    /// Find ADT info by constructor name
+    fn find_constructor_info(&self, ctor_name: &str) -> Option<(String, usize)> {
+        for (adt_name, adt_info) in &self.adt_registry {
+            for variant in &adt_info.variants {
+                if variant.name == ctor_name {
+                    return Some((adt_name.clone(), variant.tag));
+                }
+            }
+        }
+        None
     }
 
     /// Get parameters, free variables, function body term from lambda
@@ -272,6 +371,24 @@ impl<'i> K<'i> {
         let t = match node {
             Lit(l) => Term::Lit(l),
             Var(n) => {
+                // Check if this is a unit constructor (like None)
+                let var_name = self.interner.trace(n).to_string();
+                if let Some((adt_name, tag)) = self.find_constructor_info(&var_name) {
+                    // Check if it's a unit constructor (no fields)
+                    if let Some(adt_info) = self.adt_registry.get(&adt_name) {
+                        let variant = adt_info.variants.iter().find(|v| v.name == var_name);
+                        if let Some(v) = variant {
+                            if v.field_types.is_empty() {
+                                // Unit constructor - generate MakeData with no fields
+                                return TaggedTerm::new(
+                                    tform,
+                                    Term::MakeData(adt_name, tag, vec![])
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // A global definition should not be in scope env
                 if self.find_var(&n).is_none() && tform.is_fn() {
                     if let Some(label) = self.direct.get(&n).map(|id| id.to_owned()) {
@@ -285,7 +402,8 @@ impl<'i> K<'i> {
                     Term::Var(n)
                 }
             }
-            List(e) | Block(e) => Term::List(self.transform_list(e)),
+            List(e) => Term::List(self.transform_list(e)),
+            Block(e) => Term::Block(self.transform_list(e)),
             Unary(op, e) => Term::Unary(op, Box::new(self.transform(*e))),
             If(cond, tr, fl) => {
                 Term::If(Box::new(self.transform(*cond)),
@@ -369,6 +487,20 @@ impl<'i> K<'i> {
             }
 
             Apply(callee, params) => {
+                // Check if callee is a constructor
+                if let Expr::Var(callee_id) = &callee.node {
+                    let callee_name = self.interner.trace(*callee_id).to_string();
+                    if let Some((adt_name, tag)) = self.find_constructor_info(&callee_name) {
+                        // This is a constructor application - generate MakeData
+                        let params_term = self.transform_list(params);
+                        return TaggedTerm::new(
+                            tform,
+                            Term::MakeData(adt_name, tag, params_term)
+                        );
+                    }
+                }
+
+                // Regular function application
                 let callee_term = self.transform(*callee);
                 let params_term = self.transform_list(params);
 
@@ -385,6 +517,40 @@ impl<'i> K<'i> {
                 }
             }
 
+            // Match expression
+            Match(ref scrutinee, ref arms) => {
+                // Transform scrutinee
+                let scrutinee_term = self.transform(*scrutinee.clone());
+
+                // Transform match arms with proper pattern bindings
+                let arms_term: Vec<_> = arms.iter().map(|arm| {
+                    // Collect pattern bindings and add them to environment
+                    let bindings = self.collect_pattern_bindings(&arm.pattern);
+
+                    // Add bindings to environment
+                    let mut backup: Vec<(Id, Scheme)> = Vec::new();
+                    for (id, scheme) in &bindings {
+                        if let Some(old) = self.close_var(*id, scheme.clone()) {
+                            backup.push((*id, old));
+                        }
+                    }
+
+                    // Transform body with bindings in scope
+                    let body_term = self.transform(*arm.body.clone());
+
+                    // Restore environment
+                    for (id, _) in &bindings {
+                        self.release_var(id);
+                    }
+                    for (id, scheme) in backup {
+                        self.close_var(id, scheme);
+                    }
+
+                    (arm.pattern.clone(), arm.guard.clone(), Box::new(body_term))
+                }).collect();
+
+                Term::Match(Box::new(scrutinee_term), arms_term)
+            }
             // Give anonymous lambda a name binding
             Abs(lambda) => {
                 let ty = tform.clone();

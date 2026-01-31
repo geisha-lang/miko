@@ -110,30 +110,35 @@ fn run_repl() {
 fn compile(name: &str, src: &str) -> Result<LLVMCodegen, CompileError> {
     let mut inter = Interner::new();
 
-    parse(src, &mut inter)
-    .map_err(|e| CompileError::ParseError(format!("{}", e)))
-    .and_then(|mut defs| {
+    // Parse source
+    let mut defs = parse(src, &mut inter)
+        .map_err(|e| CompileError::ParseError(format!("{}", e)))?;
+
+    // Type inference
+    let adt_registry = {
         let env = Infer::new_env();
         let prelude = load_prelude(&mut inter, &env);
         let mut infer = Infer::new(&mut inter);
         infer.infer_defs(&prelude, &mut defs)
-            .map_err(|te| CompileError::TypeError(te))
-            .map(|()| defs)
-    })
-    .and_then(|defs|{
-        let (mut top, _) = K::go(defs, &mut inter);
-        let main_id = inter.intern("main");
-        let mut emitter = LLVMEmit::new(name, &mut inter);
-        let main_fn = top.remove(&main_id);
-        let env = VarEnv::new();
-        if let Some(mf) = main_fn {
-            emitter.gen_main(mf.deref(), &env);
-        }
-        for def in top.values() {
-            emitter.gen_top_level(def.deref(), &env);
-        }
-        Ok(emitter.generator)
-    })
+            .map_err(|te| CompileError::TypeError(te))?;
+        infer.adt_registry
+    };
+
+    // K-conversion (core term generation)
+    let (mut top, _) = K::go(defs, &mut inter, adt_registry);
+
+    // Code generation
+    let main_id = inter.intern("main");
+    let mut emitter = LLVMEmit::new(name, &mut inter);
+    let main_fn = top.remove(&main_id);
+    let env = VarEnv::new();
+    if let Some(mf) = main_fn {
+        emitter.gen_main(mf.deref(), &env);
+    }
+    for def in top.values() {
+        emitter.gen_top_level(def.deref(), &env);
+    }
+    Ok(emitter.generator)
 }
 
 

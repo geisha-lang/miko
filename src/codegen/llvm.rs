@@ -195,7 +195,42 @@ impl LLVMCodegen {
 
     pub fn gen_user_type(&self, tyname: &str) -> LLVMType {
         // TODO: make a user defined type definition
-        unimplemented!()
+        unimplemented!("User type {} not implemented", tyname)
+    }
+
+    /// Get the LLVM type for an ADT (Algebraic Data Type)
+    /// ADTs are represented as a tagged union: { i32 tag, payload }
+    /// where payload is the largest variant's fields or an opaque byte array
+    pub fn get_adt_type(&self, max_payload_size: usize) -> LLVMType {
+        // For now, use a simple representation: { i32 tag, [max_payload_size x i8] }
+        // This is a simple approach; a more sophisticated one would compute exact union sizes
+        let tag_ty = self.context.get_int32_type();
+        if max_payload_size == 0 {
+            // Unit-only ADT
+            self.context.get_struct_type(&vec![tag_ty], false)
+        } else {
+            // ADT with payload - use an array of bytes as a generic payload
+            let payload_ty = unsafe {
+                LLVMType::from_ref(llvm_sys::core::LLVMArrayType(
+                    self.context.get_int8_type().raw_ptr(),
+                    max_payload_size as u32
+                ))
+            };
+            self.context.get_struct_type(&vec![tag_ty, payload_ty], false)
+        }
+    }
+
+    /// Create a struct type for a specific ADT variant's payload
+    pub fn get_variant_payload_type(&self, field_types: &[&Type]) -> LLVMType {
+        if field_types.is_empty() {
+            // No payload - return void type
+            self.context.get_void_type()
+        } else {
+            let llvm_types: Vec<LLVMType> = field_types.iter()
+                .map(|t| self.get_llvm_type(t))
+                .collect();
+            self.context.get_struct_type(&llvm_types, false)
+        }
     }
 
     pub fn get_or_add_function(&self, fun_name: &str, fty: &Type) -> LLVMFunction {

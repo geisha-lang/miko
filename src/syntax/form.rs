@@ -13,6 +13,30 @@ use crate::internal::*;
 
 pub type E = P<Form>;
 
+/// A pattern for pattern matching
+#[derive(Clone, PartialEq, Debug)]
+pub enum Pattern {
+    /// Variable binding: x
+    Var(Id),
+    /// Ignore pattern: _
+    Wildcard,
+    /// Literal pattern: 42, "hello", true
+    Lit(Lit),
+    /// Constructor pattern: Cons(x, xs) or Nil (unit constructor)
+    Constructor(Name, Vec<Pattern>),
+}
+
+/// A single arm in a match expression
+#[derive(Clone, PartialEq, Debug)]
+pub struct MatchArm {
+    /// The pattern to match against
+    pub pattern: Pattern,
+    /// Optional guard condition
+    pub guard: Option<E>,
+    /// The body expression if the pattern matches
+    pub body: E,
+}
+
 /// Represents a top level definition,
 /// `def` or `data` or `type`
 #[derive(Clone, PartialEq, Debug)]
@@ -91,6 +115,55 @@ pub enum Item {
     Form(E),
     Alias(Vec<Id>, P<Scheme>),
     Alg(Vec<Id>, Vec<Variant>),
+    /// Concept (typeclass) definition
+    /// e.g., `concept Eq a { eq: a * a -> Bool }`
+    Concept {
+        /// Type parameters for the concept (e.g., "a" in "Eq a")
+        type_params: Vec<Id>,
+        /// Superclass constraints (e.g., "Ord a" requires "Eq a")
+        superclasses: Vec<TypeConstraint>,
+        /// Method signatures
+        methods: Vec<MethodDecl>,
+    },
+    /// Instance of a concept for a type
+    /// e.g., `instance Eq Int { def eq(x, y) = x == y }`
+    Instance {
+        /// Name of the concept being implemented
+        concept_name: Name,
+        /// Type arguments (e.g., "Int" in "Eq Int")
+        type_args: Vec<Type>,
+        /// Context constraints (e.g., "Eq a" in "instance (Eq a) => Eq (List a)")
+        constraints: Vec<TypeConstraint>,
+        /// Method implementations
+        methods: Vec<MethodImpl>,
+    },
+}
+
+/// A type constraint (e.g., "Eq a")
+#[derive(Clone, PartialEq, Debug)]
+pub struct TypeConstraint {
+    /// Name of the concept (e.g., "Eq")
+    pub concept: Name,
+    /// Type variable (e.g., "a")
+    pub type_var: Name,
+}
+
+/// A method declaration in a concept
+#[derive(Clone, PartialEq, Debug)]
+pub struct MethodDecl {
+    /// Method name
+    pub name: Id,
+    /// Method type signature
+    pub ty: Scheme,
+}
+
+/// A method implementation in an instance
+#[derive(Clone, PartialEq, Debug)]
+pub struct MethodImpl {
+    /// Method name
+    pub name: Id,
+    /// Implementation (as a Form expression, usually a lambda)
+    pub body: E,
 }
 
 
@@ -241,6 +314,10 @@ pub enum Expr {
     /// Conditional expression
     /// e.g. `if (fuck == shit) 1 else 0`
     If(E, E, E),
+
+    /// Pattern matching expression
+    /// e.g. `match x { Nil -> 0, Cons(h, t) -> 1 }`
+    Match(E, Vec<MatchArm>),
 }
 
 #[derive(Debug, PartialEq, Clone)]

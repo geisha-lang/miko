@@ -8,4 +8,5 @@ pub enum TypeError {
     MisMatch(Type, Type),
     HighRank(Type, Span),
     UnknownOperator(BinOp, Span),
+    PatternError(String, Span),
 }

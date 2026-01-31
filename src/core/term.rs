@@ -10,6 +10,7 @@ use std::iter::DoubleEndedIterator;
 use crate::internal::*;
 use crate::types::*;
 use crate::utils::*;
+use crate::syntax::form::{Pattern, Form};
 
 
 type Node = Box<TaggedTerm>;
@@ -141,6 +142,18 @@ pub enum Term {
     /// Conditional expression
     /// e.g. `if (fuck == shit) 1 else 0`
     If(Node, Node, Node),
+
+    /// Pattern matching expression
+    /// Match(scrutinee, [(pattern, optional_guard, body)])
+    Match(Node, Vec<(Pattern, Option<P<Form>>, Node)>),
+
+    /// ADT Operations
+    /// Construct an ADT value: MakeData(type_name, variant_tag, fields)
+    MakeData(Name, usize, Vec<Node>),
+    /// Get the variant tag from an ADT value
+    GetTag(Node),
+    /// Get a field from an ADT value by index
+    GetField(Node, usize),
 }
 
 /// Represents a closure, including a entry as

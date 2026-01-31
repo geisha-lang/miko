@@ -34,6 +34,15 @@ pub struct Field {
 }
 
 
+/// A type-level constraint for concepts (used in type schemes)
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct SchemeConstraint {
+    /// Name of the concept (e.g., "Eq")
+    pub concept: Name,
+    /// Type variable or type (e.g., "a" in "Eq a")
+    pub type_arg: Name,
+}
+
 /// Type scheme
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Scheme {
@@ -41,9 +50,13 @@ pub enum Scheme {
     /// `Int * Int -> Double`
     Mono(Type),
 
-    /// Polymorphism type
+    /// Polymorphism type without constraints
     /// `forall a. a * a -> a`
     Poly(Vec<Name>, Type),
+
+    /// Polymorphism type with constraints
+    /// `forall (Eq a). a * a -> Bool`
+    PolyConstrained(Vec<Name>, Vec<SchemeConstraint>, Type),
 
     /// Unknown type
     Slot,
@@ -61,7 +74,8 @@ impl Scheme {
     pub fn body(&self) -> &Type {
         match *self {
             Scheme::Mono(ref t) |
-            Scheme::Poly(_, ref t) => t,
+            Scheme::Poly(_, ref t) |
+            Scheme::PolyConstrained(_, _, ref t) => t,
             Scheme::Slot => unreachable!(),
         }
     }
@@ -69,11 +83,29 @@ impl Scheme {
     pub fn arrow(from: Type, to: Type) -> Scheme {
         Scheme::Mono(Type::Arr(P(from), P(to)))
     }
+
     pub fn is_fn(&self) -> bool {
         match self {
-            &Scheme::Mono(Type::Arr(..)) |
-            &Scheme::Poly(_, Type::Arr(..)) => true,
+            Scheme::Mono(Type::Arr(..)) |
+            Scheme::Poly(_, Type::Arr(..)) |
+            Scheme::PolyConstrained(_, _, Type::Arr(..)) => true,
             _ => false
+        }
+    }
+
+    /// Get type parameters
+    pub fn type_params(&self) -> &[Name] {
+        match self {
+            Scheme::Poly(vars, _) | Scheme::PolyConstrained(vars, _, _) => vars,
+            _ => &[],
+        }
+    }
+
+    /// Get constraints (if any)
+    pub fn constraints(&self) -> &[SchemeConstraint] {
+        match self {
+            Scheme::PolyConstrained(_, constraints, _) => constraints,
+            _ => &[],
         }
     }
 }
@@ -164,4 +196,54 @@ impl ToString for Type {
 
 
 pub type TypeEnv<'a> = SymTable<'a, Id, Scheme>;
+
+/// Information about an ADT (Algebraic Data Type)
+#[derive(Clone, Debug)]
+pub struct AdtInfo {
+    /// Name of the ADT (e.g., "List", "Option")
+    pub name: Name,
+    /// Type parameters (e.g., ["a"] for List a)
+    pub type_params: Vec<Name>,
+    /// Variants with their constructor info
+    pub variants: Vec<VariantInfo>,
+}
+
+/// Information about a single variant/constructor
+#[derive(Clone, Debug)]
+pub struct VariantInfo {
+    /// Name of the constructor (e.g., "Cons", "Nil")
+    pub name: Name,
+    /// Tag value for runtime discrimination
+    pub tag: usize,
+    /// Field types (empty for unit variants)
+    pub field_types: Vec<Type>,
+    /// The constructor's type scheme
+    pub scheme: Scheme,
+}
+
+impl AdtInfo {
+    /// Build the result type for this ADT applied to its type parameters
+    /// e.g., for `data List a`, returns `List a`
+    pub fn result_type(&self) -> Type {
+        if self.type_params.is_empty() {
+            Type::Con(self.name.clone())
+        } else {
+            let base = Type::Con(self.name.clone());
+            let params: Vec<Type> = self.type_params.iter()
+                .map(|p| Type::Var(p.clone()))
+                .collect();
+            Type::compose_n(std::iter::once(base).chain(params))
+        }
+    }
+
+    /// Generate constructor type schemes for all variants
+    pub fn generate_constructors(&self) -> Vec<(Name, Scheme)> {
+        self.variants.iter().map(|v| {
+            (v.name.clone(), v.scheme.clone())
+        }).collect()
+    }
+}
+
+/// Registry of all ADT definitions
+pub type AdtRegistry = HashMap<Name, AdtInfo>;
 

@@ -234,6 +234,63 @@ def f(x) = match x {
 }
 ```
 
+## Monomorphization
+
+Geisha uses monomorphization to compile polymorphic functions. When a polymorphic function is called with concrete type arguments, a specialized version is generated.
+
+### How It Works
+
+1. **Instantiation Recording**: During type inference, when a polymorphic function is called, the concrete type arguments are recorded.
+
+2. **Specialization**: After type inference, specialized versions of polymorphic functions are generated for each unique set of type arguments.
+
+3. **Call Site Rewriting**: Calls to polymorphic functions are rewritten to call the specialized versions.
+
+### Example
+
+```
+def length(lst) = match lst {
+    Nil -> 0,
+    Cons(_, t) -> 1 + length(t)
+}
+
+def main() = putNumber(length(Cons(1, Cons(2, Nil))))
+```
+
+The compiler:
+
+1. Infers `length : forall a. List a -> Int`
+2. Records that `length` is called with `a = Int`
+3. Generates `length_Int : List Int -> Int` with specialized types
+4. Rewrites the call to use `length_Int`
+5. Skips emitting code for the generic `length` (since it's never called directly)
+
+### Recursive Functions
+
+Recursive calls within specialized functions are also renamed:
+
+```
+def length_Int(lst) = match lst {
+    Nil -> 0,
+    Cons(_, t) -> 1 + length_Int(t)  // Calls specialized version
+}
+```
+
+### Name Mangling
+
+Specialized functions use name mangling to encode type arguments:
+
+| Original | Type Args | Mangled Name |
+|----------|-----------|--------------|
+| `length` | `[Int]` | `length_Int` |
+| `fst` | `[Int, Bool]` | `fst_Int_Bool` |
+| `map` | `[Int, String]` | `map_Int_String` |
+
+For complex types, the mangling uses descriptive suffixes:
+- `Fn<A>To<B>` for function types
+- `Pair<A>And<B>` for product types
+- `<Base>Of<Arg>` for parameterized types
+
 ## Algorithm Summary
 
 ```

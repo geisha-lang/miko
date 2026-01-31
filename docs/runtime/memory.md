@@ -83,15 +83,30 @@ For a function `Int -> Int`:
 
 ## Algebraic Data Types
 
-ADTs use a tagged representation: a tag identifying the variant, plus the variant's payload.
+ADTs use a compact tagged representation: a tag identifying the variant, followed by an inline payload struct.
 
 ### Structure
 
 ```llvm
-%adt = type { i32, i8* }
+%adt = type { i32, %payload }
 ; Field 0: variant tag (0, 1, 2, ...)
-; Field 1: payload pointer
+; Field 1: payload struct (sized for largest variant)
 ```
+
+The payload is **inline** (not a pointer), which provides better cache locality and avoids an extra indirection.
+
+### Instantiated Types
+
+Polymorphic ADTs are instantiated with concrete types during monomorphization. For example:
+
+```
+data List a { Nil, Cons(a, List a) }
+
+List Int  → { i32, { i32, %List_Int* } }
+List Bool → { i32, { i1, %List_Bool* } }
+```
+
+The payload struct uses the **concrete types** from instantiation, not generic pointer types.
 
 ### Example: Maybe
 
@@ -102,13 +117,20 @@ data Maybe a {
 }
 ```
 
+For `Maybe Int`:
+```llvm
+%Maybe_Int = type { i32, { i32 } }
+; Field 0: tag (0 = Nothing, 1 = Just)
+; Field 1: payload struct with one i32 field
+```
+
 Memory layout:
 ```
 Nothing:
-    { tag: 0, payload: null }
+    { tag: 0, payload: { undef } }
 
 Just(42):
-    { tag: 1, payload: ptr to i32 containing 42 }
+    { tag: 1, payload: { 42 } }
 ```
 
 ### Example: List
@@ -120,15 +142,40 @@ data List a {
 }
 ```
 
+For `List Int`:
+```llvm
+%List_Int = type { i32, { i32, %List_Int* } }
+; Field 0: tag
+; Field 1: payload with head value and tail pointer
+```
+
 Memory layout:
 ```
 Nil:
-    { tag: 0, payload: null }
+    { tag: 0, payload: { undef, null } }
 
 Cons(1, Cons(2, Nil)):
-    { tag: 1, payload: ptr to { i32: 1, List*: ptr to inner } }
-    where inner = { tag: 1, payload: ptr to { i32: 2, List*: ptr to nil } }
-    where nil = { tag: 0, payload: null }
+    { tag: 1, payload: { 1, ptr to inner } }
+    where inner = { tag: 1, payload: { 2, ptr to nil } }
+    where nil = { tag: 0, payload: { undef, null } }
+```
+
+### Payload Sizing
+
+The payload struct is sized for the **largest variant**:
+
+```
+data Tree a {
+    Leaf(a),              // 1 field
+    Node(Tree a, Tree a)  // 2 fields (largest)
+}
+```
+
+For `Tree Int`:
+```llvm
+%Tree_Int = type { i32, { %Tree_Int*, %Tree_Int* } }
+; Payload sized for Node (2 pointers)
+; Leaf uses only first field
 ```
 
 ### Variant Tags
@@ -141,6 +188,17 @@ Tags are assigned sequentially:
 ```
 data Color { Red, Green, Blue }
 // Red = 0, Green = 1, Blue = 2
+```
+
+### Bitcasting for Variant Access
+
+When accessing fields, the payload pointer is bitcast to the variant's specific type:
+
+```llvm
+; For Leaf(x) pattern on Tree Int:
+%payload_ptr = getelementptr %Tree_Int, %tree, 0, 1
+%leaf_payload = bitcast { %Tree_Int*, %Tree_Int* }* %payload_ptr to { i32 }*
+%x = load i32, { i32 }* %leaf_payload, 0
 ```
 
 ## Stack Allocation

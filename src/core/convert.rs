@@ -10,10 +10,71 @@ use crate::utils::*;
 use crate::types::*;
 use crate::syntax::form::*;
 use crate::internal::*;
+use crate::typeinfer::mono::{InstantiationRegistry, Instantiation};
 
 use crate::core::term::*;
 
 type Direct = HashMap<Id, Id>;
+
+/// Maps from original function name to the specialized name for a given call site
+type SpecializationMap = HashMap<Name, HashMap<Vec<Type>, Name>>;
+
+/// Information about a specialized function call
+#[derive(Clone, Debug)]
+struct SpecializedCall {
+    mangled_name: Name,
+    specialized_scheme: Scheme,
+}
+
+/// Check if a type is fully concrete (no type variables)
+fn is_type_concrete(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => false,
+        Type::Con(_) | Type::Void => true,
+        Type::Arr(p, r) => is_type_concrete(p) && is_type_concrete(r),
+        Type::Prod(l, r) => is_type_concrete(l) && is_type_concrete(r),
+        Type::Comp(base, arg) => is_type_concrete(base) && is_type_concrete(arg),
+    }
+}
+
+/// Extract type arguments from a Comp type chain
+/// E.g., Comp(Comp(Map, k), v) -> [k, v]
+/// For a simple type like Con("Int"), returns empty vec
+fn extract_type_args(ty: &Type) -> Vec<Type> {
+    let mut args = Vec::new();
+    let mut current = ty;
+    while let Type::Comp(base, arg) = current {
+        args.insert(0, arg.as_ref().clone());
+        current = base.as_ref();
+    }
+    args
+}
+
+/// Unify two types, adding bindings to the substitution
+/// This is a simple one-way unification: type variables in `pattern` are bound to concrete types in `concrete`
+fn unify_types_into(pattern: &Type, concrete: &Type, subst: &mut HashMap<Name, Type>) {
+    match (pattern, concrete) {
+        (Type::Var(name), _) => {
+            // Bind type variable to concrete type
+            if !subst.contains_key(name) {
+                subst.insert(name.clone(), concrete.clone());
+            }
+        }
+        (Type::Arr(p1, r1), Type::Arr(p2, r2)) => {
+            unify_types_into(p1, p2, subst);
+            unify_types_into(r1, r2, subst);
+        }
+        (Type::Prod(l1, r1), Type::Prod(l2, r2)) => {
+            unify_types_into(l1, l2, subst);
+            unify_types_into(r1, r2, subst);
+        }
+        (Type::Comp(b1, a1), Type::Comp(b2, a2)) => {
+            unify_types_into(b1, b2, subst);
+            unify_types_into(a1, a2, subst);
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug)]
 pub struct K<'i> {
@@ -26,6 +87,10 @@ pub struct K<'i> {
     direct: Direct,
     /// ADT registry for pattern matching and constructor generation
     adt_registry: AdtRegistry,
+    /// Registry of instantiations for monomorphization
+    instantiation_registry: InstantiationRegistry,
+    /// Map from (function_name, type_args) to specialized function name
+    specialization_map: SpecializationMap,
 }
 
 macro_rules! with_var {
@@ -45,11 +110,23 @@ impl<'i> K<'i> {
     /// generate core term representation
     pub fn go<I>(module: I,
                  interner: &mut Interner,
-                 adt_registry: AdtRegistry)
+                 adt_registry: AdtRegistry,
+                 instantiation_registry: InstantiationRegistry)
                  -> (HashMap<Id, P<FunDef>>, HashMap<Id, P<TypeDef>>)
         where I: IntoIterator<Item = Def>
     {
         let current_tmp = interner.intern("");
+
+        // Build specialization map from instantiation registry
+        let mut specialization_map: SpecializationMap = HashMap::new();
+        for inst in &instantiation_registry.instantiations {
+            let mangled = inst.mangled_name();
+            specialization_map
+                .entry(inst.function.clone())
+                .or_insert_with(HashMap::new)
+                .insert(inst.type_args.clone(), mangled);
+        }
+
         let mut runner = K {
             count: 0,
             env: HashMap::new(),
@@ -59,6 +136,8 @@ impl<'i> K<'i> {
             direct: HashMap::new(),
             interner,
             adt_registry,
+            instantiation_registry,
+            specialization_map,
         };
         let defs: Vec<_> = module.into_iter()
             .map(|def| {
@@ -72,10 +151,113 @@ impl<'i> K<'i> {
             for def in defs {
                 b.convert_def(def);
             }
+
+            // Generate specialized versions of polymorphic functions
+            b.generate_specializations();
         }
 
         let K { global, typedefs, .. } = runner;
         (global, typedefs)
+    }
+
+    /// Generate specialized versions of polymorphic functions
+    fn generate_specializations(&mut self) {
+        // Collect functions that need specialization
+        let functions_to_specialize: Vec<(String, Vec<Instantiation>)> = self.instantiation_registry
+            .polymorphic_functions
+            .keys()
+            .filter_map(|fn_name| {
+                let insts = self.instantiation_registry.get_instantiations(fn_name);
+                if insts.is_empty() {
+                    None
+                } else {
+                    Some((fn_name.clone(), insts.into_iter().cloned().collect()))
+                }
+            })
+            .collect();
+
+
+        // For each function that needs specialization, generate specialized versions
+        for (fn_name, instantiations) in functions_to_specialize {
+            // Get the original function definition
+            let fn_id = self.interner.intern(&fn_name);
+            if let Some(original_def) = self.global.get(&fn_id).cloned() {
+                for inst in instantiations {
+                    self.specialize_function(&original_def, &inst);
+                }
+            }
+        }
+    }
+
+    /// Generate a specialized version of a function for a specific instantiation
+    fn specialize_function(&mut self, original: &FunDef, inst: &Instantiation) {
+        // Get the scheme from the original function definition
+        // This has the actual type variable names used after inference
+        let original_scheme = original.scheme();
+
+        // Build substitution from type parameters to concrete types
+        let type_params = original_scheme.type_params();
+        if type_params.len() != inst.type_args.len() {
+            return; // Mismatch, skip
+        }
+
+        let subst: HashMap<Name, Type> = type_params.iter()
+            .cloned()
+            .zip(inst.type_args.iter().cloned())
+            .collect();
+
+        // Create the specialized type by substituting type parameters
+        let specialized_ty = apply_type_subst(original.ref_type(), &subst);
+        let specialized_scheme = Scheme::Mono(specialized_ty);
+
+        // Create the specialized function with mangled name
+        let mangled_name = inst.mangled_name();
+        let mangled_id = self.interner.intern(&mangled_name);
+
+        // Build function rename map for recursive calls
+        // Maps original function ID to specialized function ID
+        let mut fn_rename = HashMap::new();
+        fn_rename.insert(original.name(), mangled_id);
+
+        // Create specialization context
+        let ctx = SpecializeContext {
+            type_subst: subst.clone(),
+            fn_rename,
+        };
+
+        // Specialize parameters
+        let specialized_params: Vec<VarDecl> = original.parameters().iter()
+            .map(|p| {
+                let VarDecl(id, scm) = p;
+                let new_scm = apply_scheme_subst(scm, &subst);
+                VarDecl(*id, new_scm)
+            })
+            .collect();
+
+        // Specialize free variables
+        let specialized_fv: Vec<VarDecl> = original.fv().iter()
+            .map(|p| {
+                let VarDecl(id, scm) = p;
+                let new_scm = apply_scheme_subst(scm, &subst);
+                VarDecl(*id, new_scm)
+            })
+            .collect();
+
+        // Specialize body with context (including recursive call renaming)
+        let specialized_body = specialize_term(original.body(), &ctx);
+
+        // Create and register the specialized function
+        let specialized_def = FunDef::new(
+            mangled_id,
+            specialized_scheme,
+            specialized_params,
+            specialized_fv,
+            specialized_body,
+        );
+
+        // Add to direct call map
+        self.direct.insert(mangled_id, mangled_id);
+        self.global.insert(mangled_id, Box::new(specialized_def));
     }
 
     /// Get a unique id, then increase the counter
@@ -317,6 +499,90 @@ impl<'i> K<'i> {
         None
     }
 
+    /// Find a specialized function for a polymorphic call based on argument types
+    /// Returns Some with the specialized function info if specialization is needed
+    fn find_specialized_function(
+        &self,
+        fn_name: &str,
+        args: &[P<TaggedTerm>],
+        result_type: &Scheme
+    ) -> Option<SpecializedCall> {
+        // Get the function definition to access its actual scheme (with fresh type variables)
+        let fn_id = self.interner.lookup(fn_name)?;
+        let func_def = self.global.get(&fn_id)?;
+        let actual_scheme = func_def.scheme();
+
+        // Get type parameters from the actual scheme
+        let type_params = actual_scheme.type_params();
+        if type_params.is_empty() {
+            return None; // Monomorphic function, no specialization needed
+        }
+
+        // Try to determine type arguments from argument types and result type
+        let arg_types: Vec<Type> = args.iter()
+            .map(|a| a.ref_scheme().body().clone())
+            .collect();
+
+        // Build a substitution by matching the actual function type against concrete types
+        let subst = self.infer_type_args(actual_scheme, &arg_types, result_type.body())?;
+
+        // Build the type args in order
+        let type_args: Vec<Type> = type_params.iter()
+            .filter_map(|p| subst.get(p).cloned())
+            .collect();
+
+        if type_args.len() != type_params.len() {
+            return None; // Couldn't determine all type arguments
+        }
+
+        // Check if all type args are concrete
+        if !type_args.iter().all(|t| is_type_concrete(t)) {
+            return None;
+        }
+
+        // Create the instantiation and get mangled name
+        let inst = Instantiation::new(fn_name.to_string(), type_args.clone());
+
+        // Apply substitution to get specialized scheme
+        let specialized_type = apply_type_subst(actual_scheme.body(), &subst);
+        let specialized_scheme = Scheme::Mono(specialized_type);
+
+        Some(SpecializedCall {
+            mangled_name: inst.mangled_name(),
+            specialized_scheme,
+        })
+    }
+
+    /// Infer type arguments by matching polymorphic type against concrete argument and result types
+    fn infer_type_args(
+        &self,
+        poly_scheme: &Scheme,
+        arg_types: &[Type],
+        result_type: &Type
+    ) -> Option<HashMap<Name, Type>> {
+        let mut subst = HashMap::new();
+
+        // Get the function type from scheme
+        let fn_type = poly_scheme.body();
+
+        if let Type::Arr(param_type, ret_type) = fn_type {
+            // Unify parameter types
+            let param_types = param_type.prod_to_vec();
+            for (expected, actual) in param_types.iter().zip(arg_types.iter()) {
+                unify_types_into(*expected, actual, &mut subst);
+            }
+
+            // Unify result type
+            unify_types_into(ret_type.as_ref(), result_type, &mut subst);
+        }
+
+        if subst.is_empty() {
+            None
+        } else {
+            Some(subst)
+        }
+    }
+
     /// Get parameters, free variables, function body term from lambda
     fn trans_lambda(&mut self, lambda: Lambda, cap_fv: bool) -> (Vec<VarDecl>, Vec<VarDecl>, TaggedTerm) {
         let params = lambda.param;
@@ -380,6 +646,8 @@ impl<'i> K<'i> {
                         if let Some(v) = variant {
                             if v.field_types.is_empty() {
                                 // Unit constructor - generate MakeData with no fields
+                                // Extract type arguments from the result type (e.g., List Int -> [Int])
+                                let type_args = extract_type_args(tform.body());
                                 return TaggedTerm::new(
                                     tform,
                                     Term::MakeData {
@@ -387,6 +655,7 @@ impl<'i> K<'i> {
                                         tag,
                                         fields: vec![],
                                         field_types: vec![],
+                                        type_args,
                                     }
                                 );
                             }
@@ -512,6 +781,8 @@ impl<'i> K<'i> {
                         let field_types: Vec<Type> = params_term.iter()
                             .map(|t| t.ref_scheme().body().clone())
                             .collect();
+                        // Extract type arguments from the result type (e.g., List Int -> [Int])
+                        let type_args = extract_type_args(tform.body());
                         return TaggedTerm::new(
                             tform,
                             Term::MakeData {
@@ -519,6 +790,7 @@ impl<'i> K<'i> {
                                 tag,
                                 fields: params_term,
                                 field_types,
+                                type_args,
                             }
                         );
                     }
@@ -531,8 +803,20 @@ impl<'i> K<'i> {
                 match callee_term.body() {
                     &Term::Var(n) => {
                         if let Some(label) = self.direct.get(&n) {
-                            Term::ApplyDir(VarDecl(label.to_owned(), callee_term.ref_scheme().clone()),
-                                           params_term)
+                            // Check if this is a polymorphic function that needs specialization
+                            let fn_name = self.interner.trace(*label).to_string();
+                            if let Some(specialized) = self.find_specialized_function(&fn_name, &params_term, &tform) {
+                                let specialized_id = self.interner.intern(&specialized.mangled_name);
+                                // Make sure the specialized function is in direct call map
+                                self.direct.insert(specialized_id, specialized_id);
+                                Term::ApplyDir(
+                                    VarDecl(specialized_id, specialized.specialized_scheme.clone()),
+                                    params_term
+                                )
+                            } else {
+                                Term::ApplyDir(VarDecl(label.to_owned(), callee_term.ref_scheme().clone()),
+                                               params_term)
+                            }
                         } else {
                             Term::ApplyCls(Box::new(callee_term), params_term)
                         }
@@ -593,5 +877,149 @@ impl<'i> K<'i> {
             }
         };
         TaggedTerm::new(tform, t)
+    }
+}
+
+/// Apply a type substitution to a type
+fn apply_type_subst(ty: &Type, subst: &HashMap<Name, Type>) -> Type {
+    match ty {
+        Type::Var(name) => {
+            if let Some(concrete) = subst.get(name) {
+                concrete.clone()
+            } else {
+                ty.clone()
+            }
+        }
+        Type::Con(_) | Type::Void => ty.clone(),
+        Type::Arr(p, r) => Type::Arr(
+            Box::new(apply_type_subst(p, subst)),
+            Box::new(apply_type_subst(r, subst)),
+        ),
+        Type::Prod(l, r) => Type::Prod(
+            Box::new(apply_type_subst(l, subst)),
+            Box::new(apply_type_subst(r, subst)),
+        ),
+        Type::Comp(base, arg) => Type::Comp(
+            Box::new(apply_type_subst(base, subst)),
+            Box::new(apply_type_subst(arg, subst)),
+        ),
+    }
+}
+
+/// Apply a type substitution to a scheme
+fn apply_scheme_subst(scm: &Scheme, subst: &HashMap<Name, Type>) -> Scheme {
+    match scm {
+        Scheme::Mono(ty) => Scheme::Mono(apply_type_subst(ty, subst)),
+        Scheme::Poly(vars, ty) => {
+            // Don't substitute bound variables
+            let filtered_subst: HashMap<Name, Type> = subst.iter()
+                .filter(|(k, _)| !vars.contains(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Scheme::Poly(vars.clone(), apply_type_subst(ty, &filtered_subst))
+        }
+        Scheme::PolyConstrained(vars, constraints, ty) => {
+            let filtered_subst: HashMap<Name, Type> = subst.iter()
+                .filter(|(k, _)| !vars.contains(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Scheme::PolyConstrained(vars.clone(), constraints.clone(), apply_type_subst(ty, &filtered_subst))
+        }
+        Scheme::Slot => Scheme::Slot,
+    }
+}
+
+/// Context for specialization: maps original function IDs to specialized IDs
+struct SpecializeContext {
+    type_subst: HashMap<Name, Type>,
+    /// Maps original function ID to specialized function ID for recursive calls
+    fn_rename: HashMap<Id, Id>,
+}
+
+/// Apply type substitution to a tagged term (specializes the term's types)
+fn specialize_term(term: &TaggedTerm, ctx: &SpecializeContext) -> TaggedTerm {
+    let specialized_scheme = apply_scheme_subst(term.ref_scheme(), &ctx.type_subst);
+    let specialized_body = specialize_term_body(term.body(), ctx);
+    TaggedTerm::new(specialized_scheme, specialized_body)
+}
+
+/// Apply type substitution to a term body
+fn specialize_term_body(term: &Term, ctx: &SpecializeContext) -> Term {
+    match term {
+        Term::Lit(lit) => Term::Lit(lit.clone()),
+        Term::Var(id) => {
+            // Rename function reference if this is a recursive call
+            let new_id = ctx.fn_rename.get(id).copied().unwrap_or(*id);
+            Term::Var(new_id)
+        }
+        Term::Binary(op, l, r) => Term::Binary(
+            *op,
+            Box::new(specialize_term(l, ctx)),
+            Box::new(specialize_term(r, ctx)),
+        ),
+        Term::Unary(op, e) => Term::Unary(
+            *op,
+            Box::new(specialize_term(e, ctx)),
+        ),
+        Term::List(items) => Term::List(
+            items.iter().map(|i| Box::new(specialize_term(i, ctx))).collect(),
+        ),
+        Term::Block(items) => Term::Block(
+            items.iter().map(|i| Box::new(specialize_term(i, ctx))).collect(),
+        ),
+        Term::Let(var, val, body) => {
+            let VarDecl(id, scm) = var;
+            let specialized_var = VarDecl(*id, apply_scheme_subst(scm, &ctx.type_subst));
+            Term::Let(
+                specialized_var,
+                Box::new(specialize_term(val, ctx)),
+                Box::new(specialize_term(body, ctx)),
+            )
+        }
+        Term::If(c, t, f) => Term::If(
+            Box::new(specialize_term(c, ctx)),
+            Box::new(specialize_term(t, ctx)),
+            Box::new(specialize_term(f, ctx)),
+        ),
+        Term::ApplyDir(var, args) => {
+            let VarDecl(id, scm) = var;
+            // Check if this function ID should be renamed (for recursive calls)
+            let new_id = ctx.fn_rename.get(id).copied().unwrap_or(*id);
+            let specialized_var = VarDecl(new_id, apply_scheme_subst(scm, &ctx.type_subst));
+            Term::ApplyDir(
+                specialized_var,
+                args.iter().map(|a| Box::new(specialize_term(a, ctx))).collect(),
+            )
+        }
+        Term::ApplyCls(callee, args) => Term::ApplyCls(
+            Box::new(specialize_term(callee, ctx)),
+            args.iter().map(|a| Box::new(specialize_term(a, ctx))).collect(),
+        ),
+        Term::MakeCls(var, cls, body) => {
+            let VarDecl(id, scm) = var;
+            let specialized_var = VarDecl(*id, apply_scheme_subst(scm, &ctx.type_subst));
+            Term::MakeCls(
+                specialized_var,
+                cls.clone(), // Closure structure doesn't change
+                Box::new(specialize_term(body, ctx)),
+            )
+        }
+        Term::Match(scrutinee, arms) => Term::Match(
+            Box::new(specialize_term(scrutinee, ctx)),
+            arms.iter().map(|(pat, guard, body)| (
+                pat.clone(),
+                guard.clone(),
+                Box::new(specialize_term(body, ctx)),
+            )).collect(),
+        ),
+        Term::MakeData { type_name, tag, fields, field_types, type_args } => Term::MakeData {
+            type_name: type_name.clone(),
+            tag: *tag,
+            fields: fields.iter().map(|f| Box::new(specialize_term(f, ctx))).collect(),
+            field_types: field_types.iter().map(|t| apply_type_subst(t, &ctx.type_subst)).collect(),
+            type_args: type_args.iter().map(|t| apply_type_subst(t, &ctx.type_subst)).collect(),
+        },
+        Term::GetTag(node) => Term::GetTag(Box::new(specialize_term(node, ctx))),
+        Term::GetField(node, idx) => Term::GetField(Box::new(specialize_term(node, ctx)), *idx),
     }
 }

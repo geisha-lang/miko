@@ -177,6 +177,15 @@ impl SubstMut for Form {
                 tr.apply_mut(sub);
                 fl.apply_mut(sub);
             }
+            Match(ref mut scrutinee, ref mut arms) => {
+                scrutinee.apply_mut(sub);
+                for arm in arms.iter_mut() {
+                    if let Some(ref mut guard) = arm.guard {
+                        guard.apply_mut(sub);
+                    }
+                    arm.body.apply_mut(sub);
+                }
+            }
             // Lit(Lit),
             // Var(Name),
             _ => {}

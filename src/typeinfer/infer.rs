@@ -19,6 +19,7 @@ use std::mem;
 use super::subst::*;
 use super::constraint::{ Constraint };
 pub use super::error::{ TypeError };
+use super::mono::{InstantiationRegistry, Instantiation, CallSite};
 
 #[derive(Debug)]
 pub struct Infer<'interner> {
@@ -27,6 +28,10 @@ pub struct Infer<'interner> {
     constraints: LinkedList<Constraint>,
     /// Registry of ADT definitions for pattern matching
     pub adt_registry: types::AdtRegistry,
+    /// Registry for tracking polymorphic function instantiations
+    pub instantiation_registry: InstantiationRegistry,
+    /// Active call sites - maps fresh type variables to their call site info
+    call_sites: Vec<CallSite>,
 }
 
 
@@ -37,6 +42,17 @@ fn to_mono(ty: Type) -> Scheme {
     Scheme::Mono(ty)
 }
 
+/// Check if a type is fully concrete (contains no type variables)
+fn is_concrete_type(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => false,
+        Type::Con(_) | Type::Void => true,
+        Type::Arr(p, r) => is_concrete_type(p) && is_concrete_type(r),
+        Type::Prod(l, r) => is_concrete_type(l) && is_concrete_type(r),
+        Type::Comp(base, arg) => is_concrete_type(base) && is_concrete_type(arg),
+    }
+}
+
 
 impl<'i> Infer<'i> {
     pub fn new(interner: &'i mut Interner) -> Infer<'i> {
@@ -45,6 +61,8 @@ impl<'i> Infer<'i> {
             constraints: LinkedList::new(),
             interner,
             adt_registry: HashMap::new(),
+            instantiation_registry: InstantiationRegistry::new(),
+            call_sites: Vec::new(),
         }
     }
 
@@ -73,12 +91,32 @@ impl<'i> Infer<'i> {
 
     /// Temporary instantiate a polymorphism type
     fn instantiate(&mut self, scm: &Scheme) -> Type {
+        self.instantiate_with_tracking(scm, None)
+    }
+
+    /// Instantiate a polymorphism type with optional tracking for monomorphization
+    fn instantiate_with_tracking(&mut self, scm: &Scheme, fn_name: Option<Name>) -> Type {
         use self::Scheme::*;
         match *scm {
             Mono(ref ty) => ty.clone(),
             Poly(ref tvs, ref ty) => {
                 let tvs_: Vec<_> = tvs.iter().map(|_| self.fresh()).collect();
-                let sub: Subst = tvs.clone().into_iter().zip(tvs_).collect();
+                let sub: Subst = tvs.clone().into_iter().zip(tvs_.clone()).collect();
+
+                // Track this instantiation for monomorphization
+                if let Some(fn_name) = fn_name {
+                    let fresh_var_names: Vec<Name> = tvs_.iter()
+                        .filter_map(|t| if let Type::Var(n) = t { Some(n.clone()) } else { None })
+                        .collect();
+
+                    // Record context for each fresh variable
+                    for (i, var_name) in fresh_var_names.iter().enumerate() {
+                        self.instantiation_registry.record_context(var_name.clone(), fn_name.clone(), i);
+                    }
+
+                    // Record the call site
+                    self.call_sites.push(CallSite::new(fn_name, fresh_var_names));
+                }
 
                 ty.clone().apply(&sub)
             }
@@ -86,11 +124,58 @@ impl<'i> Infer<'i> {
                 // For now, treat constrained poly the same as unconstrained
                 // In the future, we'd also generate "wanted" constraints here
                 let tvs_: Vec<_> = tvs.iter().map(|_| self.fresh()).collect();
-                let sub: Subst = tvs.clone().into_iter().zip(tvs_).collect();
+                let sub: Subst = tvs.clone().into_iter().zip(tvs_.clone()).collect();
+
+                // Track this instantiation for monomorphization
+                if let Some(fn_name) = fn_name {
+                    let fresh_var_names: Vec<Name> = tvs_.iter()
+                        .filter_map(|t| if let Type::Var(n) = t { Some(n.clone()) } else { None })
+                        .collect();
+
+                    // Record context for each fresh variable
+                    for (i, var_name) in fresh_var_names.iter().enumerate() {
+                        self.instantiation_registry.record_context(var_name.clone(), fn_name.clone(), i);
+                    }
+
+                    // Record the call site
+                    self.call_sites.push(CallSite::new(fn_name, fresh_var_names));
+                }
 
                 ty.clone().apply(&sub)
             }
             Slot => unreachable!(),
+        }
+    }
+
+    /// Collect concrete instantiations from the substitution after solve()
+    fn collect_instantiations(&mut self, sub: &Subst) {
+        // Process each call site to determine concrete type arguments
+        for call_site in &self.call_sites {
+            let mut type_args = Vec::new();
+            let mut all_concrete = true;
+
+            for fresh_var in &call_site.fresh_vars {
+                if let Some(concrete_type) = sub.get(fresh_var) {
+                    // Check if the type is fully concrete (no type variables)
+                    if is_concrete_type(concrete_type) {
+                        type_args.push(concrete_type.clone());
+                    } else {
+                        all_concrete = false;
+                        break;
+                    }
+                } else {
+                    // Type variable wasn't resolved - use a default or skip
+                    all_concrete = false;
+                    break;
+                }
+            }
+
+            // Only add instantiation if all type arguments are concrete
+            if all_concrete && !type_args.is_empty() {
+                let inst = Instantiation::new(call_site.function.clone(), type_args.clone());
+                self.instantiation_registry.add_instantiation(inst);
+            } else if !type_args.is_empty() {
+            }
         }
     }
 
@@ -324,8 +409,18 @@ impl<'i> Infer<'i> {
             Apply(ref mut callee, ref mut args) => {
                 let callee = callee.as_mut();
                 let callee_pos = callee.tag.pos;
+
+                // Get the function name if this is a direct function call
+                let fn_name = match &callee.node {
+                    Expr::Var(id) => Some(self.interner.trace(*id).to_string()),
+                    _ => None,
+                };
+
                 let ty_callee = self.infer(e, callee)?;
-                let callee_inst = self.instantiate(ty_callee);
+
+                // Use tracking instantiation if we have a function name
+                let callee_inst = self.instantiate_with_tracking(ty_callee, fn_name);
+
                 let mut ty_args: Vec<Type> = vec![];
 
                 for arg in args.iter_mut() {
@@ -521,6 +616,10 @@ impl<'i> Infer<'i> {
                     self.infer(&mut env, d.form_body_mut())?;
                     self.solve()?
                 };
+
+                // Collect instantiations from this function body
+                self.collect_instantiations(&sub);
+
                 d.form_body_mut().apply_mut(&sub);
 
                 let general = {
@@ -533,7 +632,11 @@ impl<'i> Infer<'i> {
                     }
                 };
 
-                d.form_body_mut().tag.set_scheme(general);
+                d.form_body_mut().tag.set_scheme(general.clone());
+
+                // Register polymorphic functions for potential specialization
+                let fn_name = self.interner.trace(d.name()).to_string();
+                self.instantiation_registry.register_polymorphic(fn_name, general.clone());
 
                 env.insert(d.name().to_owned(), d.form_type().clone());
             }

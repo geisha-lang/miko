@@ -77,6 +77,10 @@ impl FunDef {
         self.ty.body()
     }
 
+    pub fn scheme(&self) -> &Scheme {
+        &self.ty
+    }
+
     pub fn parameters(&self) -> &Vec<VarDecl> {
         &self.params
     }
@@ -153,7 +157,8 @@ pub enum Term {
         type_name: Name,
         tag: usize,
         fields: Vec<Node>,
-        field_types: Vec<Type>,  // Instantiated concrete types
+        field_types: Vec<Type>,  // Instantiated concrete types for fields
+        type_args: Vec<Type>,    // Type arguments for the ADT (e.g., [Int] for List Int)
     },
     /// Get the variant tag from an ADT value
     GetTag(Node),

@@ -38,6 +38,11 @@ impl Interner {
     pub fn trace_string(&self, i: Id) -> String {
         self.backward[i.0].clone()
     }
+
+    /// Look up an Id without interning if it doesn't exist
+    pub fn lookup(&self, s: &str) -> Option<Id> {
+        self.forward.get(s).copied()
+    }
 }
 
 

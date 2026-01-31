@@ -8,6 +8,16 @@ use crate::codegen::llvm::*;
 
 use std::ops::Deref;
 
+/// Check if a type contains any type variables
+fn contains_type_var(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => true,
+        Type::Con(_) | Type::Void => false,
+        Type::Arr(p, r) => contains_type_var(p) || contains_type_var(r),
+        Type::Prod(l, r) => contains_type_var(l) || contains_type_var(r),
+        Type::Comp(base, arg) => contains_type_var(base) || contains_type_var(arg),
+    }
+}
 
 pub trait EmitProvider {
     fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = FunDef>;
@@ -52,6 +62,14 @@ impl<'i> LLVMEmit<'i> {
     pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
         // A global function definition
         let fun_type = def.ref_type();
+
+        // Skip polymorphic functions - they should have specialized versions generated
+        // A function is polymorphic if its type contains type variables
+        if contains_type_var(fun_type) {
+            let def_name = self.interner.trace(def.name());
+            return;
+        }
+
         let void_ret = if let Type::Arr(_, ret) = fun_type {
             matches!(ret.as_ref(), Type::Void)
         } else {
@@ -193,7 +211,8 @@ impl<'i> LLVMEmit<'i> {
 
                     // Check if this is an ADT type - if so, use the actual init value type
                     // to preserve the concrete instantiated types
-                    if is_adt_type(tyvar.body()) {
+                    let is_adt = is_adt_type(tyvar.body());
+                    if is_adt {
                         let init_ty = init.get_type();
                         self.builder().alloca(&init_ty, var_name)
                     } else {
@@ -362,35 +381,31 @@ impl<'i> LLVMEmit<'i> {
                 let els_end = self.builder().get_insert_block();
 
                 self.builder().set_position_at_end(&cont_blk);
-                let ret_ty = then.get_type();
-                self.builder().phi_node(&ret_ty, &[(&then, &then_end), (&els, &els_end)], "if.res")
+                self.create_result_phi(&[(then, then_end), (els, els_end)], &cont_blk, "if.res")
             }
             List(_) => unimplemented!(),
             Unary(_, _) => unimplemented!(),
 
             // ADT Operations
-            MakeData { ref type_name, tag, ref fields, ref field_types } => {
+            MakeData { ref type_name, tag, ref fields, ref field_types, ref type_args } => {
                 // Create an ADT value with the given tag and fields
                 // ADT is represented as: { i32 tag, payload_struct }
                 // Returns a pointer to the allocated ADT struct
+                //
+                // We use the instantiated ADT type based on type_args for consistent memory layout
+
 
                 // Get field values
                 let field_vals: Vec<LLVMValue> = fields.iter()
                     .map(|f| self.gen_expr(f, symbols))
                     .collect();
 
-                // Build payload type from instantiated field_types
-                let tag_ty = self.context().get_int32_type();
-                let adt_ty = if field_types.is_empty() {
-                    // Unit variant - just tag
-                    self.context().get_struct_type(&vec![tag_ty], false)
+                // Use the instantiated ADT type for allocation
+                // This ensures the payload is sized correctly for concrete type arguments
+                let adt_ty = if type_args.is_empty() {
+                    self.generator.gen_user_type(type_name)
                 } else {
-                    // Variant with payload - use instantiated types
-                    let payload_llvm_types: Vec<LLVMType> = field_types.iter()
-                        .map(|t| self.generator.get_instantiated_field_type(t))
-                        .collect();
-                    let payload_ty = self.context().get_struct_type(&payload_llvm_types, false);
-                    self.context().get_struct_type(&vec![tag_ty, payload_ty], false)
+                    self.generator.gen_instantiated_user_type(type_name, type_args)
                 };
 
                 // Allocate on stack
@@ -403,7 +418,17 @@ impl<'i> LLVMEmit<'i> {
 
                 // Store payload fields if any
                 if !field_vals.is_empty() {
-                    let payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
+                    // Build this variant's specific payload type from field_types
+                    let payload_llvm_types: Vec<LLVMType> = field_types.iter()
+                        .map(|t| self.generator.get_instantiated_field_type(t))
+                        .collect();
+                    let variant_payload_ty = self.context().get_struct_type(&payload_llvm_types, false);
+                    let variant_payload_ptr_ty = variant_payload_ty.get_ptr(0);
+
+                    // Get the payload pointer and cast to this variant's type
+                    let generic_payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
+                    let payload_ptr = self.builder().bit_cast(&generic_payload_ptr, &variant_payload_ptr_ty, "adt.payload.typed");
+
                     for (i, fv) in field_vals.iter().enumerate() {
                         let field_ptr = self.builder().struct_field_ptr(&payload_ptr, i, "adt.field.ptr");
                         let field_ty = field_ptr.get_type().get_element();
@@ -492,16 +517,8 @@ impl<'i> LLVMEmit<'i> {
 
                     // Build phi node for result
                     self.builder().set_position_at_end(&cont_blk);
-                    if !results.is_empty() {
-                        let result_ty = results[0].0.get_type();
-                        let incoming: Vec<_> = results.iter()
-                            .map(|(v, b)| (v, b))
-                            .collect();
-                        self.builder().phi_node(&result_ty, &incoming, "match.result")
-                    } else {
-                        // No arms - return undef (shouldn't happen in valid code)
-                        self.context().get_int32_const(0)
-                    }
+
+                    self.create_result_phi(&results, &cont_blk, "match.result")
                 } else {
                     // Simple pattern matching (literals, wildcards, variables)
                     // Generate a chain of if-then-else
@@ -526,6 +543,110 @@ impl<'i> LLVMEmit<'i> {
     fn context(&self) -> &LLVMContext {
         &self.generator.context
     }
+
+    /// Create a phi node for results, handling void types and type mismatches correctly.
+    /// LLVM phi nodes cannot have void type, so we return a dummy value for void results.
+    /// Also handles i32/i64 mismatches by coercing to i32 (the concrete Int type).
+    fn create_result_phi(&mut self, results: &[(LLVMValue, LLVMBasicBlock)], cont_blk: &LLVMBasicBlock, name: &str) -> LLVMValue {
+        if results.is_empty() {
+            return self.context().get_int32_const(0);
+        }
+        let result_ty = results[0].0.get_type();
+        let is_void = unsafe {
+            llvm_sys::core::LLVMGetTypeKind(result_ty.raw_ptr()) == llvm_sys::LLVMTypeKind::LLVMVoidTypeKind
+        };
+        if is_void {
+            self.context().get_int32_const(0)  // Dummy value, won't be used
+        } else {
+            // Check if all result types match
+            let all_same_type = results.iter().all(|(v, _)| v.get_type().raw_ptr() == result_ty.raw_ptr());
+
+            if all_same_type {
+                let incoming: Vec<_> = results.iter().map(|(v, b)| (v, b)).collect();
+                self.builder().phi_node(&result_ty, &incoming, name)
+            } else {
+                // Types differ - likely i32/i64 mismatch from polymorphic functions
+                // Coerce everything to i32 (the concrete Int type)
+                let i32_ty = self.context().get_int32_type();
+
+                // We need to insert conversions in the correct basic blocks
+                // For each result, if it's i64, truncate to i32
+                let converted: Vec<(LLVMValue, LLVMBasicBlock)> = results.iter().map(|(v, blk)| {
+                    let v_ty = v.get_type();
+                    let v_ty_kind = unsafe {
+                        llvm_sys::core::LLVMGetTypeKind(v_ty.raw_ptr())
+                    };
+
+                    if v_ty_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind {
+                        let bit_width = unsafe {
+                            llvm_sys::core::LLVMGetIntTypeWidth(v_ty.raw_ptr())
+                        };
+                        if bit_width == 64 {
+                            // Need to insert trunc instruction before the branch in blk
+                            // First, find the terminator instruction
+                            let terminator = unsafe {
+                                llvm_sys::core::LLVMGetBasicBlockTerminator(blk.raw_ptr())
+                            };
+                            if !terminator.is_null() {
+                                // Position builder before terminator
+                                unsafe {
+                                    llvm_sys::core::LLVMPositionBuilderBefore(
+                                        self.builder().raw_ptr(),
+                                        terminator
+                                    );
+                                }
+                            }
+                            let truncated = self.builder().trunc(v, &i32_ty, "phi.trunc");
+                            (truncated, blk.clone())
+                        } else if bit_width == 32 {
+                            (v.clone(), blk.clone())
+                        } else {
+                            // Other integer width - try to convert
+                            if bit_width < 32 {
+                                let terminator = unsafe {
+                                    llvm_sys::core::LLVMGetBasicBlockTerminator(blk.raw_ptr())
+                                };
+                                if !terminator.is_null() {
+                                    unsafe {
+                                        llvm_sys::core::LLVMPositionBuilderBefore(
+                                            self.builder().raw_ptr(),
+                                            terminator
+                                        );
+                                    }
+                                }
+                                let extended = self.builder().sext(v, &i32_ty, "phi.sext");
+                                (extended, blk.clone())
+                            } else {
+                                let terminator = unsafe {
+                                    llvm_sys::core::LLVMGetBasicBlockTerminator(blk.raw_ptr())
+                                };
+                                if !terminator.is_null() {
+                                    unsafe {
+                                        llvm_sys::core::LLVMPositionBuilderBefore(
+                                            self.builder().raw_ptr(),
+                                            terminator
+                                        );
+                                    }
+                                }
+                                let truncated = self.builder().trunc(v, &i32_ty, "phi.trunc");
+                                (truncated, blk.clone())
+                            }
+                        }
+                    } else {
+                        // Non-integer type - use as is
+                        (v.clone(), blk.clone())
+                    }
+                }).collect();
+
+                // Restore builder position to continuation block
+                self.builder().set_position_at_end(cont_blk);
+
+                let incoming: Vec<_> = converted.iter().map(|(v, b)| (v, b)).collect();
+                self.builder().phi_node(&i32_ty, &incoming, name)
+            }
+        }
+    }
+
     fn alloca_for_var(&mut self, fun: &LLVMFunction, var: &VarDecl) -> LLVMValue {
         let &VarDecl(pname, ref ptype) = var;
         let name = self.interner.trace(pname);
@@ -646,12 +767,14 @@ impl<'i> LLVMEmit<'i> {
                         instantiated_field_types
                     };
 
+
                     // Build the payload struct type with instantiated types
                     let payload_llvm_types: Vec<LLVMType> = field_types.iter()
                         .map(|t| self.generator.get_instantiated_field_type(t))
                         .collect();
                     let payload_ty = self.context().get_struct_type(&payload_llvm_types, false);
                     let payload_ptr_ty = payload_ty.get_ptr(0);
+
 
                     // Cast the payload pointer to the correct type
                     let raw_payload_ptr = self.builder().struct_field_ptr(scrutinee_ptr, 1, "pat.payload.ptr");
@@ -854,15 +977,7 @@ impl<'i> LLVMEmit<'i> {
 
         // Build phi node for result
         self.builder().set_position_at_end(cont_blk);
-        if !results.is_empty() {
-            let result_ty = results[0].0.get_type();
-            let incoming: Vec<_> = results.iter()
-                .map(|(v, b)| (v, b))
-                .collect();
-            self.builder().phi_node(&result_ty, &incoming, "match.result")
-        } else {
-            self.context().get_int32_const(0)
-        }
+        self.create_result_phi(&results, cont_blk, "match.result")
     }
 }
 

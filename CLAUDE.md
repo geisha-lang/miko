@@ -108,6 +108,21 @@ instance Eq Int {            # Implement for type
 - `peg` 0.8 - inline PEG parser generator
 - `clap` 4 - command-line argument parsing
 
+## Development Workflow
+
+After implementing a feature:
+1. Run `cargo test` to ensure all unit tests pass
+2. Test with example programs in `test/` directory
+3. **Update documentation** in `docs/` to reflect changes:
+   - `docs/specs/` - Language specification docs
+   - `docs/runtime/` - Runtime/codegen implementation docs
+4. Update any TODO files if issues are resolved
+
+When encountering issues:
+- If a proper fix requires deeper architectural changes, **document the workaround** in `docs/todo/`
+- Create a markdown file describing: the issue, the workaround applied, and what a proper fix would look like
+- This prevents technical debt from being forgotten
+
 ## Gotchas
 
 - Example Geisha programs in `test/` (fibonacci.gs, factorial.gs, etc.)

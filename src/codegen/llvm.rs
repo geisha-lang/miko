@@ -103,18 +103,28 @@ pub fn is_adt_type(t: &Type) -> bool {
                 _ => true,
             }
         }
-        Type::Comp(base, _) => {
-            // Parametric ADT like List a
-            if let Type::Con(n) = base.as_ref() {
-                match n.as_str() {
-                    "Int" | "Float" | "Char" | "String" | "Void" | "Bool" => false,
-                    _ => true,
-                }
-            } else {
-                false
+        Type::Comp(_, _) => {
+            // Parametric ADT like List a or Pair Int String
+            // Walk to the base to find the type constructor name
+            let base_name = get_comp_base_name_static(t);
+            match base_name.as_str() {
+                "Int" | "Float" | "Char" | "String" | "Void" | "Bool" => false,
+                _ => true,
             }
         }
         _ => false,
+    }
+}
+
+/// Get the base type constructor name from a Comp chain (static version)
+fn get_comp_base_name_static(ty: &Type) -> String {
+    let mut current = ty;
+    while let Type::Comp(base, _) = current {
+        current = base.as_ref();
+    }
+    match current {
+        Type::Con(name) => name.clone(),
+        _ => String::new(),
     }
 }
 
@@ -218,12 +228,12 @@ impl LLVMCodegen {
                     .collect();
                 self.context.get_struct_type(&tys, true)
             }
-            Comp(base, _param) => {
-                if let Type::Con(name) = base.as_ref() {
-                    self.gen_user_type(name)
-                } else {
-                    self.get_llvm_type(base)
-                }
+            Comp(_, _) => {
+                // For parameterized ADTs like Maybe Int or Pair Int String,
+                // collect all type arguments and find the base type constructor
+                let type_args = self.collect_comp_type_args(ty);
+                let base_name = self.get_comp_base_name(ty);
+                self.gen_instantiated_user_type(&base_name, &type_args)
             }
 
             // Unresolved type variable - use i64 as universal boxed representation
@@ -250,6 +260,106 @@ impl LLVMCodegen {
         } else {
             panic!("Unknown user type: {}", tyname)
         }
+    }
+
+    /// Collect all type arguments from a Comp type chain
+    /// E.g., Comp(Comp(Map, k), v) -> [k, v]
+    fn collect_comp_type_args(&self, ty: &Type) -> Vec<Type> {
+        let mut args = Vec::new();
+        let mut current = ty;
+        while let Type::Comp(base, arg) = current {
+            args.insert(0, arg.as_ref().clone());
+            current = base.as_ref();
+        }
+        args
+    }
+
+    /// Get the base type constructor name from a Comp chain
+    /// E.g., Comp(Comp(Map, k), v) -> "Map"
+    fn get_comp_base_name(&self, ty: &Type) -> String {
+        let mut current = ty;
+        while let Type::Comp(base, _) = current {
+            current = base.as_ref();
+        }
+        match current {
+            Type::Con(name) => name.clone(),
+            _ => panic!("Expected type constructor at base of Comp chain, got {:?}", current),
+        }
+    }
+
+    /// Generate LLVM type for an instantiated ADT (e.g., Maybe Int)
+    pub fn gen_instantiated_user_type(&self, tyname: &str, type_args: &[Type]) -> LLVMType {
+        if let Some(adt_info) = self.adt_registry.get(tyname) {
+            self.get_instantiated_adt_llvm_type(adt_info, type_args)
+        } else {
+            panic!("Unknown user type: {}", tyname)
+        }
+    }
+
+    /// Generate LLVM type for an ADT with concrete type arguments
+    fn get_instantiated_adt_llvm_type(&self, adt_info: &AdtInfo, type_args: &[Type]) -> LLVMType {
+        let tag_ty = self.context.get_int32_type();
+
+        // Build substitution from type parameters to concrete types
+        let subst: std::collections::HashMap<String, Type> = adt_info.type_params.iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect();
+
+
+        // Find variant with most fields for payload sizing
+        let max_fields = adt_info.variants.iter()
+            .filter(|v| !v.field_types.is_empty())
+            .max_by_key(|v| v.field_types.len());
+
+        match max_fields {
+            Some(variant) => {
+                // Substitute type parameters in field types
+                let instantiated_field_types: Vec<Type> = variant.field_types.iter()
+                    .map(|t| self.substitute_type(t, &subst))
+                    .collect();
+                let payload_ty = self.get_instantiated_payload_llvm_type(&instantiated_field_types);
+                self.context.get_struct_type(&vec![tag_ty, payload_ty], false)
+            }
+            None => {
+                // All unit variants
+                self.context.get_struct_type(&vec![tag_ty], false)
+            }
+        }
+    }
+
+    /// Substitute type parameters in a type
+    fn substitute_type(&self, ty: &Type, subst: &std::collections::HashMap<String, Type>) -> Type {
+        match ty {
+            Type::Var(name) => {
+                if let Some(concrete) = subst.get(name) {
+                    concrete.clone()
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Con(_) | Type::Void => ty.clone(),
+            Type::Arr(p, r) => Type::Arr(
+                Box::new(self.substitute_type(p, subst)),
+                Box::new(self.substitute_type(r, subst)),
+            ),
+            Type::Prod(l, r) => Type::Prod(
+                Box::new(self.substitute_type(l, subst)),
+                Box::new(self.substitute_type(r, subst)),
+            ),
+            Type::Comp(base, arg) => Type::Comp(
+                Box::new(self.substitute_type(base, subst)),
+                Box::new(self.substitute_type(arg, subst)),
+            ),
+        }
+    }
+
+    /// Get LLVM type for an instantiated payload (with concrete types, no type variables)
+    fn get_instantiated_payload_llvm_type(&self, field_types: &[Type]) -> LLVMType {
+        let llvm_types: Vec<LLVMType> = field_types.iter()
+            .map(|t| self.get_instantiated_field_type(t))
+            .collect();
+        self.context.get_struct_type(&llvm_types, false)
     }
 
     fn get_adt_llvm_type(&self, adt_info: &AdtInfo) -> LLVMType {
@@ -336,9 +446,11 @@ impl LLVMCodegen {
                 self.context.get_int8_type().get_ptr(0)
             }
             Type::Arr(..) => self.get_closure_type().get_ptr(0),
-            Type::Var(v) => {
-                eprintln!("Warning: unresolved type var {} at codegen", v);
-                self.context.get_int64_type() // Fallback with warning
+            Type::Var(_v) => {
+                // Type variables in polymorphic functions use i64 as universal representation
+                // This is expected when monomorphization hasn't specialized the function
+                // Debug: eprintln!("Warning: unresolved type var {} at codegen", v);
+                self.context.get_int64_type()
             }
             Type::Prod(..) => {
                 let tys: Vec<_> = ty.prod_to_vec().iter()

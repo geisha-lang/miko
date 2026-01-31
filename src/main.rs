@@ -115,17 +115,17 @@ fn compile(name: &str, src: &str) -> Result<LLVMCodegen, CompileError> {
         .map_err(|e| CompileError::ParseError(format!("{}", e)))?;
 
     // Type inference
-    let adt_registry = {
+    let (adt_registry, instantiation_registry) = {
         let env = Infer::new_env();
         let prelude = load_prelude(&mut inter, &env);
         let mut infer = Infer::new(&mut inter);
         infer.infer_defs(&prelude, &mut defs)
             .map_err(|te| CompileError::TypeError(te))?;
-        infer.adt_registry
+        (infer.adt_registry, infer.instantiation_registry)
     };
 
-    // K-conversion (core term generation)
-    let (mut top, _) = K::go(defs, &mut inter, adt_registry.clone());
+    // K-conversion (core term generation) with monomorphization
+    let (mut top, _) = K::go(defs, &mut inter, adt_registry.clone(), instantiation_registry);
 
     // Code generation
     let main_id = inter.intern("main");

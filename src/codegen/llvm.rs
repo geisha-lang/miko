@@ -22,6 +22,7 @@ pub struct LLVMCodegen {
     pub context: LLVMContext,
     pub passer: LLVMFunctionPassManager,
     unique: usize,
+    pub adt_registry: AdtRegistry,
 }
 
 type LLVMOpBuilder<'a> = dyn Fn(LLVMBuilderRef,
@@ -32,52 +33,93 @@ type LLVMOpBuilder<'a> = dyn Fn(LLVMBuilderRef,
 pub fn get_llvm_op<'a>(op: BinOp, operand_ty: &'a Type) -> Box<LLVMOpBuilder<'a>> {
     use self::BinOp::*;
     use self::Type::*;
+
+    // Get type name, defaulting to "Int" for type variables (polymorphic contexts)
+    let type_name = match operand_ty {
+        Con(ty_name) => ty_name.as_str(),
+        Var(_) => "Int", // Default to Int for unresolved type variables
+        _ => "Int",      // Default to Int for other cases
+    };
+
     Box::new(move |builder, lhs, rhs, dest|
-        if let Con(ty_name) = operand_ty {
-            let name_ref = ty_name.as_str();
-            unsafe {
-                match (op, name_ref) {
-                    (Add, "Int") => LLVMBuildAdd(builder, lhs, rhs, dest),
-                    (Add, "Float") => LLVMBuildFAdd(builder, lhs, rhs, dest),
-                    (Sub, "Int") => LLVMBuildSub(builder, lhs, rhs, dest),
-                    (Sub, "Float") => LLVMBuildFSub(builder, lhs, rhs, dest),
-                    (Mul, "Int") => LLVMBuildMul(builder, lhs, rhs, dest),
-                    (Mul, "Float") => LLVMBuildFMul(builder, lhs, rhs, dest),
-                    (Eq, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, lhs, rhs, dest),
-                    (Lt, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLT, lhs, rhs, dest),
-                    (Le, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLE, lhs, rhs, dest),
-                    (Gt, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGT, lhs, rhs, dest),
-                    (Ge, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGE, lhs, rhs, dest),
-                    (Eq, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOEQ, lhs, rhs, dest),
-                    (Lt, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOLT, lhs, rhs, dest),
-                    (Le, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOLE, lhs, rhs, dest),
-                    (Gt, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGT, lhs, rhs, dest),
-                    (Ge, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGE, lhs, rhs, dest),
-                    (And, "Bool") => LLVMBuildAnd(builder, lhs, rhs, dest),
-                    (Or, "Bool") => LLVMBuildOr(builder, lhs, rhs, dest),
-                    (Div, _) => LLVMBuildFDiv(builder, lhs, rhs, dest), // TODO: I dont know exactly which builder
-                    (Rem, _) => LLVMBuildURem(builder, lhs, rhs, dest), //       should I use for these two
-                    _ => unimplemented!(),
-                }
+        unsafe {
+            match (op, type_name) {
+                (Add, "Int") => LLVMBuildAdd(builder, lhs, rhs, dest),
+                (Add, "Float") => LLVMBuildFAdd(builder, lhs, rhs, dest),
+                (Sub, "Int") => LLVMBuildSub(builder, lhs, rhs, dest),
+                (Sub, "Float") => LLVMBuildFSub(builder, lhs, rhs, dest),
+                (Mul, "Int") => LLVMBuildMul(builder, lhs, rhs, dest),
+                (Mul, "Float") => LLVMBuildFMul(builder, lhs, rhs, dest),
+                (Eq, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, lhs, rhs, dest),
+                (Lt, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLT, lhs, rhs, dest),
+                (Le, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLE, lhs, rhs, dest),
+                (Gt, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGT, lhs, rhs, dest),
+                (Ge, "Int") => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGE, lhs, rhs, dest),
+                (Eq, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOEQ, lhs, rhs, dest),
+                (Lt, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOLT, lhs, rhs, dest),
+                (Le, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOLE, lhs, rhs, dest),
+                (Gt, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGT, lhs, rhs, dest),
+                (Ge, "Double") => LLVMBuildFCmp(builder, LLVMRealPredicate::LLVMRealOGE, lhs, rhs, dest),
+                (And, "Bool") => LLVMBuildAnd(builder, lhs, rhs, dest),
+                (Or, "Bool") => LLVMBuildOr(builder, lhs, rhs, dest),
+                (Div, _) => LLVMBuildFDiv(builder, lhs, rhs, dest),
+                (Rem, _) => LLVMBuildURem(builder, lhs, rhs, dest),
+                // Default to Int operations for type variables
+                (Add, _) => LLVMBuildAdd(builder, lhs, rhs, dest),
+                (Sub, _) => LLVMBuildSub(builder, lhs, rhs, dest),
+                (Mul, _) => LLVMBuildMul(builder, lhs, rhs, dest),
+                (Eq, _) => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, lhs, rhs, dest),
+                (Lt, _) => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLT, lhs, rhs, dest),
+                (Le, _) => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLE, lhs, rhs, dest),
+                (Gt, _) => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGT, lhs, rhs, dest),
+                (Ge, _) => LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSGE, lhs, rhs, dest),
+                (And, _) => LLVMBuildAnd(builder, lhs, rhs, dest),
+                (Or, _) => LLVMBuildOr(builder, lhs, rhs, dest),
+                _ => unimplemented!("Binary operation {:?} not implemented for type {}", op, type_name),
             }
-        } else {
-            unreachable!()
         })
 }
 
 pub fn is_primitive_type(t: &Type) -> bool {
-    if let Type::Con(n) = t {
-        match n.as_str() {
-            "Int" | "Float" | "Char" | "String" | "Void" => true,
-            _ => false,
+    match t {
+        Type::Con(n) => {
+            match n.as_str() {
+                "Int" | "Float" | "Char" | "String" | "Void" | "Bool" => true,
+                _ => false,
+            }
         }
-    } else {
-        false
+        // Type variables are treated as primitive (i64) values
+        Type::Var(_) => true,
+        _ => false,
+    }
+}
+
+/// Check if a type is an ADT (user-defined algebraic data type)
+pub fn is_adt_type(t: &Type) -> bool {
+    match t {
+        Type::Con(n) => {
+            match n.as_str() {
+                "Int" | "Float" | "Char" | "String" | "Void" | "Bool" => false,
+                _ => true,
+            }
+        }
+        Type::Comp(base, _) => {
+            // Parametric ADT like List a
+            if let Type::Con(n) = base.as_ref() {
+                match n.as_str() {
+                    "Int" | "Float" | "Char" | "String" | "Void" | "Bool" => false,
+                    _ => true,
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 
 impl LLVMCodegen {
-    pub fn new(name: &str) -> LLVMCodegen {
+    pub fn new(name: &str, adt_registry: AdtRegistry) -> LLVMCodegen {
         let context = LLVMContext::new();
         let module = LLVMModule::in_ctx(name, &context);
         let builder = LLVMBuilder::in_ctx(&context);
@@ -88,6 +130,7 @@ impl LLVMCodegen {
             builder,
             passer,
             unique: 0,
+            adt_registry,
         }
     }
 
@@ -175,9 +218,17 @@ impl LLVMCodegen {
                     .collect();
                 self.context.get_struct_type(&tys, true)
             }
-            Comp(_c, _p) => unimplemented!(), // TODO: determine the type
+            Comp(base, _param) => {
+                if let Type::Con(name) = base.as_ref() {
+                    self.gen_user_type(name)
+                } else {
+                    self.get_llvm_type(base)
+                }
+            }
 
-            Var(..) => panic!("Unmaterized type"),
+            // Unresolved type variable - use i64 as universal boxed representation
+            // This can hold both pointers (via inttoptr) and primitives (via zext/sext)
+            Var(..) => self.context.get_int64_type(),
         }
     }
 
@@ -194,8 +245,75 @@ impl LLVMCodegen {
     }
 
     pub fn gen_user_type(&self, tyname: &str) -> LLVMType {
-        // TODO: make a user defined type definition
-        unimplemented!("User type {} not implemented", tyname)
+        if let Some(adt_info) = self.adt_registry.get(tyname) {
+            self.get_adt_llvm_type(adt_info)
+        } else {
+            panic!("Unknown user type: {}", tyname)
+        }
+    }
+
+    fn get_adt_llvm_type(&self, adt_info: &AdtInfo) -> LLVMType {
+        let tag_ty = self.context.get_int32_type();
+
+        // Find variant with most fields for payload sizing
+        let max_fields = adt_info.variants.iter()
+            .filter(|v| !v.field_types.is_empty())
+            .max_by_key(|v| v.field_types.len());
+
+        match max_fields {
+            Some(variant) => {
+                let payload_ty = self.get_payload_llvm_type(&variant.field_types);
+                self.context.get_struct_type(&vec![tag_ty, payload_ty], false)
+            }
+            None => {
+                // All unit variants
+                self.context.get_struct_type(&vec![tag_ty], false)
+            }
+        }
+    }
+
+    fn get_payload_llvm_type(&self, field_types: &[Type]) -> LLVMType {
+        let llvm_types: Vec<LLVMType> = field_types.iter()
+            .map(|t| self.get_field_llvm_type(t))
+            .collect();
+        self.context.get_struct_type(&llvm_types, false)
+    }
+
+    fn get_field_llvm_type(&self, ty: &Type) -> LLVMType {
+        match ty {
+            Type::Con(name) => match name.as_str() {
+                "Int" => self.context.get_int32_type(),
+                "Float" => self.context.get_double_type(),
+                "Char" => self.context.get_int8_type(),
+                "Bool" => self.context.get_int1_type(),
+                "String" => self.context.get_int8_type().get_ptr(0),
+                "Void" => self.context.get_void_type(),
+                // Other ADTs: use opaque pointer to avoid infinite recursion
+                // ADT values are always stored/passed as pointers
+                _ => self.context.get_int8_type().get_ptr(0),
+            },
+            Type::Arr(..) => self.get_closure_type().get_ptr(0),
+            Type::Comp(_base, _) => {
+                // Polymorphic type like List a - use opaque pointer
+                // ADT values are always stored/passed as pointers
+                self.context.get_int8_type().get_ptr(0)
+            }
+            // Type variable: use i64 as a universal representation
+            // that can hold both pointers (via inttoptr) and primitives (via zext/sext)
+            Type::Var(_) => self.context.get_int64_type(),
+            Type::Prod(..) => {
+                let tys: Vec<_> = ty.prod_to_vec().iter()
+                    .map(|t| self.get_field_llvm_type(t))
+                    .collect();
+                self.context.get_struct_type(&tys, false)
+            }
+            Type::Void => self.context.get_void_type(),
+        }
+    }
+
+    /// Get the i64 type for storing polymorphic values
+    pub fn get_int64_type(&self) -> LLVMType {
+        self.context.get_int64_type()
     }
 
     /// Get the LLVM type for an ADT (Algebraic Data Type)
@@ -254,6 +372,7 @@ impl LLVMCodegen {
         let fi = block.get_first_instr();
         let llvm_ty = match ty {
             Type::Arr(..) => self.get_closure_type().get_ptr(0),
+            _ if is_adt_type(ty) => self.get_llvm_type(ty).get_ptr(0),
             _ => self.get_llvm_type(ty)
         };
         builder.set_position(&block, &fi);

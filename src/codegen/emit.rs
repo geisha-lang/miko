@@ -36,9 +36,9 @@ pub type VarEnv<'a> = SymTable<'a, Id, LLVMValue>;
 
 
 impl<'i> LLVMEmit<'i> {
-    pub fn new(name: &str, interner: &'i mut Interner) -> Self {
+    pub fn new(name: &str, interner: &'i mut Interner, adt_registry: AdtRegistry) -> Self {
         LLVMEmit {
-            generator: LLVMCodegen::new(name),
+            generator: LLVMCodegen::new(name, adt_registry),
             interner,
             funpass: true
         }
@@ -224,11 +224,28 @@ impl<'i> LLVMEmit<'i> {
             ApplyDir(VarDecl(fun, ref fun_ty), ref args) => {
                 let empty_fv_ty = self.context().get_int8_type().get_ptr(0);
                 let empty_fv_ptr = empty_fv_ty.get_null_ptr();
-                let mut argsv: Vec<_> =
-                    args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+                let callee_name = self.interner.trace(fun).to_owned();
+                let callee = self.generator.get_or_add_function(&callee_name, fun_ty.body());
+
+                // Get actual expected parameter types from the LLVM function
+                let fn_ty = callee.get_function_type();
+
+                // Generate argument values with type conversion if needed
+                let mut argsv: Vec<_> = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let val = self.gen_expr(arg, symbols);
+                    // Get expected parameter type from LLVM function
+                    let expected_llvm_ty = fn_ty.get_param_type(i);
+                    let val_ty = val.get_type();
+
+                    // Check if we need to cast - i8* to specific ADT pointer
+                    if val_ty.raw_ptr() != expected_llvm_ty.raw_ptr() {
+                        argsv.push(self.builder().bit_cast(&val, &expected_llvm_ty, "arg.cast"));
+                    } else {
+                        argsv.push(val);
+                    }
+                }
                 argsv.push(empty_fv_ptr);
-                let callee_name = self.interner.trace(fun);
-                let callee = self.generator.get_or_add_function(callee_name, fun_ty.body());
 
                 self.builder().call(&callee, &mut argsv, "calldirect")
             }
@@ -340,62 +357,59 @@ impl<'i> LLVMEmit<'i> {
             Unary(_, _) => unimplemented!(),
 
             // ADT Operations
-            MakeData(ref _type_name, tag, ref fields) => {
+            MakeData(ref type_name, tag, ref fields) => {
                 // Create an ADT value with the given tag and fields
                 // ADT is represented as: { i32 tag, payload_struct }
+                // Returns a pointer to the allocated ADT struct
+
+                // Get the ADT type from the registry
+                let adt_ty = self.generator.gen_user_type(type_name);
 
                 // Get field values
                 let field_vals: Vec<LLVMValue> = fields.iter()
                     .map(|f| self.gen_expr(f, symbols))
                     .collect();
 
-                // Create the ADT struct type
-                let tag_ty = self.context().get_int32_type();
+                // Allocate on stack
+                let adt_ptr = self.builder().alloca(&adt_ty, "adt");
 
-                if field_vals.is_empty() {
-                    // Unit constructor - just need the tag
-                    let adt_ty = self.context().get_struct_type(&vec![tag_ty], false);
-                    let mut adt_val = adt_ty.get_undef();
-                    let tag_val = self.context().get_int32_const(tag as i32);
-                    adt_val = self.builder().insert_value(&adt_val, &tag_val, 0, "adt.tag");
-                    adt_val
-                } else {
-                    // Constructor with fields
-                    let field_types: Vec<LLVMType> = field_vals.iter()
-                        .map(|v| v.get_type())
-                        .collect();
-                    let payload_ty = self.context().get_struct_type(&field_types, false);
-                    let adt_ty = self.context().get_struct_type(&vec![tag_ty, payload_ty], false);
+                // Store tag
+                let tag_val = self.context().get_int32_const(tag as i32);
+                let tag_ptr = self.builder().struct_field_ptr(&adt_ptr, 0, "adt.tag.ptr");
+                self.builder().store(&tag_val, &tag_ptr);
 
-                    let mut adt_val = adt_ty.get_undef();
-                    let tag_val = self.context().get_int32_const(tag as i32);
-                    adt_val = self.builder().insert_value(&adt_val, &tag_val, 0, "adt.tag");
-
-                    // Build payload struct
-                    let mut payload_val = payload_ty.get_undef();
+                // Store payload fields if any
+                if !field_vals.is_empty() {
+                    let payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
                     for (i, fv) in field_vals.iter().enumerate() {
-                        payload_val = self.builder().insert_value(&payload_val, fv, i, "payload.field");
+                        let field_ptr = self.builder().struct_field_ptr(&payload_ptr, i, "adt.field.ptr");
+                        let field_ty = field_ptr.get_type().get_element();
+                        let val_ty = fv.get_type();
+                        let val_to_store = self.convert_to_field_type(fv, &val_ty, &field_ty);
+                        self.builder().store(&val_to_store, &field_ptr);
                     }
-                    adt_val = self.builder().insert_value(&adt_val, &payload_val, 1, "adt.payload");
-                    adt_val
                 }
+                adt_ptr
             }
 
             GetTag(ref node) => {
-                // Extract the tag from an ADT value
-                let adt_val = self.gen_expr(node, symbols);
-                self.builder().extract_value(&adt_val, 0, "adt.tag")
+                // Extract the tag from an ADT value (pointer)
+                let adt_ptr = self.gen_expr(node, symbols);
+                let tag_ptr = self.builder().struct_field_ptr(&adt_ptr, 0, "adt.tag.ptr");
+                self.builder().load(&tag_ptr, "adt.tag")
             }
 
             GetField(ref node, index) => {
-                // Extract a field from an ADT value's payload
-                let adt_val = self.gen_expr(node, symbols);
-                let payload = self.builder().extract_value(&adt_val, 1, "adt.payload");
-                self.builder().extract_value(&payload, index, "adt.field")
+                // Extract a field from an ADT value's payload (pointer)
+                let adt_ptr = self.gen_expr(node, symbols);
+                let payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
+                let field_ptr = self.builder().struct_field_ptr(&payload_ptr, index, "adt.field.ptr");
+                self.builder().load(&field_ptr, "adt.field")
             }
 
             Match(ref scrutinee, ref arms) => {
                 // Generate code for pattern matching using a switch on the tag
+                // For ADT patterns, scrutinee_val is a pointer to the ADT struct
                 let scrutinee_val = self.gen_expr(scrutinee, symbols);
 
                 // Get current function and create basic blocks
@@ -411,19 +425,19 @@ impl<'i> LLVMEmit<'i> {
                 });
 
                 if has_adt_patterns {
-                    // ADT pattern matching: extract tag and switch on it
-                    let tag_val = self.builder().extract_value(&scrutinee_val, 0, "match.tag");
+                    // ADT pattern matching: load tag via pointer and switch on it
+                    let tag_ptr = self.builder().struct_field_ptr(&scrutinee_val, 0, "match.tag.ptr");
+                    let tag_val = self.builder().load(&tag_ptr, "match.tag");
 
                     // Create blocks for each arm
                     let arm_blocks: Vec<LLVMBasicBlock> = arms.iter().enumerate()
                         .map(|(i, _)| self.context().append_basic_block(&parent, &format!("match.arm.{}", i)))
                         .collect();
 
-                    // Create default block (unreachable for exhaustive matches)
+                    // Create default block - use unreachable for exhaustive matches
                     let default_blk = self.context().append_basic_block(&parent, "match.default");
                     self.builder().set_position_at_end(&default_blk);
-                    // For now, branch to first arm as default (should be unreachable)
-                    self.builder().br(&cont_blk);
+                    self.builder().unreachable();
 
                     // Build switch instruction
                     self.builder().set_position_at_end(&blk);
@@ -442,9 +456,9 @@ impl<'i> LLVMEmit<'i> {
                         // Generate arm body
                         self.builder().set_position_at_end(arm_blk);
 
-                        // Bind pattern variables
+                        // Bind pattern variables (scrutinee_val is a pointer)
                         let mut arm_symbols = symbols.sub_env();
-                        self.bind_pattern_vars(&scrutinee_val, pattern, &mut arm_symbols);
+                        self.bind_pattern_vars_ptr(&scrutinee_val, pattern, &mut arm_symbols);
 
                         let result = self.gen_expr(body, &mut arm_symbols);
                         self.builder().br(&cont_blk);
@@ -510,13 +524,45 @@ impl<'i> LLVMEmit<'i> {
         alloca
     }
 
+    /// Convert a value to match the expected field type in an ADT
+    /// Handles polymorphic fields (i64) and pointer type mismatches
+    fn convert_to_field_type(&mut self, val: &LLVMValue, val_ty: &LLVMType, field_ty: &LLVMType) -> LLVMValue {
+        if val_ty.raw_ptr() == field_ty.raw_ptr() {
+            // Types match, no conversion needed
+            return val.clone();
+        }
+
+        let i64_ty = self.context().get_int64_type();
+        let i32_ty = self.context().get_int32_type();
+        let i8_ptr_ty = self.context().get_int8_type().get_ptr(0);
+
+        // Check if field is i64 (polymorphic slot)
+        if field_ty.raw_ptr() == i64_ty.raw_ptr() {
+            // Convert value to i64
+            if val_ty.raw_ptr() == i32_ty.raw_ptr() {
+                // i32 -> i64 via sext
+                return self.builder().sext(val, &i64_ty, "sext.i64");
+            } else {
+                // Pointer -> i64 via ptrtoint
+                return self.builder().ptr_to_int(val, &i64_ty, "ptr.to.i64");
+            }
+        }
+
+        // Check if field is i8* (opaque pointer for ADT)
+        if field_ty.raw_ptr() == i8_ptr_ty.raw_ptr() {
+            // Bitcast pointer to i8*
+            return self.builder().bit_cast(val, &i8_ptr_ty, "ptr.cast");
+        }
+
+        // Fallback: try bitcast
+        self.builder().bit_cast(val, field_ty, "field.cast")
+    }
+
     /// Bind pattern variables to their values in the current scope
     fn bind_pattern_vars<'b>(&mut self, scrutinee: &LLVMValue, pattern: &Pattern, symbols: &mut VarEnv<'b>) {
         match pattern {
             Pattern::Var(id) => {
                 // Bind the entire scrutinee to this variable
-                let blk = self.builder().get_insert_block();
-                let fun = blk.get_parent();
                 let var_name = self.interner.trace(*id);
                 let alloca = self.builder().alloca(&scrutinee.get_type(), var_name);
                 self.builder().store(scrutinee, &alloca);
@@ -532,6 +578,33 @@ impl<'i> LLVMEmit<'i> {
                     for (i, sub_pat) in sub_patterns.iter().enumerate() {
                         let field = self.builder().extract_value(&payload, i, "pat.field");
                         self.bind_pattern_vars(&field, sub_pat, symbols);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bind pattern variables when scrutinee is a pointer to ADT struct
+    fn bind_pattern_vars_ptr<'b>(&mut self, scrutinee_ptr: &LLVMValue, pattern: &Pattern, symbols: &mut VarEnv<'b>) {
+        match pattern {
+            Pattern::Var(id) => {
+                // Bind the pointer directly (variable holds pointer to ADT)
+                let var_name = self.interner.trace(*id);
+                let alloca = self.builder().alloca(&scrutinee_ptr.get_type(), var_name);
+                self.builder().store(scrutinee_ptr, &alloca);
+                symbols.insert(*id, alloca);
+            }
+            Pattern::Wildcard | Pattern::Lit(_) => {
+                // No bindings for wildcards or literals
+            }
+            Pattern::Constructor(_, sub_patterns) => {
+                // Extract payload fields via pointer and bind sub-patterns
+                if !sub_patterns.is_empty() {
+                    let payload_ptr = self.builder().struct_field_ptr(scrutinee_ptr, 1, "pat.payload.ptr");
+                    for (i, sub_pat) in sub_patterns.iter().enumerate() {
+                        let field_ptr = self.builder().struct_field_ptr(&payload_ptr, i, "pat.field.ptr");
+                        let field_val = self.builder().load(&field_ptr, "pat.field");
+                        self.bind_pattern_vars(&field_val, sub_pat, symbols);
                     }
                 }
             }

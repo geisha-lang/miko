@@ -76,6 +76,7 @@ impl LLVMContext {
     method_type_getter!(get_int8_type, LLVMInt8TypeInContext);
     method_type_getter!(get_int16_type, LLVMInt16TypeInContext);
     method_type_getter!(get_int32_type, LLVMInt32TypeInContext);
+    method_type_getter!(get_int64_type, LLVMInt64TypeInContext);
     method_type_getter!(get_double_type, LLVMDoubleTypeInContext);
     method_type_getter!(get_void_type, LLVMVoidTypeInContext);
 
@@ -217,6 +218,26 @@ impl LLVMType {
             LLVMValue::from_ref(LLVMGetUndef(self.raw_ptr()))
         }
     }
+
+    /// Get the parameter type at the given index (for function types)
+    pub fn get_param_type(&self, idx: usize) -> Self {
+        unsafe {
+            let count = LLVMCountParamTypes(self.0.clone()) as usize;
+            if idx >= count {
+                panic!("Parameter index {} out of bounds (count: {})", idx, count);
+            }
+            let mut params = vec![ptr::null_mut(); count];
+            LLVMGetParamTypes(self.0.clone(), params.as_mut_ptr());
+            LLVMType(params[idx])
+        }
+    }
+
+    /// Get the number of parameters (for function types)
+    pub fn count_param_types(&self) -> usize {
+        unsafe {
+            LLVMCountParamTypes(self.0.clone()) as usize
+        }
+    }
 }
 
 impl LLVMValue {
@@ -312,6 +333,11 @@ impl LLVMBuilder {
     method_build_instr!(cond_br, LLVMBuildCondBr, cond: &LLVMValue, then: &LLVMBasicBlock, el: &LLVMBasicBlock);
     method_build_instr!(br, LLVMBuildBr, cont: &LLVMBasicBlock);
     method_build_instr!(bit_cast, LLVMBuildBitCast, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
+    method_build_instr!(sext, LLVMBuildSExt, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
+    method_build_instr!(zext, LLVMBuildZExt, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
+    method_build_instr!(trunc, LLVMBuildTrunc, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
+    method_build_instr!(ptr_to_int, LLVMBuildPtrToInt, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
+    method_build_instr!(int_to_ptr, LLVMBuildIntToPtr, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
 
     pub fn phi_node<'a, I>(&self, ty: &LLVMType, incoming: I, dest: &str) -> LLVMValue
         where I: IntoIterator<Item=&'a (&'a LLVMValue, &'a LLVMBasicBlock)>
@@ -333,6 +359,13 @@ impl LLVMBuilder {
             LLVMValue::from_ref(LLVMBuildRet(self.raw_ptr(), ptr::null_mut()))
         }
     }
+
+    pub fn unreachable(&self) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildUnreachable(self.raw_ptr()))
+        }
+    }
+
     pub fn call(&self, fun: &LLVMFunction, args: &mut Vec<LLVMValue>, name: &str) -> LLVMValue {
         let fn_ty = fun.get_function_type();
         self.call_with_type(&fn_ty, fun, args, name)

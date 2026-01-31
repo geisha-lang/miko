@@ -125,11 +125,11 @@ fn compile(name: &str, src: &str) -> Result<LLVMCodegen, CompileError> {
     };
 
     // K-conversion (core term generation)
-    let (mut top, _) = K::go(defs, &mut inter, adt_registry);
+    let (mut top, _) = K::go(defs, &mut inter, adt_registry.clone());
 
     // Code generation
     let main_id = inter.intern("main");
-    let mut emitter = LLVMEmit::new(name, &mut inter);
+    let mut emitter = LLVMEmit::new(name, &mut inter, adt_registry);
     let main_fn = top.remove(&main_id);
     let env = VarEnv::new();
     if let Some(mf) = main_fn {

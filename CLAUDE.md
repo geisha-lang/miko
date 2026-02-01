@@ -18,6 +18,9 @@ cargo test
 # Compile Geisha source to executable (auto-links with runtime)
 ./target/debug/miko -o output input.gs
 
+# Multi-file project compilation
+./target/debug/miko --src-root ./src -o output src/main/mod.gs
+
 # Compile to object file only (no linking)
 ./target/debug/miko -c -o output.o input.gs
 
@@ -38,7 +41,7 @@ GEISHA_RUNTIME=/path/to/runtime.a ./target/debug/miko -o output input.gs
 The compiler follows a classic multi-stage pipeline:
 
 ```
-Source (.gs) → Parse → Type Infer → Core Transform → LLVM Codegen → Object File
+Source (.gs) → [Module Loader] → Parse → Type Infer → Core Transform → LLVM Codegen → Object File
 ```
 
 ### Key Modules
@@ -47,12 +50,20 @@ Source (.gs) → Parse → Type Infer → Core Transform → LLVM Codegen → Ob
 - **`typeinfer/`** - Hindley-Milner type inference with constraint solving
 - **`core/`** - K-conversion: transforms AST to core terms with explicit closure free variables
 - **`codegen/`** - LLVM IR emission via `llvm-sys`
+- **`modules/`** - Multi-file compilation: module loader, import resolution, visibility checking
 - **`types.rs`** - Type system: `Type`, `Scheme` (polymorphic types), `TypeEnv`
-- **`utils.rs`** - `Interner` (string interning), `SymTable` (lexical scoping)
+- **`utils.rs`** - `Interner` (string interning), `SymTable` (lexical scoping), `ModuleSymTable`
 
 ### Parser
 
 The PEG grammar is defined inline in `src/syntax/parser/mod.rs` using the `peg::parser!` macro. The parser uses `RefCell<Interner>` to handle mutable state threading.
+
+### Module System
+
+Multi-file projects use the module loader (`src/modules/`):
+- `loader.rs` - Finds and loads `.gs` files based on module paths
+- `imports.rs` - Resolves `use` statements and checks visibility
+- `deps.rs` - Dependency graph for compilation order
 
 ### Runtime
 
@@ -109,6 +120,35 @@ instance Eq Int {            # Implement for type
     def eq(x, y) = x == y
 }
 ```
+
+### Module System
+
+```
+# Visibility (private by default)
+pub def add(x, y) = x + y    # Public function
+def helper(x) = x * 2        # Private function
+
+# Module declarations
+mod math                     # Load math.gs or math/mod.gs
+
+# Import statements
+use math.add                 # Single import
+use math.{add, mul}          # Multiple imports
+use math.add as plus         # Import with alias
+open math                    # Import all public items
+```
+
+## Multi-File Project Structure
+
+```
+project/
+  src/
+    main/
+      mod.gs          # Entry point: mod math, use math.add
+      math.gs         # pub def add(x, y) = x + y
+```
+
+Compile with: `./miko --src-root src -o output src/main/mod.gs`
 
 ## Dependencies
 

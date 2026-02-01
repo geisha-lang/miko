@@ -91,6 +91,8 @@ pub struct K<'i> {
     instantiation_registry: InstantiationRegistry,
     /// Map from (function_name, type_args) to specialized function name
     specialization_map: SpecializationMap,
+    /// Import mappings: local_name -> qualified_name
+    import_map: HashMap<Id, Id>,
 }
 
 macro_rules! with_var {
@@ -113,6 +115,20 @@ impl<'i> K<'i> {
                  adt_registry: AdtRegistry,
                  instantiation_registry: InstantiationRegistry)
                  -> (HashMap<Id, P<FunDef>>, HashMap<Id, P<TypeDef>>)
+        where I: IntoIterator<Item = Def>
+    {
+        Self::go_with_imports(module, interner, adt_registry, instantiation_registry, HashMap::new())
+    }
+
+    /// Do transformation on a syntax module with import mappings,
+    /// generate core term representation
+    pub fn go_with_imports<I>(
+        module: I,
+        interner: &mut Interner,
+        adt_registry: AdtRegistry,
+        instantiation_registry: InstantiationRegistry,
+        import_map: HashMap<Id, Id>,
+    ) -> (HashMap<Id, P<FunDef>>, HashMap<Id, P<TypeDef>>)
         where I: IntoIterator<Item = Def>
     {
         let current_tmp = interner.intern("");
@@ -138,6 +154,7 @@ impl<'i> K<'i> {
             adt_registry,
             instantiation_registry,
             specialization_map,
+            import_map,
         };
         let defs: Vec<_> = module.into_iter()
             .map(|def| {
@@ -145,6 +162,7 @@ impl<'i> K<'i> {
                      def
                  })
             .collect();
+
         {
             let b = &mut runner;
 
@@ -639,8 +657,11 @@ impl<'i> K<'i> {
         let t = match node {
             Lit(l) => Term::Lit(l),
             Var(n) => {
+                // Check if this is an imported name and resolve it
+                let resolved_n = self.import_map.get(&n).copied().unwrap_or(n);
+
                 // Check if this is a unit constructor (like None)
-                let var_name = self.interner.trace(n).to_string();
+                let var_name = self.interner.trace(resolved_n).to_string();
                 if let Some((adt_name, tag)) = self.find_constructor_info(&var_name) {
                     // Check if it's a unit constructor (no fields)
                     if let Some(adt_info) = self.adt_registry.get(&adt_name) {
@@ -666,25 +687,28 @@ impl<'i> K<'i> {
                 }
 
                 // A global definition should not be in scope env
-                if self.find_var(&n).is_none() && tform.is_fn() {
-                    if let Some(label) = self.direct.get(&n).map(|id| id.to_owned()) {
+                if self.find_var(&resolved_n).is_none() && tform.is_fn() {
+                    if let Some(label) = self.direct.get(&resolved_n).map(|id| id.to_owned()) {
                         Term::Var(label)
                     } else {
                         // For global function name, make a closure
-                        self.direct.insert(n, n);
-                        Term::Var(n)
+                        self.direct.insert(resolved_n, resolved_n);
+                        Term::Var(resolved_n)
                     }
                 } else {
-                    Term::Var(n)
+                    Term::Var(resolved_n)
                 }
             }
             QualifiedVar(path) => {
-                // For qualified variables (e.g., module.submodule.name),
-                // currently we only support single-module lookups (Phase 1)
-                // In Phase 2, we'll implement full multi-file module resolution
-                // For now, treat the last segment as the variable name
+                // For qualified variables (e.g., module.name), use the full qualified path
+                // The definition should be registered with this qualified name
+
+                // First, construct the qualified name string and intern it
+                let qualified_str = path.to_string_with(self.interner);
+                let qualified_id = self.interner.intern(&qualified_str);
+
+                // Check if this is a unit constructor (using last segment for constructor lookup)
                 if let Some(name) = path.name() {
-                    // Check if this is a unit constructor
                     let var_name = self.interner.trace(name).to_string();
                     if let Some((adt_name, tag)) = self.find_constructor_info(&var_name) {
                         if let Some(adt_info) = self.adt_registry.get(&adt_name) {
@@ -706,11 +730,10 @@ impl<'i> K<'i> {
                             }
                         }
                     }
-                    // Treat as regular variable for now (module resolution in Phase 2)
-                    Term::Var(name)
-                } else {
-                    panic!("Empty module path in QualifiedVar")
                 }
+
+                // Use the qualified name as the variable identifier
+                Term::Var(qualified_id)
             }
             List(e) => Term::List(self.transform_list(e)),
             Block(e) => Term::Block(self.transform_list(e)),

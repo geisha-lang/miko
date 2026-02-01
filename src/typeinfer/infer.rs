@@ -174,8 +174,176 @@ impl<'i> Infer<'i> {
             if all_concrete && !type_args.is_empty() {
                 let inst = Instantiation::new(call_site.function.clone(), type_args.clone());
                 self.instantiation_registry.add_instantiation(inst);
-            } else if !type_args.is_empty() {
             }
+        }
+    }
+
+    /// Collect instantiations from a fully-typed form by walking the AST
+    /// This is called after all types are resolved, so we can look up callee types
+    fn collect_instantiations_from_body(&mut self, form: &Form, env: &TypeEnv) {
+        self.collect_instantiations_from_body_with_imports(form, env, &HashMap::new())
+    }
+
+    /// Collect instantiations with import alias resolution
+    fn collect_instantiations_from_body_with_imports(
+        &mut self,
+        form: &Form,
+        env: &TypeEnv,
+        import_aliases: &HashMap<Id, Id>,
+    ) {
+        use crate::syntax::form::Expr::*;
+
+        match &form.node {
+            Apply(callee, args) => {
+                // Get the function name if this is a direct call
+                let fn_name = match &callee.node {
+                    Var(id) => {
+                        // Check if this is an imported name and resolve it
+                        if let Some(qualified_id) = import_aliases.get(id) {
+                            Some(self.interner.trace(*qualified_id).to_string())
+                        } else {
+                            Some(self.interner.trace(*id).to_string())
+                        }
+                    },
+                    QualifiedVar(path) => Some(path.to_string_with(self.interner)),
+                    _ => None,
+                };
+
+                if let Some(ref name) = fn_name {
+                    // Look up the callee's type in the environment
+                    let callee_id = match &callee.node {
+                        Var(id) => Some(*id),
+                        QualifiedVar(path) => {
+                            let path_str = path.to_string_with(self.interner);
+                            Some(self.interner.intern(&path_str))
+                        },
+                        _ => None,
+                    };
+
+                    if let Some(id) = callee_id {
+                        if let Some(callee_scheme) = env.lookup(&id) {
+                            // Check if the callee is polymorphic
+                            let type_params = callee_scheme.type_params();
+                            if !type_params.is_empty() {
+                                // Extract concrete type arguments from the call
+                                if let Some(type_args) = self.extract_type_args_from_call(callee_scheme, args, form) {
+                                    if type_args.iter().all(|t| is_concrete_type(t)) {
+                                        let inst = Instantiation::new(name.clone(), type_args);
+                                        self.instantiation_registry.add_instantiation(inst);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Recurse into callee and arguments
+                self.collect_instantiations_from_body_with_imports(callee, env, import_aliases);
+                for arg in args {
+                    self.collect_instantiations_from_body_with_imports(arg, env, import_aliases);
+                }
+            }
+
+            // Recurse into sub-expressions
+            Abs(fun) => {
+                self.collect_instantiations_from_body_with_imports(&fun.body, env, import_aliases);
+            }
+            Binary(_, left, right) => {
+                self.collect_instantiations_from_body_with_imports(left, env, import_aliases);
+                self.collect_instantiations_from_body_with_imports(right, env, import_aliases);
+            }
+            Unary(_, expr) => {
+                self.collect_instantiations_from_body_with_imports(expr, env, import_aliases);
+            }
+            Let(_, val, body) => {
+                self.collect_instantiations_from_body_with_imports(val, env, import_aliases);
+                self.collect_instantiations_from_body_with_imports(body, env, import_aliases);
+            }
+            If(cond, then_br, else_br) => {
+                self.collect_instantiations_from_body_with_imports(cond, env, import_aliases);
+                self.collect_instantiations_from_body_with_imports(then_br, env, import_aliases);
+                self.collect_instantiations_from_body_with_imports(else_br, env, import_aliases);
+            }
+            Match(scrutinee, arms) => {
+                self.collect_instantiations_from_body_with_imports(scrutinee, env, import_aliases);
+                for arm in arms {
+                    self.collect_instantiations_from_body_with_imports(&arm.body, env, import_aliases);
+                    if let Some(ref guard) = arm.guard {
+                        self.collect_instantiations_from_body_with_imports(guard, env, import_aliases);
+                    }
+                }
+            }
+            List(exprs) | Block(exprs) => {
+                for e in exprs {
+                    self.collect_instantiations_from_body_with_imports(e, env, import_aliases);
+                }
+            }
+            // Leaf nodes - no recursion needed
+            Lit(_) | Var(_) | QualifiedVar(_) => {}
+        }
+    }
+
+    /// Extract type arguments from a function call based on argument types
+    fn extract_type_args_from_call(&self, callee_scheme: &Scheme, args: &[P<Form>], result_form: &Form) -> Option<Vec<Type>> {
+        let type_params = callee_scheme.type_params();
+        if type_params.is_empty() {
+            return None;
+        }
+
+        // Get the function type body
+        let fn_type = callee_scheme.body();
+
+        // Extract argument types from args (they should already have concrete types)
+        let arg_types: Vec<Type> = args.iter()
+            .map(|a| a.tag.ref_type().clone())
+            .collect();
+
+        // Get result type
+        let result_type = result_form.tag.ref_type().clone();
+
+        // Try to match the function type with concrete types to extract type args
+        let mut subst: HashMap<Name, Type> = HashMap::new();
+
+        // Match argument types
+        if let Type::Arr(param_type, ret_type) = fn_type {
+            // For single argument or product type
+            let product_arg_type = Type::product_n(arg_types.clone());
+            self.match_types(&param_type, &product_arg_type, &mut subst);
+            // Match result type
+            self.match_types(&ret_type, &result_type, &mut subst);
+        }
+
+        // Build type args in order of type parameters
+        let type_args: Vec<Type> = type_params.iter()
+            .filter_map(|p| subst.get(p).cloned())
+            .collect();
+
+        if type_args.len() == type_params.len() {
+            Some(type_args)
+        } else {
+            None
+        }
+    }
+
+    /// Match a polymorphic type with a concrete type, extracting substitutions
+    fn match_types(&self, poly: &Type, concrete: &Type, subst: &mut HashMap<Name, Type>) {
+        match (poly, concrete) {
+            (Type::Var(name), _) => {
+                subst.insert(name.clone(), concrete.clone());
+            }
+            (Type::Arr(p1, p2), Type::Arr(c1, c2)) => {
+                self.match_types(p1, c1, subst);
+                self.match_types(p2, c2, subst);
+            }
+            (Type::Prod(p1, p2), Type::Prod(c1, c2)) => {
+                self.match_types(p1, c1, subst);
+                self.match_types(p2, c2, subst);
+            }
+            (Type::Comp(p1, p2), Type::Comp(c1, c2)) => {
+                self.match_types(p1, c1, subst);
+                self.match_types(p2, c2, subst);
+            }
+            _ => {}
         }
     }
 
@@ -377,15 +545,21 @@ impl<'i> Infer<'i> {
             }
 
             // Qualified variable (module path like collections.list.length)
-            // For Phase 1, we just use the last segment to look up in current scope
-            // Phase 2 will implement full module resolution
+            // Try multiple lookup strategies:
+            // 1. Full qualified path as a single interned name (e.g., "math.add")
+            // 2. Last segment only (for imports that bring names into scope)
             QualifiedVar(ref path) => {
-                if let Some(name) = path.name() {
+                // First, try the full qualified path
+                let path_str = path.to_string_with(self.interner);
+                let qualified_id = self.interner.intern(&path_str);
+
+                if let Some(ty) = e.lookup(&qualified_id) {
+                    form.tag.ty = (*ty).clone();
+                } else if let Some(name) = path.name() {
+                    // Fall back to just the last segment
                     if let Some(ty) = e.lookup(&name) {
                         form.tag.ty = (*ty).clone();
                     } else {
-                        // Construct full path string for error message
-                        let path_str = path.to_string_with(self.interner);
                         return Err(NotInScope(path_str, form.tag.pos));
                     }
                 } else {
@@ -430,6 +604,7 @@ impl<'i> Infer<'i> {
                 // Get the function name if this is a direct function call
                 let fn_name = match &callee.node {
                     Expr::Var(id) => Some(self.interner.trace(*id).to_string()),
+                    Expr::QualifiedVar(path) => Some(path.to_string_with(self.interner)),
                     _ => None,
                 };
 
@@ -634,8 +809,8 @@ impl<'i> Infer<'i> {
                     self.solve()?
                 };
 
-                // Collect instantiations from this function body
-                self.collect_instantiations(&sub);
+                // Note: we no longer collect instantiations here because the callee's
+                // polymorphic type may not be known yet. We do a second pass below.
 
                 d.form_body_mut().apply_mut(&sub);
 
@@ -659,9 +834,117 @@ impl<'i> Infer<'i> {
             }
         }
 
+        // Second pass: collect instantiations now that all types are known
+        // This handles the case where callers are defined before callees
+        for d in program.iter_mut() {
+            if d.is_form() {
+                self.collect_instantiations_from_body(d.form_body_mut(), &env);
+            }
+        }
+
         Ok(())
     }
 
+    /// Do type inference over top level definitions with import aliases.
+    ///
+    /// Import aliases are pairs of (local_name, qualified_name) that should be
+    /// added to the type environment so that local names can resolve to their
+    /// qualified counterparts.
+    pub fn infer_defs_with_imports<'a>(
+        &mut self,
+        _env: &'a TypeEnv<'a>,
+        program: &'a mut Vec<Def>,
+        import_aliases: &[(Id, Id)],
+    ) -> Result<(), TypeError> {
+        // First pass: process ADT definitions and collect constructor types
+        let mut constructor_types: Vec<(Id, Scheme)> = Vec::new();
+        for d in program.iter() {
+            if let Item::Alg(ref type_params, ref variants) = d.node {
+                let adt_name = self.interner.trace(d.ident).to_string();
+                let ctors = self.process_adt(&adt_name, type_params, variants);
+                constructor_types.extend(ctors);
+            }
+        }
+
+        // Give each definition a temporary type if no annotation
+        let mut env = {
+            let name_scms = program
+                .iter()
+                .filter(|ref v| v.is_form())
+                .map(|ref d| (d.name(), match d.form_annot() {
+                    Some(s) => s.clone(),
+                    _ => to_mono(self.fresh())
+                }));
+
+            // Add them into environment
+            _env.extend_n(name_scms)
+        };
+
+        // Add constructor types to environment
+        for (ctor_id, ctor_scheme) in constructor_types {
+            env.insert(ctor_id, ctor_scheme);
+        }
+
+        // Add import aliases to the environment
+        // We'll add these after the first inference pass so we have types to refer to
+        let mut pending_imports: Vec<(Id, Id)> = import_aliases.to_vec();
+
+        for d in program.iter_mut() {
+            if d.is_form() {
+                let sub = {
+                    self.infer(&mut env, d.form_body_mut())?;
+                    self.solve()?
+                };
+
+                d.form_body_mut().apply_mut(&sub);
+
+                let general = {
+                    let ty = d.form_type().body().to_owned();
+                    let fvs: Vec<_> = ty.ftv().into_iter().collect();
+                    if fvs.is_empty() {
+                        Scheme::Mono(ty)
+                    } else {
+                        Scheme::Poly(fvs, ty)
+                    }
+                };
+
+                d.form_body_mut().tag.set_scheme(general.clone());
+
+                // Register polymorphic functions for potential specialization
+                let fn_name = self.interner.trace(d.name()).to_string();
+                self.instantiation_registry.register_polymorphic(fn_name.clone(), general.clone());
+
+                env.insert(d.name().to_owned(), d.form_type().clone());
+
+                // Check if this definition is the target of any import alias
+                // If so, add the alias to the environment now
+                pending_imports.retain(|(local_id, qualified_id)| {
+                    if *qualified_id == d.name() {
+                        // Add the alias with the same type
+                        env.insert(*local_id, d.form_type().clone());
+                        // Also register the alias as a polymorphic function if needed
+                        let alias_name = self.interner.trace(*local_id).to_string();
+                        self.instantiation_registry.register_polymorphic(alias_name, general.clone());
+                        false // Remove from pending
+                    } else {
+                        true // Keep in pending
+                    }
+                });
+            }
+        }
+
+        // Build import alias map for instantiation collection
+        let import_alias_map: HashMap<Id, Id> = import_aliases.iter().cloned().collect();
+
+        // Second pass: collect instantiations now that all types are known
+        for d in program.iter_mut() {
+            if d.is_form() {
+                self.collect_instantiations_from_body_with_imports(d.form_body_mut(), &env, &import_alias_map);
+            }
+        }
+
+        Ok(())
+    }
 
     /// Solve constraints. This will move out the `Infer` struct.
     fn solve<'a>(&mut self) -> Result<Subst, TypeError> {

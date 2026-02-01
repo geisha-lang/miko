@@ -102,6 +102,13 @@ peg::parser! {
         rule module_path() -> ModulePath
             = segments:identifier() ++ lexeme(<".">) { ModulePath::new(segments) }
 
+        /// Parse a module path followed by ".{" for multiple imports
+        /// e.g., "math." in "use math.{add, mul}"
+        rule module_path_for_multi() -> ModulePath
+            = segments:(identifier() ++ lexeme(<".">)) lexeme(<".">) &lexeme(<"{">) {
+                ModulePath::new(segments)
+            }
+
         /// Parse a single use spec: `name` or `name as alias`
         rule use_spec() -> UseSpec
             = name:identifier() reserved(<"as">) alias:identifier() { UseSpec::with_alias(name, alias) }
@@ -113,8 +120,8 @@ peg::parser! {
 
         /// Parse a use statement
         rule use_statement() -> UseItem
-            // use foo.bar.{baz, qux}
-            = path:module_path() list:use_item_list() { UseItem::Multiple(path, list) }
+            // use foo.bar.{baz, qux} - must come first, uses lookahead
+            = path:module_path_for_multi() list:use_item_list() { UseItem::Multiple(path, list) }
             // use foo.bar as baz
             / path:module_path() reserved(<"as">) alias:identifier() { UseItem::Alias(path, alias) }
             // use foo.bar (single import)
@@ -632,6 +639,16 @@ pub fn parse_expr(src: &str, interner: &mut Interner) -> Result<Form, peg::error
     result
 }
 
+/// Parse a source file as a FileModule with full module item support.
+/// This preserves use statements, mod declarations, and visibility information.
+pub fn parse_file_module(
+    src: &str,
+    path: &ModulePath,
+    interner: &RefCell<Interner>,
+) -> Result<FileModule, peg::error::ParseError<peg::str::LineCol>> {
+    file_module(src, interner, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1150,78 @@ pub def publicFn(x) = x + 1
         let defs = result.unwrap();
         assert_eq!(defs.len(), 1);
         assert!(defs[0].is_public());
+    }
+
+    #[test]
+    fn case_parse_use_multiple_imports() {
+        // Test parsing use statement with multiple imports: `use math.{add, mul}`
+        let src = "
+use math.{add, mul}
+pub def main() = add(1, mul(2, 3))
+";
+        let cell = RefCell::new(Interner::new());
+        let path = ModulePath::new(vec![]);
+        let result = file_module(src, &cell, &path);
+        println!("Parse result: {:?}", result);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fm = result.unwrap();
+        assert_eq!(fm.items.len(), 2); // use statement + def
+
+        // Check the first item is a use statement with Multiple variant
+        if let ModuleItem::Use(_, UseItem::Multiple(base_path, specs)) = &fm.items[0] {
+            assert_eq!(base_path.segments.len(), 1); // "math"
+            assert_eq!(specs.len(), 2); // add, mul
+        } else {
+            panic!("Expected UseItem::Multiple, got {:?}", fm.items[0]);
+        }
+    }
+
+    #[test]
+    fn case_parse_use_single_import() {
+        // Test parsing use statement with single import: `use math.add`
+        let src = "
+use math.add
+pub def main() = add(1, 2)
+";
+        let cell = RefCell::new(Interner::new());
+        let path = ModulePath::new(vec![]);
+        let result = file_module(src, &cell, &path);
+        println!("Parse result: {:?}", result);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fm = result.unwrap();
+        assert_eq!(fm.items.len(), 2); // use statement + def
+
+        // Check the first item is a use statement with Single variant
+        if let ModuleItem::Use(_, UseItem::Single(path)) = &fm.items[0] {
+            assert_eq!(path.segments.len(), 2); // "math.add"
+        } else {
+            panic!("Expected UseItem::Single, got {:?}", fm.items[0]);
+        }
+    }
+
+    #[test]
+    fn case_parse_use_alias_import() {
+        // Test parsing use statement with alias: `use math.add as plus`
+        let src = "
+use math.add as plus
+pub def main() = plus(1, 2)
+";
+        let cell = RefCell::new(Interner::new());
+        let path = ModulePath::new(vec![]);
+        let result = file_module(src, &cell, &path);
+        println!("Parse result: {:?}", result);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let fm = result.unwrap();
+        assert_eq!(fm.items.len(), 2); // use statement + def
+
+        // Check the first item is a use statement with Alias variant
+        if let ModuleItem::Use(_, UseItem::Alias(path, alias)) = &fm.items[0] {
+            assert_eq!(path.segments.len(), 2); // "math.add"
+            let interner = cell.borrow();
+            assert_eq!(interner.trace(*alias), "plus");
+        } else {
+            panic!("Expected UseItem::Alias, got {:?}", fm.items[0]);
+        }
     }
 
 }

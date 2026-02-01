@@ -4,9 +4,11 @@ The Geisha module system provides namespacing, visibility control, and import me
 
 ## Overview
 
-The module system has two phases of implementation:
-- **Phase 1 (Complete)**: Core module syntax - visibility modifiers, inline modules, qualified names
-- **Phase 2 (Planned)**: File-based modules - multi-file compilation, module loader
+The module system supports:
+- **Visibility control**: `pub` modifier for public items, private by default
+- **File-based modules**: Multi-file project compilation with `mod` declarations
+- **Import mechanism**: `use` statements with multiple variants
+- **Qualified names**: Direct access via `module.name` syntax
 
 ## Syntax
 
@@ -23,6 +25,18 @@ data Internal { Secret(Int) }         // private ADT
 
 pub concept Show a { ... }      // public concept
 concept Helper a { ... }        // private concept
+```
+
+### Module Declarations
+
+Declare submodules to load from separate files:
+
+```
+// main/mod.gs
+mod math                        // loads math.gs as submodule
+mod utils                       // loads utils.gs or utils/mod.gs
+
+pub def main() = putNumber(math.add(2, 3))
 ```
 
 ### Inline Submodules
@@ -45,16 +59,104 @@ Qualified access to module members:
 ```
 collections.list.length(myList)
 Utils.clamp(value, 0, 100)
+math.add(2, 3)
 ```
 
 ### Import Statements
 
 ```
-use collections.list                    // qualified access: list.length
-use collections.list.{Nil, Cons, map}   // import specific items
-use collections.list as L               // alias: L.length
-open collections.list                   // bring all public items into scope
-pub use collections.list.{Nil, Cons}    // re-export
+use math.add                            // single import
+use math.{add, mul}                     // multiple imports
+use math.add as plus                    // import with alias
+open math                               // bring all public items into scope
+pub use math.{add, mul}                 // re-export (make visible to other modules)
+```
+
+## Multi-File Compilation
+
+### Project Structure
+
+File path maps directly to module path:
+
+```
+project/
+  src/
+    main/
+      mod.gs          # entry point: mod math, use math.{add, mul}
+      math.gs         # pub def add, pub def mul
+      utils/
+        mod.gs        # submodule: pub def clamp
+```
+
+**Mapping:** `path/to/file.gs` → module `path.to.file`
+
+### Usage
+
+```bash
+# Single-file compilation (traditional)
+./miko -o output input.gs
+
+# Multi-file project compilation
+./miko --src-root ./src -o output src/main/mod.gs
+```
+
+### Example: Multi-File Project
+
+**src/main/math.gs:**
+```
+pub def add(x, y) = x + y
+pub def mul(x, y) = x * y
+def secret(x) = x * x           // private - cannot be imported
+```
+
+**src/main/mod.gs:**
+```
+mod math
+use math.{add, mul}
+
+pub def main() = putNumber(mul(add(2, 3), 4))
+```
+
+**Compile and run:**
+```bash
+./miko --src-root src -o output src/main/mod.gs
+./output
+# Output: 20
+```
+
+## Visibility Checking
+
+### Cross-Module Access
+
+Private items cannot be imported from other modules:
+
+```
+// math.gs
+pub def add(x, y) = x + y
+def secret(x) = x * x            // private
+
+// main.gs
+use math.add                     // ✅ OK - add is public
+use math.secret                  // ❌ Error: cannot import private item
+```
+
+**Error message:**
+```
+Compiling error:
+Normal("cannot import private item 'secret' from module 'math'")
+```
+
+### Glob Import Respects Visibility
+
+The `open` statement only imports public items:
+
+```
+// math.gs
+pub def add(x, y) = x + y
+def secret(x) = x * x
+
+// main.gs
+open math                        // imports only `add`, not `secret`
 ```
 
 ## AST Types
@@ -114,7 +216,7 @@ pub enum ModuleItem {
     Def(Visibility, Def),              // function/value definition
     Use(Visibility, UseItem),          // import statement
     SubModule(Visibility, Box<ModuleDef>),  // inline submodule
-    ModDecl(Visibility, Id),           // module declaration (Phase 2)
+    ModDecl(Visibility, Id),           // module declaration
 }
 ```
 
@@ -155,6 +257,7 @@ pub struct ModuleSymTable<'a, T: Clone> {
 - Private items are only visible within the same module
 - Public items are visible from any module
 - Re-exports (`pub use`) make imported items public
+- Import resolution checks visibility and reports errors
 
 ## Name Mangling
 
@@ -174,56 +277,34 @@ Functions in `src/codegen/llvm.rs`:
 
 ## Implementation Status
 
-### Phase 1: Core Module Syntax (Complete)
+### Phase 1: Core Module Syntax ✅ Complete
 
 | Component | Status | File |
 |-----------|--------|------|
-| AST types (ModulePath, Visibility, etc.) | Done | `src/syntax/form.rs` |
-| Parser for `pub` modifier | Done | `src/syntax/parser/mod.rs` |
-| Parser for `use`/`open` statements | Done | `src/syntax/parser/mod.rs` |
-| Parser for qualified names | Done | `src/syntax/parser/mod.rs` |
-| Parser for inline `mod` | Done | `src/syntax/parser/mod.rs` |
-| ModuleSymTable | Done | `src/utils.rs` |
-| Type inference for QualifiedVar | Done | `src/typeinfer/infer.rs` |
-| Core conversion for QualifiedVar | Done | `src/core/convert.rs` |
-| Module name mangling | Done | `src/codegen/llvm.rs` |
-| Unit tests | Done | Various test modules |
+| AST types (ModulePath, Visibility, etc.) | ✅ Done | `src/syntax/form.rs` |
+| Parser for `pub` modifier | ✅ Done | `src/syntax/parser/mod.rs` |
+| Parser for `use`/`open` statements | ✅ Done | `src/syntax/parser/mod.rs` |
+| Parser for qualified names | ✅ Done | `src/syntax/parser/mod.rs` |
+| Parser for inline `mod` | ✅ Done | `src/syntax/parser/mod.rs` |
+| ModuleSymTable | ✅ Done | `src/utils.rs` |
+| Type inference for QualifiedVar | ✅ Done | `src/typeinfer/infer.rs` |
+| Core conversion for QualifiedVar | ✅ Done | `src/core/convert.rs` |
+| Module name mangling | ✅ Done | `src/codegen/llvm.rs` |
 
-### Phase 2: File-Based Modules (Planned)
+### Phase 2: File-Based Modules ✅ Complete
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Module loader | Not started | Load `.gs` files based on module path |
-| `mod filename` syntax | Parser done | Links to file-based modules |
-| File path resolution | Not started | `foo.gs` or `foo/mod.gs` |
-| Dependency resolution | Not started | Topological sort for compilation order |
-| Cross-file visibility | Not started | Check visibility across file boundaries |
-| Circular import detection | Not started | Prevent circular dependencies |
-
-## File Organization (Phase 2 Design)
-
-File path maps directly to module path:
-
-```
-src/
-  main.gs              # entry point (root module)
-  collections.gs       # module collections
-  collections/
-    mod.gs             # module collections (alternative)
-    list.gs            # module collections.list
-    map.gs             # module collections.map
-```
-
-**Mapping:** `path/to/file.gs` -> module `path.to.file`
-
-**Parent module declares submodules** (`collections/mod.gs`):
-```
-pub mod list    // loads list.gs as collections.list
-pub mod map     // loads map.gs as collections.map
-
-// Re-exports for convenience
-pub use list.{List, Nil, Cons}
-```
+| Component | Status | File |
+|-----------|--------|------|
+| Module loader | ✅ Done | `src/modules/loader.rs` |
+| File path resolution | ✅ Done | Supports `foo.gs` or `foo/mod.gs` |
+| Dependency graph | ✅ Done | `src/modules/deps.rs` |
+| CLI --src-root | ✅ Done | `src/main.rs` |
+| `mod` declaration linking | ✅ Done | Recursively loads submodules |
+| `use` statement resolution | ✅ Done | `src/modules/imports.rs` |
+| Multiple imports syntax | ✅ Done | `use foo.{a, b}` |
+| Import aliases | ✅ Done | `use foo.bar as baz` |
+| Glob imports | ✅ Done | `open foo` |
+| Cross-file visibility | ✅ Done | Error on importing private items |
 
 ## Examples
 
@@ -263,6 +344,40 @@ mod Math {
 def main() = Math.max(Math.abs(0 - 5), 3)
 ```
 
+### Multi-File with Imports
+
+**math.gs:**
+```
+pub def add(x, y) = x + y
+pub def mul(x, y) = x * y
+```
+
+**mod.gs:**
+```
+mod math
+use math.{add, mul}
+
+pub def main() = putNumber(mul(add(2, 3), 4))
+```
+
+### Import with Alias
+
+```
+mod math
+use math.add as plus
+
+pub def main() = putNumber(plus(5, 10))
+```
+
+### Glob Import
+
+```
+mod math
+open math
+
+pub def main() = putNumber(mul(add(2, 3), 4))
+```
+
 ## Testing
 
 Run module-related tests:
@@ -271,12 +386,20 @@ Run module-related tests:
 cargo test module
 cargo test visibility
 cargo test qualified
+cargo test use
 ```
 
-Test programs:
+Test multi-file compilation:
 ```bash
-# Compile with visibility modifiers
-echo "pub def main() = putNumber(42)" > /tmp/test.gs
-./target/debug/miko -o /tmp/test /tmp/test.gs
-/tmp/test
+# Create project structure
+mkdir -p /tmp/project/src/main
+echo "pub def add(x, y) = x + y" > /tmp/project/src/main/math.gs
+echo "mod math
+use math.add
+pub def main() = putNumber(add(2, 3))" > /tmp/project/src/main/mod.gs
+
+# Compile and run
+./target/debug/miko --src-root /tmp/project/src -o /tmp/project/out /tmp/project/src/main/mod.gs
+/tmp/project/out
+# Output: 5
 ```

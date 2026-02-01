@@ -20,3 +20,4 @@ pub mod codegen;
 pub mod types;
 pub mod core;
 pub mod internal;
+pub mod modules;

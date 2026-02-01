@@ -1,6 +1,6 @@
 # Geisha Language Overview
 
-Geisha is a statically-typed functional programming language that compiles to native code via LLVM. It features Hindley-Milner type inference, algebraic data types, pattern matching, and a concept system (typeclasses).
+Geisha is a statically-typed functional programming language that compiles to native code via LLVM. It features Hindley-Milner type inference, algebraic data types, pattern matching, a concept system (typeclasses), and a Rust-inspired module system.
 
 ## Features
 
@@ -8,6 +8,7 @@ Geisha is a statically-typed functional programming language that compiles to na
 - **Statically typed**: Complete type inference with polymorphism
 - **Algebraic data types**: Define custom types with pattern matching
 - **Concepts**: Typeclass-style polymorphism with constraints
+- **Module system**: File-based modules with visibility control and imports
 - **Native compilation**: LLVM backend generates efficient machine code
 
 ## Hello World
@@ -22,14 +23,20 @@ def main() = printLn("Hello, World!")
 # Build the compiler
 cargo build
 
-# Compile a Geisha source file to object code
-./target/debug/miko -o output.o input.gs
-
-# Link with runtime to create executable
-cc -o output base.o output.o
+# Compile a single file to executable (auto-links with runtime)
+./target/debug/miko -o output input.gs
 
 # Run the program
 ./output
+
+# Multi-file project compilation
+./target/debug/miko --src-root ./src -o output src/main/mod.gs
+
+# Compile to object file only (no linking)
+./target/debug/miko -c -o output.o input.gs
+
+# Emit LLVM IR (for debugging)
+./target/debug/miko -e -o /dev/null input.gs
 ```
 
 ## Quick Examples
@@ -101,8 +108,24 @@ def allEqual(x, y, z) : forall (Eq a). a * a * a -> Bool =
     if (eq(x, y)) eq(y, z) else false
 ```
 
+### Modules and Visibility
+
+```
+// math.gs
+pub def add(x, y) = x + y
+pub def mul(x, y) = x * y
+def helper(x) = x * x       // private
+
+// mod.gs
+mod math
+use math.{add, mul}
+
+pub def main() = putNumber(mul(add(2, 3), 4))
+```
+
 ## Documentation
 
+### Language Specification
 - [Syntax Reference](specs/syntax.md) - Complete grammar and lexical elements
 - [Functions](specs/functions.md) - Function definitions, lambdas, closures
 - [Type System](specs/type-system.md) - Types, polymorphism, annotations
@@ -111,9 +134,9 @@ def allEqual(x, y, z) : forall (Eq a). a * a * a -> Bool =
 - [Pattern Matching](specs/pattern-matching.md) - Match expressions and patterns
 - [Concepts](specs/concepts.md) - Typeclass system
 - [Operators](specs/operators.md) - Operators and precedence
+- [Modules](specs/modules.md) - Module system, visibility, imports
 
 ### Runtime Documentation
-
 - [Compilation Pipeline](runtime/compilation.md) - How code is compiled
 - [Closures](runtime/closures.md) - Closure representation
 - [Memory Layout](runtime/memory.md) - Memory management

@@ -8,6 +8,11 @@ This document describes how Geisha source code is compiled to native executables
 Source Code (.gs)
        │
        ▼
+   ┌──────────────┐
+   │ Module Loader │  Load multi-file projects (optional)
+   └──────────────┘
+       │
+       ▼
    ┌────────┐
    │ Parser │  PEG grammar → AST
    └────────┘
@@ -43,6 +48,71 @@ Source Code (.gs)
    └────────┘
 ```
 
+## Compilation Modes
+
+### Single-File Compilation
+
+```bash
+./miko -o output input.gs
+```
+
+Compiles a single `.gs` file to an executable.
+
+### Multi-File Project Compilation
+
+```bash
+./miko --src-root ./src -o output src/main/mod.gs
+```
+
+Compiles a multi-file project with module system support:
+- `--src-root`: Base directory for module resolution
+- Entry file: The main module to compile
+
+## Stage 0: Module Loading (Multi-File)
+
+For projects using `--src-root`, the module loader handles multi-file compilation.
+
+### Implementation
+
+Located in `src/modules/`:
+- `loader.rs`: File discovery and loading
+- `deps.rs`: Dependency graph and compilation order
+- `imports.rs`: Import resolution and visibility checking
+
+### Process
+
+1. **Entry Module**: Load the entry file specified on command line
+2. **Submodule Discovery**: Process `mod foo` declarations to find dependencies
+3. **Recursive Loading**: Load submodules from `foo.gs` or `foo/mod.gs`
+4. **Import Resolution**: Resolve `use` statements to qualified names
+5. **Visibility Checking**: Verify imported items are public
+
+### File Resolution
+
+For `mod foo` in `src/main/mod.gs`, the loader tries:
+1. `src/main/foo.gs`
+2. `src/main/foo/mod.gs`
+
+### Module Path Mapping
+
+```
+src/main/mod.gs       → module "main"
+src/main/math.gs      → module "main.math"
+src/main/utils/mod.gs → module "main.utils"
+```
+
+### Import Resolution
+
+```
+// main/mod.gs
+mod math
+use math.{add, mul}      // Resolves to main.math.add, main.math.mul
+
+pub def main() = add(2, 3)
+```
+
+The import map tracks local name → qualified name mappings, passed through type inference and K-conversion.
+
 ## Stage 1: Parsing
 
 The parser transforms source text into an Abstract Syntax Tree (AST).
@@ -70,6 +140,7 @@ enum Def {
 enum Expr {
     Lit(Literal),
     Var(Symbol),
+    QualifiedVar(ModulePath),  // module.name access
     App(func, args),
     Lambda(params, body),
     Let(name, value, body),
@@ -86,6 +157,14 @@ enum Pattern {
     Lit(Literal),
     Constructor(name, fields),
 }
+
+// Module items
+enum ModuleItem {
+    Def(Visibility, Def),
+    Use(Visibility, UseItem),
+    SubModule(Visibility, ModuleDef),
+    ModDecl(Visibility, Id),
+}
 ```
 
 ## Stage 2: Type Inference
@@ -100,15 +179,18 @@ The type inference phase assigns types to all expressions.
 ### Process
 
 1. **Environment Setup**: Initialize with built-in types and functions
-2. **Constraint Generation**: Traverse AST, generate type constraints
-3. **Unification**: Solve constraints using Robinson's algorithm
-4. **Generalization**: Generalize function types to polymorphic schemes
+2. **Import Integration**: Add import aliases to type environment
+3. **Constraint Generation**: Traverse AST, generate type constraints
+4. **Unification**: Solve constraints using Robinson's algorithm
+5. **Generalization**: Generalize function types to polymorphic schemes
+6. **Instantiation Tracking**: Record polymorphic function instantiations for monomorphization
 
 ### Outputs
 
 - Type annotations for all expressions
 - ADT registry with constructor types
 - Concept/instance registry
+- Instantiation registry for monomorphization
 
 ## Stage 3: K-Conversion
 
@@ -118,6 +200,7 @@ K-conversion transforms the AST into a core intermediate representation with exp
 
 - Make free variable capture explicit
 - Distinguish between closure calls and direct calls
+- Resolve import aliases to qualified names
 - Prepare for efficient code generation
 
 ### Implementation
@@ -245,6 +328,15 @@ entry:
 
 The `fv` parameter holds the closure environment (free variables).
 
+### Name Mangling
+
+Module-qualified names are mangled for LLVM:
+
+```
+math.add : Int * Int -> Int
+=> "_G4Mmath3Nadd_3Int3Int"
+```
+
 ### Closure Representation
 
 Closures are represented as structs containing captured values:
@@ -279,40 +371,60 @@ LLVM compiles the IR to native object code.
 ### Command
 
 ```bash
-./target/debug/miko -o output.o input.gs
+./target/debug/miko -c -o output.o input.gs
 ```
 
 ## Stage 7: Linking
 
-The object file must be linked with the runtime library.
+The object file is linked with the runtime library automatically.
 
 ### Runtime Library
 
-`base.o` contains:
-- `printLn`: Print string with newline
-- `putNumber`: Print integer
-- `putFloat`: Print float
-- `putChar`: Print character
+The runtime (`src/lib/`) contains:
+- `base.c`: I/O functions (`printLn`, `putNumber`, `putFloat`, `putChar`)
+- `runtime/gc_bitmap.c`: Mark-and-sweep garbage collector
 
-### Linking Command
+### Automatic Linking
+
+When producing an executable (default), the compiler automatically links with the runtime:
 
 ```bash
-cc -o output base.o output.o
+./miko -o output input.gs  # Links automatically
+```
+
+For manual control:
+
+```bash
+./miko -c -o output.o input.gs          # Object file only
+./miko --runtime /path/to/runtime.a ...  # Custom runtime path
 ```
 
 ## Complete Workflow
 
+### Single File
+
 ```bash
-# 1. Build the compiler
+# Build the compiler
 cargo build
 
-# 2. Compile source to object file
-./target/debug/miko -o program.o program.gs
+# Compile and link (one step)
+./target/debug/miko -o program program.gs
 
-# 3. Link with runtime
-cc -o program base.o program.o
+# Run
+./program
+```
 
-# 4. Run
+### Multi-File Project
+
+```bash
+# Project structure:
+# src/main/mod.gs   - entry point with "mod math"
+# src/main/math.gs  - math module with "pub def add"
+
+# Compile
+./target/debug/miko --src-root src -o program src/main/mod.gs
+
+# Run
 ./program
 ```
 
@@ -321,7 +433,7 @@ cc -o program base.o program.o
 ### Emit LLVM IR
 
 ```bash
-./target/debug/miko -e program.gs
+./target/debug/miko -e -o /dev/null program.gs
 ```
 
 This prints the generated LLVM IR to stdout for inspection.
@@ -359,5 +471,8 @@ else:
 | `src/core/term.rs` | Core IR types |
 | `src/core/escape.rs` | Escape analysis |
 | `src/codegen/emit.rs` | LLVM emission |
+| `src/modules/loader.rs` | Module file loading |
+| `src/modules/imports.rs` | Import resolution |
+| `src/modules/deps.rs` | Dependency graph |
 | `src/lib/base.c` | Runtime library (I/O) |
 | `src/lib/runtime/gc_bitmap.c` | Garbage collector |

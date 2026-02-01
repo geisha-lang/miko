@@ -121,6 +121,8 @@ instance Eq Int {            # Implement for type
 
 ## Development Workflow
 
+For any new feature or feature changes, make sure to update feature spec docs first, then start implementation.
+
 After implementing a feature:
 1. Run `cargo test` to ensure all unit tests pass
 2. Test with example programs in `test/` directory

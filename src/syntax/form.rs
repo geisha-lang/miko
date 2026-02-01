@@ -13,6 +13,164 @@ use crate::internal::*;
 
 pub type E = P<Form>;
 
+// ============================================================================
+// Module System Types
+// ============================================================================
+
+/// A module path representing a sequence of identifiers
+/// e.g., `collections.list.length` -> segments = ["collections", "list", "length"]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ModulePath {
+    pub segments: Vec<Id>,
+}
+
+impl ModulePath {
+    pub fn new(segments: Vec<Id>) -> Self {
+        ModulePath { segments }
+    }
+
+    pub fn single(id: Id) -> Self {
+        ModulePath { segments: vec![id] }
+    }
+
+    pub fn is_qualified(&self) -> bool {
+        self.segments.len() > 1
+    }
+
+    /// Get the last segment (the actual name being referenced)
+    pub fn name(&self) -> Option<Id> {
+        self.segments.last().copied()
+    }
+
+    /// Get the module part (all segments except the last)
+    pub fn module_path(&self) -> Vec<Id> {
+        if self.segments.len() > 1 {
+            self.segments[..self.segments.len() - 1].to_vec()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Convert to a string representation using dots
+    pub fn to_string_with(&self, interner: &Interner) -> String {
+        self.segments
+            .iter()
+            .map(|id| interner.trace(*id))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
+/// Visibility modifier for definitions
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Visibility {
+    /// Private (default) - only accessible within the same module
+    #[default]
+    Private,
+    /// Public - accessible from other modules
+    Public,
+}
+
+impl Visibility {
+    pub fn is_public(&self) -> bool {
+        matches!(self, Visibility::Public)
+    }
+}
+
+/// Specification for a single import item
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct UseSpec {
+    /// The name being imported
+    pub name: Id,
+    /// Optional alias (e.g., `use foo.bar as baz`)
+    pub alias: Option<Id>,
+}
+
+impl UseSpec {
+    pub fn new(name: Id) -> Self {
+        UseSpec { name, alias: None }
+    }
+
+    pub fn with_alias(name: Id, alias: Id) -> Self {
+        UseSpec { name, alias: Some(alias) }
+    }
+
+    /// Get the local name (alias if present, otherwise the original name)
+    pub fn local_name(&self) -> Id {
+        self.alias.unwrap_or(self.name)
+    }
+}
+
+/// An import/use statement
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum UseItem {
+    /// Import a single item: `use foo.bar`
+    Single(ModulePath),
+    /// Import specific items: `use foo.{bar, baz}`
+    Multiple(ModulePath, Vec<UseSpec>),
+    /// Import all public items: `use foo.*` (via `open`)
+    Glob(ModulePath),
+    /// Import with alias: `use foo.bar as baz`
+    Alias(ModulePath, Id),
+}
+
+impl UseItem {
+    /// Get the module path being imported from
+    pub fn module_path(&self) -> &ModulePath {
+        match self {
+            UseItem::Single(p) | UseItem::Multiple(p, _) | UseItem::Glob(p) | UseItem::Alias(p, _) => p,
+        }
+    }
+}
+
+/// An inline submodule definition (with braces)
+#[derive(Clone, PartialEq, Debug)]
+pub struct ModuleDef {
+    /// The module name
+    pub name: Id,
+    /// Items within this module
+    pub items: Vec<ModuleItem>,
+    /// Position in source
+    pub pos: Span,
+}
+
+/// A single item within a module
+#[derive(Clone, PartialEq, Debug)]
+pub enum ModuleItem {
+    /// A function/value definition: `pub def foo(x) = x`
+    Def(Visibility, Def),
+    /// An import statement: `pub use foo.bar`
+    Use(Visibility, UseItem),
+    /// An inline submodule: `pub mod utils { ... }`
+    SubModule(Visibility, Box<ModuleDef>),
+    /// A submodule declaration (file-based): `pub mod list`
+    ModDecl(Visibility, Id),
+}
+
+impl ModuleItem {
+    pub fn visibility(&self) -> Visibility {
+        match self {
+            ModuleItem::Def(v, _)
+            | ModuleItem::Use(v, _)
+            | ModuleItem::SubModule(v, _)
+            | ModuleItem::ModDecl(v, _) => *v,
+        }
+    }
+
+    pub fn is_public(&self) -> bool {
+        self.visibility().is_public()
+    }
+}
+
+/// A parsed file representing a file-level module
+#[derive(Clone, PartialEq, Debug)]
+pub struct FileModule {
+    /// Module path derived from file path (e.g., collections/list.gs -> collections.list)
+    pub path: ModulePath,
+    /// Items within the module
+    pub items: Vec<ModuleItem>,
+}
+
 /// A pattern for pattern matching
 #[derive(Clone, PartialEq, Debug)]
 pub enum Pattern {
@@ -44,6 +202,8 @@ pub struct Def {
     pub ident: Id,
     pub node: Item,
     pub pos: Span,
+    /// Visibility modifier (default: Private)
+    pub visibility: Visibility,
 }
 
 impl Def {
@@ -52,13 +212,29 @@ impl Def {
         self.ident.clone()
     }
 
-    /// Create a definition node define a form (value).
+    /// Create a definition node define a form (value) with default (private) visibility.
     pub fn value(pos: Span, name: Id, body: E) -> Def {
         Def {
               ident: name,
               node: Item::Form(body),
               pos,
+              visibility: Visibility::Private,
         }
+    }
+
+    /// Create a definition node with explicit visibility.
+    pub fn value_with_visibility(pos: Span, name: Id, body: E, visibility: Visibility) -> Def {
+        Def {
+              ident: name,
+              node: Item::Form(body),
+              pos,
+              visibility,
+        }
+    }
+
+    /// Check if this definition is public
+    pub fn is_public(&self) -> bool {
+        self.visibility.is_public()
     }
 
     /// If this is a form define
@@ -286,33 +462,35 @@ pub enum Expr {
     Lit(Lit),
     /// Identifier (binding/definition)
     Var(Id),
+    /// Qualified name access (e.g., `collections.list.length`)
+    QualifiedVar(ModulePath),
     /// List (array)
-    /// e.g. `[fuck, shit]`
+    /// e.g. `[foo, bar]`
     List(Vec<E>),
     /// Block (statement sequence)
-    /// e.g. `{ print(fuck); print(shit); 1 }`
+    /// e.g. `{ print(foo); print(bar); 1 }`
     Block(Vec<E>),
     /// Function apply
-    /// `fuck(shit, 1)`
+    /// `foo(bar, 1)`
     Apply(E, Vec<E>),
 
     /// Abstruction (function)
-    /// e.g. `(fuck, shit) -> fuck + shit`
+    /// e.g. `(a, b) -> a + b`
     Abs(Lambda),
 
     /// Binary operator expression
-    /// e.g. `fuck + shit`
+    /// e.g. `a + b`
     Binary(BinOp, E, E),
     /// Unary operator expression
-    /// e.g. `!fuck`
-    /// e.g. `-shit`
+    /// e.g. `!a`
+    /// e.g. `-b`
     Unary(UnOp, E),
 
     /// Let-in expression
-    /// e.g. `let fuck = shit in fuck + 1`
+    /// e.g. `let x = y in x + 1`
     Let(VarDecl, E, E),
     /// Conditional expression
-    /// e.g. `if (fuck == shit) 1 else 0`
+    /// e.g. `if (x == y) 1 else 0`
     If(E, E, E),
 
     /// Pattern matching expression

@@ -38,7 +38,7 @@ peg::parser! {
         rule whitespace() = quiet!{[' ' | '\n' | '\r' | '\t']*}
         rule whitespace_inline() = quiet!{[' ' | '\t']*}
 
-        rule keywords() = "def" / "if" / "else" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance"
+        rule keywords() = ("def" / "if" / "else" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance" / "pub" / "use" / "mod" / "open" / "as") !identifier_char()
 
         rule lexeme<T>(x: rule<T>) -> T
             = whitespace() !keywords() t:x() { t }
@@ -89,22 +89,116 @@ peg::parser! {
         pub rule module() -> Vec<Def>
             = d:definition()+ whitespace() { d }
 
+        // ====================================================================
+        // Module System Grammar
+        // ====================================================================
+
+        /// Parse visibility modifier (pub or nothing)
+        rule visibility() -> Visibility
+            = reserved(<"pub">) { Visibility::Public }
+            / { Visibility::Private }
+
+        /// Parse a module path (e.g., collections.list.length)
+        rule module_path() -> ModulePath
+            = segments:identifier() ++ lexeme(<".">) { ModulePath::new(segments) }
+
+        /// Parse a single use spec: `name` or `name as alias`
+        rule use_spec() -> UseSpec
+            = name:identifier() reserved(<"as">) alias:identifier() { UseSpec::with_alias(name, alias) }
+            / name:identifier() { UseSpec::new(name) }
+
+        /// Parse use item list: `{foo, bar as baz}`
+        rule use_item_list() -> Vec<UseSpec>
+            = lexeme(<"{">) specs:use_spec() ++ lexeme(<",">) lexeme(<"}">) { specs }
+
+        /// Parse a use statement
+        rule use_statement() -> UseItem
+            // use foo.bar.{baz, qux}
+            = path:module_path() list:use_item_list() { UseItem::Multiple(path, list) }
+            // use foo.bar as baz
+            / path:module_path() reserved(<"as">) alias:identifier() { UseItem::Alias(path, alias) }
+            // use foo.bar (single import)
+            / path:module_path() { UseItem::Single(path) }
+
+        /// Parse open statement (glob import): `open foo.bar`
+        rule open_statement() -> UseItem
+            = reserved(<"open">) path:module_path() { UseItem::Glob(path) }
+
+        /// Parse a use declaration (with optional visibility)
+        rule use_declaration() -> (Visibility, UseItem)
+            = vis:visibility() reserved(<"use">) item:use_statement() { (vis, item) }
+
+        /// Parse an open declaration (with optional visibility)
+        rule open_declaration() -> (Visibility, UseItem)
+            = vis:visibility() item:open_statement() { (vis, item) }
+
+        /// Parse an inline module definition: `mod name { items }`
+        rule inline_module_def() -> ModuleDef
+            = start:position!() reserved(<"mod">) name:identifier()
+              lexeme(<"{">) items:module_item()* lexeme(<"}">) end:position!() {
+                ModuleDef {
+                    name,
+                    items,
+                    pos: Span::new(start, end),
+                }
+            }
+
+        /// Parse a module declaration (for file-based modules): `mod name`
+        rule module_declaration() -> Id
+            = reserved(<"mod">) name:identifier() { name }
+
+        /// Parse a module item (with visibility)
+        rule module_item() -> ModuleItem
+            = vis:visibility() d:inline_module_def() { ModuleItem::SubModule(vis, Box::new(d)) }
+            / decl:use_declaration() { ModuleItem::Use(decl.0, decl.1) }
+            / decl:open_declaration() { ModuleItem::Use(decl.0, decl.1) }
+            / vis:visibility() name:module_declaration() definition_delimite()* { ModuleItem::ModDecl(vis, name) }
+            / vis:visibility() d:spanned(<form_definition()>) definition_delimite()* {
+                let (span, (name, form)) = d;
+                ModuleItem::Def(vis, Def::value_with_visibility(span, name, Box::new(form), vis))
+            }
+            / vis:visibility() d:type_definition() definition_delimite()* { ModuleItem::Def(vis, d) }
+
+        /// Parse a file module (for multi-file compilation)
+        /// Note: The path is cloned since peg rules don't allow moving parameters
+        pub rule file_module(path: &ModulePath) -> FileModule
+            = items:module_item()* whitespace() { FileModule { path: path.clone(), items } }
+
+        // ====================================================================
+        // End Module System Grammar
+        // ====================================================================
+
         pub rule definition() -> Def
-            = t:forward_declaration() definition_delimite()* d:spanned(<form_definition()>) {?
+            = t:forward_declaration() definition_delimite()* d:spanned(<pub_form_definition()>) {?
                 let (forward_name, scm) = t;
-                let (span, (name, mut form)) = d;
+                let (span, (vis, name, mut form)) = d;
                 if forward_name == name {
                     form.tag.annotate = Some(scm);
-                    Ok(Def::value(span, name, Box::new(form)))
+                    Ok(Def::value_with_visibility(span, name, Box::new(form), vis))
                 } else {
                     Err("Forward declaration should be followed by it's definition")
                 }
             }
-            / d:spanned(<form_definition()>) {
-                let (span, (name, form)) = d;
-                Def::value(span, name, Box::new(form))
+            / d:spanned(<pub_form_definition()>) {
+                let (span, (vis, name, form)) = d;
+                Def::value_with_visibility(span, name, Box::new(form), vis)
             }
-            / type_definition()
+            / d:spanned(<pub_type_definition()>) {
+                let (span, (vis, mut def)) = d;
+                def.pos = span;
+                def.visibility = vis;
+                def
+            }
+
+        /// Form definition with optional pub prefix
+        rule pub_form_definition() -> (Visibility, Id, Form)
+            = reserved(<"pub">) p:form_definition() { (Visibility::Public, p.0, p.1) }
+            / p:form_definition() { (Visibility::Private, p.0, p.1) }
+
+        /// Type definition with optional pub prefix
+        rule pub_type_definition() -> (Visibility, Def)
+            = reserved(<"pub">) d:type_definition() { (Visibility::Public, d) }
+            / d:type_definition() { (Visibility::Private, d) }
 
         rule forward_declaration() -> (Id, Scheme)
             = n:identifier() lexeme(<":">) t:type_scheme() { (n, t) }
@@ -131,7 +225,8 @@ peg::parser! {
                 Def {
                     ident: interner.borrow_mut().intern(name.as_str()),
                     pos: span,
-                    node: item
+                    node: item,
+                    visibility: Visibility::Private,
                 }
             }
             / reserved(<"data">) a:spanned(<type_algebra()>) {
@@ -139,7 +234,8 @@ peg::parser! {
                 Def {
                     ident: interner.borrow_mut().intern(name.as_str()),
                     pos: span,
-                    node: item
+                    node: item,
+                    visibility: Visibility::Private,
                 }
             }
             / reserved(<"concept">) a:spanned(<concept_definition()>) {
@@ -147,7 +243,8 @@ peg::parser! {
                 Def {
                     ident: interner.borrow_mut().intern(name.as_str()),
                     pos: span,
-                    node: item
+                    node: item,
+                    visibility: Visibility::Private,
                 }
             }
             / reserved(<"instance">) a:spanned(<instance_definition()>) {
@@ -155,7 +252,8 @@ peg::parser! {
                 Def {
                     ident: interner.borrow_mut().intern(name.as_str()),
                     pos: span,
-                    node: item
+                    node: item,
+                    visibility: Visibility::Private,
                 }
             }
 
@@ -436,7 +534,15 @@ peg::parser! {
             }
 
         rule var() -> Expr
-            = n:identifier() { Expr::Var(n) }
+            = path:module_path() {
+                if path.segments.len() == 1 {
+                    // Simple variable
+                    Expr::Var(path.segments[0])
+                } else {
+                    // Qualified variable (module path)
+                    Expr::QualifiedVar(path)
+                }
+            }
 
         rule list() -> Expr
             = lexeme(<"[">) l:expression() ** lexeme(<",">) lexeme(<"]">) {
@@ -831,6 +937,202 @@ instance (Eq a) => Eq (List a) {
         } else {
             panic!("Expected PolyConstrained scheme");
         }
+    }
+
+    // ========================================================================
+    // Module System Tests
+    // ========================================================================
+
+    #[test]
+    fn case_parse_pub_function() {
+        // Test parsing pub modifier on function
+        let src = "
+pub def add(x, y) = x + y
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        assert!(result.is_ok());
+        let defs = result.unwrap();
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].is_public());
+    }
+
+    #[test]
+    fn case_parse_private_function() {
+        // Test that functions are private by default
+        let src = "
+def helper(x) = x + 1
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        assert!(result.is_ok());
+        let defs = result.unwrap();
+        assert_eq!(defs.len(), 1);
+        assert!(!defs[0].is_public());
+    }
+
+    #[test]
+    fn case_parse_pub_data() {
+        // Test parsing pub modifier on data type
+        let src = "
+pub data List a {
+    Nil,
+    Cons(a, List a)
+}
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        assert!(result.is_ok());
+        let defs = result.unwrap();
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].is_public());
+    }
+
+    #[test]
+    fn case_parse_qualified_name() {
+        // Test parsing qualified variable names
+        let src = "
+def test() = collections.list.length
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("{:?}", result);
+        assert!(result.is_ok());
+        let defs = result.unwrap();
+        assert_eq!(defs.len(), 1);
+        // The function body should contain a QualifiedVar
+        if let Item::Form(ref body) = defs[0].node {
+            if let Expr::Abs(ref lambda) = body.node {
+                if let Expr::QualifiedVar(ref path) = lambda.body.node {
+                    assert_eq!(path.segments.len(), 3);
+                } else {
+                    panic!("Expected QualifiedVar in function body");
+                }
+            } else {
+                panic!("Expected Abs expression");
+            }
+        } else {
+            panic!("Expected Form item");
+        }
+    }
+
+    #[test]
+    fn case_parse_simple_qualified_name() {
+        // Test parsing simple qualified name (module.name)
+        let src = "
+def test() = utils.clamp
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn case_parse_module_items() {
+        // Test single pub def
+        let src1 = "pub def foo(x) = x";
+        let cell1 = RefCell::new(Interner::new());
+        let result1 = module(src1, &cell1);
+        assert!(result1.is_ok(), "pub def should parse: {:?}", result1.err());
+        let defs1 = result1.unwrap();
+        assert_eq!(defs1.len(), 1);
+        assert!(defs1[0].is_public(), "pub def should be public");
+
+        // Test single def (no pub)
+        let src2 = "def foo(x) = x";
+        let cell2 = RefCell::new(Interner::new());
+        let result2 = module(src2, &cell2);
+        assert!(result2.is_ok(), "def should parse: {:?}", result2.err());
+        let defs2 = result2.unwrap();
+        assert_eq!(defs2.len(), 1);
+        assert!(!defs2[0].is_public(), "def should be private");
+
+        // Test pub data
+        let src3 = "pub data Foo { Bar }";
+        let cell3 = RefCell::new(Interner::new());
+        let result3 = module(src3, &cell3);
+        assert!(result3.is_ok(), "pub data should parse: {:?}", result3.err());
+
+        // Test two defs with pub
+        let src4a = "pub def foo(x) = x\ndef bar(y) = y";
+        let cell4a = RefCell::new(Interner::new());
+        let result4a = module(src4a, &cell4a);
+        println!("Two defs: {:?}", result4a);
+
+        // Test with underscore in name
+        let src4b = "pub def public_fn(x) = x";
+        let cell4b = RefCell::new(Interner::new());
+        let result4b = module(src4b, &cell4b);
+        println!("pub def public_fn (underscore): {:?}", result4b);
+
+        // Test with camelCase (no underscore)
+        let src4d = "pub def publicFn(x) = x";
+        let cell4d = RefCell::new(Interner::new());
+        let result4d = module(src4d, &cell4d);
+        println!("pub def publicFn (camelCase): {:?}", result4d);
+
+        // Test with short name
+        let src4e = "pub def p(x) = x";
+        let cell4e = RefCell::new(Interner::new());
+        let result4e = module(src4e, &cell4e);
+        println!("pub def p (short): {:?}", result4e);
+
+        // Test names starting with "pub" prefix (should all work except bare "pub")
+        for name in &["pubA", "pubB", "public", "publication", "publisher", "puba", "pubb"] {
+            let src = format!("pub def {}(x) = x", name);
+            let cell = RefCell::new(Interner::new());
+            let result = module(&src, &cell);
+            assert!(result.is_ok(), "pub def {} should work: {:?}", name, result.err());
+        }
+
+        // "pub" as identifier should fail (it's a keyword)
+        let src_keyword = "pub def pub(x) = x";
+        let cell_keyword = RefCell::new(Interner::new());
+        let result_keyword = module(src_keyword, &cell_keyword);
+        assert!(result_keyword.is_err(), "pub as identifier should fail");
+
+        // Debug: check if the module rule can handle just two defs (no pub)
+        let src4c = "def foo(x) = x\ndef bar(y) = y";
+        let cell4c = RefCell::new(Interner::new());
+        let result4c = module(src4c, &cell4c);
+        println!("Two defs no pub: {:?}", result4c);
+
+        assert!(result4b.is_ok(), "pub def public_fn should parse: {:?}", result4b.err());
+        assert!(result4c.is_ok(), "Two defs no pub should parse: {:?}", result4c.err());
+        assert!(result4a.is_ok(), "Two defs with pub should parse: {:?}", result4a.err());
+
+        // Test full mixed visibility module
+        let src_full = "
+pub def publicFn(x) = x
+def privateFn(x) = x + 1
+pub data PublicType { Val(Int) }
+data PrivateType { Inner }
+";
+        let cell_full = RefCell::new(Interner::new());
+        let result_full = module(src_full, &cell_full);
+        assert!(result_full.is_ok(), "Full mixed visibility should parse: {:?}", result_full.err());
+        let defs = result_full.unwrap();
+        assert_eq!(defs.len(), 4);
+        assert!(defs[0].is_public(), "publicFn should be public");
+        assert!(!defs[1].is_public(), "privateFn should be private");
+        assert!(defs[2].is_public(), "PublicType should be public");
+        assert!(!defs[3].is_public(), "PrivateType should be private");
+    }
+
+    #[test]
+    fn case_parse_mixed_visibility() {
+        // Test mixed visibility with forward declarations
+        let src = "
+publicFn: Int -> Int
+pub def publicFn(x) = x + 1
+";
+        let cell = RefCell::new(Interner::new());
+        let result = module(src, &cell);
+        println!("Parse result: {:?}", result);
+        assert!(result.is_ok(), "Parse error: {:?}", result.err());
+        let defs = result.unwrap();
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].is_public());
     }
 
 }

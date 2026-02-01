@@ -678,6 +678,40 @@ impl<'i> K<'i> {
                     Term::Var(n)
                 }
             }
+            QualifiedVar(path) => {
+                // For qualified variables (e.g., module.submodule.name),
+                // currently we only support single-module lookups (Phase 1)
+                // In Phase 2, we'll implement full multi-file module resolution
+                // For now, treat the last segment as the variable name
+                if let Some(name) = path.name() {
+                    // Check if this is a unit constructor
+                    let var_name = self.interner.trace(name).to_string();
+                    if let Some((adt_name, tag)) = self.find_constructor_info(&var_name) {
+                        if let Some(adt_info) = self.adt_registry.get(&adt_name) {
+                            let variant = adt_info.variants.iter().find(|v| v.name == var_name);
+                            if let Some(v) = variant {
+                                if v.field_types.is_empty() {
+                                    let type_args = extract_type_args(tform.body());
+                                    return TaggedTerm::new(
+                                        tform,
+                                        Term::MakeData {
+                                            type_name: adt_name,
+                                            tag,
+                                            fields: vec![],
+                                            field_types: vec![],
+                                            type_args,
+                                        }
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Treat as regular variable for now (module resolution in Phase 2)
+                    Term::Var(name)
+                } else {
+                    panic!("Empty module path in QualifiedVar")
+                }
+            }
             List(e) => Term::List(self.transform_list(e)),
             Block(e) => Term::Block(self.transform_list(e)),
             Unary(op, e) => Term::Unary(op, Box::new(self.transform(*e))),

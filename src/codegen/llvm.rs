@@ -128,6 +128,120 @@ fn get_comp_base_name_static(ty: &Type) -> String {
     }
 }
 
+// ============================================================================
+// Module-qualified Name Mangling
+// ============================================================================
+
+/// Mangle a module-qualified name for LLVM symbols.
+///
+/// Format: `_G{len}M{segment}...{len}N{name}[_{type_suffix}]`
+/// - `_G` prefix marks it as a Geisha symbol
+/// - `M` followed by length and segment for each module path segment
+/// - `N` followed by length and the final name
+/// - Optional type suffix for monomorphized functions
+///
+/// Examples:
+/// - `collections.list.length` -> `_G11Mcollections4Mlist6Nlength`
+/// - `foo` (no module) -> `foo` (unchanged for backward compat)
+pub fn mangle_module_name(module_path: &[&str], name: &str) -> String {
+    if module_path.is_empty() {
+        // No module path - keep name unchanged for backward compatibility
+        // (existing code doesn't use module prefixes)
+        return name.to_string();
+    }
+
+    let mut result = String::from("_G");
+
+    // Mangle each module segment
+    for segment in module_path {
+        result.push_str(&segment.len().to_string());
+        result.push('M');
+        result.push_str(segment);
+    }
+
+    // Mangle the final name
+    result.push_str(&name.len().to_string());
+    result.push('N');
+    result.push_str(name);
+
+    result
+}
+
+/// Mangle a module-qualified name with type arguments (for monomorphization)
+pub fn mangle_module_name_with_types(module_path: &[&str], name: &str, type_args: &[Type]) -> String {
+    let mut base = mangle_module_name(module_path, name);
+
+    if !type_args.is_empty() {
+        base.push('_');
+        for (i, ty) in type_args.iter().enumerate() {
+            if i > 0 {
+                base.push('_');
+            }
+            base.push_str(&mangle_type(ty));
+        }
+    }
+
+    base
+}
+
+/// Mangle a type for use in symbol names
+fn mangle_type(ty: &Type) -> String {
+    match ty {
+        Type::Con(name) => name.clone(),
+        Type::Var(name) => format!("T{}", name),
+        Type::Arr(from, to) => format!("F{}_{}", mangle_type(from), mangle_type(to)),
+        Type::Prod(l, r) => format!("P{}_{}", mangle_type(l), mangle_type(r)),
+        Type::Comp(base, arg) => format!("{}{}", mangle_type(base), mangle_type(arg)),
+        Type::Void => "V".to_string(),
+    }
+}
+
+/// Demangle a module-qualified name (useful for debugging)
+#[allow(dead_code)]
+pub fn demangle_module_name(mangled: &str) -> Option<(Vec<String>, String)> {
+    if !mangled.starts_with("_G") {
+        // Not a mangled name
+        return Some((vec![], mangled.to_string()));
+    }
+
+    let mut chars = mangled[2..].chars().peekable();
+    let mut module_path = Vec::new();
+
+    while chars.peek().is_some() {
+        // Read length
+        let mut len_str = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                len_str.push(chars.next().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        let len: usize = len_str.parse().ok()?;
+
+        // Read marker (M for module, N for name)
+        let marker = chars.next()?;
+
+        // Read the segment
+        let segment: String = chars.by_ref().take(len).collect();
+        if segment.len() != len {
+            return None;
+        }
+
+        match marker {
+            'M' => module_path.push(segment),
+            'N' => {
+                // Found the final name
+                return Some((module_path, segment));
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
 impl LLVMCodegen {
     pub fn new(name: &str, adt_registry: AdtRegistry) -> LLVMCodegen {
         let context = LLVMContext::new();
@@ -566,5 +680,87 @@ impl LLVMCodegen {
                                 lhs.raw_ptr(),
                                 rhs.raw_ptr(),
                                 self.new_symbol().unwrap().into_raw()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mangle_no_module() {
+        // Without module path, name should be unchanged
+        let result = mangle_module_name(&[], "foo");
+        assert_eq!(result, "foo");
+    }
+
+    #[test]
+    fn test_mangle_single_module() {
+        // Single module path
+        let result = mangle_module_name(&["utils"], "clamp");
+        assert_eq!(result, "_G5Mutils5Nclamp");
+    }
+
+    #[test]
+    fn test_mangle_multiple_modules() {
+        // Multiple module segments
+        let result = mangle_module_name(&["collections", "list"], "length");
+        assert_eq!(result, "_G11Mcollections4Mlist6Nlength");
+    }
+
+    #[test]
+    fn test_demangle_simple() {
+        // Test demangling a simple module path
+        let mangled = "_G5Mutils5Nclamp";
+        let result = demangle_module_name(mangled);
+        assert!(result.is_some());
+        let (path, name) = result.unwrap();
+        assert_eq!(path, vec!["utils"]);
+        assert_eq!(name, "clamp");
+    }
+
+    #[test]
+    fn test_demangle_multiple_modules() {
+        // Test demangling multiple module segments
+        let mangled = "_G11Mcollections4Mlist6Nlength";
+        let result = demangle_module_name(mangled);
+        assert!(result.is_some());
+        let (path, name) = result.unwrap();
+        assert_eq!(path, vec!["collections", "list"]);
+        assert_eq!(name, "length");
+    }
+
+    #[test]
+    fn test_demangle_non_mangled() {
+        // Non-mangled names should return as-is
+        let result = demangle_module_name("simple_name");
+        assert!(result.is_some());
+        let (path, name) = result.unwrap();
+        assert!(path.is_empty());
+        assert_eq!(name, "simple_name");
+    }
+
+    #[test]
+    fn test_mangle_roundtrip() {
+        // Verify mangle/demangle roundtrip
+        let modules = vec!["foo", "bar", "baz"];
+        let name = "qux";
+        let mangled = mangle_module_name(&modules, name);
+        let demangled = demangle_module_name(&mangled);
+        assert!(demangled.is_some());
+        let (path, demangled_name) = demangled.unwrap();
+        assert_eq!(path, modules.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(demangled_name, name);
+    }
+
+    #[test]
+    fn test_mangle_with_types() {
+        // Test mangling with type arguments
+        let result = mangle_module_name_with_types(
+            &["collections"],
+            "map",
+            &[Type::Con("Int".to_string()), Type::Con("String".to_string())]
+        );
+        assert_eq!(result, "_G11Mcollections3Nmap_Int_String");
     }
 }

@@ -376,6 +376,23 @@ impl<'i> Infer<'i> {
                 }
             }
 
+            // Qualified variable (module path like collections.list.length)
+            // For Phase 1, we just use the last segment to look up in current scope
+            // Phase 2 will implement full module resolution
+            QualifiedVar(ref path) => {
+                if let Some(name) = path.name() {
+                    if let Some(ty) = e.lookup(&name) {
+                        form.tag.ty = (*ty).clone();
+                    } else {
+                        // Construct full path string for error message
+                        let path_str = path.to_string_with(self.interner);
+                        return Err(NotInScope(path_str, form.tag.pos));
+                    }
+                } else {
+                    return Err(NotInScope("(empty path)".to_string(), form.tag.pos));
+                }
+            }
+
             // Abstraction (function) should have a arrow type.
             // Generate temporary type var
             //   if parameter has no type annotation.

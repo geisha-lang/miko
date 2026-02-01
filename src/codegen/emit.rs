@@ -63,13 +63,6 @@ impl<'i> LLVMEmit<'i> {
         // A global function definition
         let fun_type = def.ref_type();
 
-        // Skip polymorphic functions - they should have specialized versions generated
-        // A function is polymorphic if its type contains type variables
-        if contains_type_var(fun_type) {
-            let def_name = self.interner.trace(def.name());
-            return;
-        }
-
         let void_ret = if let Type::Arr(_, ret) = fun_type {
             matches!(ret.as_ref(), Type::Void)
         } else {
@@ -269,9 +262,10 @@ impl<'i> LLVMEmit<'i> {
                     let expected_llvm_ty = fn_ty.get_param_type(i);
                     let val_ty = val.get_type();
 
-                    // Check if we need to cast - i8* to specific ADT pointer
+                    // Check if we need to convert types
                     if val_ty.raw_ptr() != expected_llvm_ty.raw_ptr() {
-                        argsv.push(self.builder().bit_cast(&val, &expected_llvm_ty, "arg.cast"));
+                        let converted = self.coerce_value(&val, &val_ty, &expected_llvm_ty);
+                        argsv.push(converted);
                     } else {
                         argsv.push(val);
                     }
@@ -392,17 +386,18 @@ impl<'i> LLVMEmit<'i> {
                 // ADT is represented as: { i32 tag, payload_struct }
                 // Returns a pointer to the allocated ADT struct
                 //
-                // We use the instantiated ADT type based on type_args for consistent memory layout
-
+                // Use the generic ADT type if any type_arg contains a type variable,
+                // otherwise use the instantiated type for better memory efficiency
 
                 // Get field values
                 let field_vals: Vec<LLVMValue> = fields.iter()
                     .map(|f| self.gen_expr(f, symbols))
                     .collect();
 
-                // Use the instantiated ADT type for allocation
-                // This ensures the payload is sized correctly for concrete type arguments
-                let adt_ty = if type_args.is_empty() {
+                // Use the instantiated ADT type for allocation only if ALL type args are concrete
+                // If any type arg contains a type variable, use the generic type (with i64 slots)
+                let all_concrete = type_args.iter().all(|t| !contains_type_var(t));
+                let adt_ty = if type_args.is_empty() || !all_concrete {
                     self.generator.gen_user_type(type_name)
                 } else {
                     self.generator.gen_instantiated_user_type(type_name, type_args)
@@ -418,21 +413,16 @@ impl<'i> LLVMEmit<'i> {
 
                 // Store payload fields if any
                 if !field_vals.is_empty() {
-                    // Build this variant's specific payload type from field_types
-                    let payload_llvm_types: Vec<LLVMType> = field_types.iter()
-                        .map(|t| self.generator.get_instantiated_field_type(t))
-                        .collect();
-                    let variant_payload_ty = self.context().get_struct_type(&payload_llvm_types, false);
-                    let variant_payload_ptr_ty = variant_payload_ty.get_ptr(0);
-
-                    // Get the payload pointer and cast to this variant's type
-                    let generic_payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
-                    let payload_ptr = self.builder().bit_cast(&generic_payload_ptr, &variant_payload_ptr_ty, "adt.payload.typed");
+                    // Get the actual payload pointer from the allocated struct
+                    // This uses the type from the allocation (which may be generic with i64 slots)
+                    let payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
 
                     for (i, fv) in field_vals.iter().enumerate() {
                         let field_ptr = self.builder().struct_field_ptr(&payload_ptr, i, "adt.field.ptr");
                         let field_ty = field_ptr.get_type().get_element();
                         let val_ty = fv.get_type();
+                        // Convert value to match the actual field type in the allocated struct
+                        // This handles i32 -> i64 promotion for polymorphic slots
                         let val_to_store = self.convert_to_field_type(fv, &val_ty, &field_ty);
                         self.builder().store(&val_to_store, &field_ptr);
                     }
@@ -701,6 +691,53 @@ impl<'i> LLVMEmit<'i> {
 
         // Fallback: try bitcast
         self.builder().bit_cast(val, field_ty, "field.cast")
+    }
+
+    /// Coerce a value to match the expected type
+    /// Handles integer width differences (i64 <-> i32) and pointer casts
+    fn coerce_value(&mut self, val: &LLVMValue, val_ty: &LLVMType, expected_ty: &LLVMType) -> LLVMValue {
+        let val_kind = unsafe { llvm_sys::core::LLVMGetTypeKind(val_ty.raw_ptr()) };
+        let expected_kind = unsafe { llvm_sys::core::LLVMGetTypeKind(expected_ty.raw_ptr()) };
+
+        // Handle integer type coercion
+        if val_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
+            && expected_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
+        {
+            let val_width = unsafe { llvm_sys::core::LLVMGetIntTypeWidth(val_ty.raw_ptr()) };
+            let expected_width = unsafe { llvm_sys::core::LLVMGetIntTypeWidth(expected_ty.raw_ptr()) };
+
+            if val_width > expected_width {
+                // Truncate (e.g., i64 -> i32)
+                return self.builder().trunc(val, expected_ty, "trunc");
+            } else if val_width < expected_width {
+                // Sign extend (e.g., i32 -> i64)
+                return self.builder().sext(val, expected_ty, "sext");
+            }
+        }
+
+        // Handle pointer to integer coercion
+        if val_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
+            && expected_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
+        {
+            return self.builder().ptr_to_int(val, expected_ty, "ptr.to.int");
+        }
+
+        // Handle integer to pointer coercion
+        if val_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
+            && expected_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
+        {
+            return self.builder().int_to_ptr(val, expected_ty, "int.to.ptr");
+        }
+
+        // Handle pointer to pointer (bitcast)
+        if val_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
+            && expected_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
+        {
+            return self.builder().bit_cast(val, expected_ty, "ptr.cast");
+        }
+
+        // Fallback: try bitcast
+        self.builder().bit_cast(val, expected_ty, "cast")
     }
 
     /// Bind pattern variables to their values in the current scope

@@ -6,4 +6,4 @@ instance Eq Int {
     def eq(x, y) = x == y
 }
 
-def main() = if (1 == 1) putNumber(42) else putNumber(0)
+def main() = if (eq(1, 1)) putNumber(42) else putNumber(0)

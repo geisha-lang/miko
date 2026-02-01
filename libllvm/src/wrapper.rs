@@ -132,6 +132,11 @@ impl LLVMContext {
             LLVMValue::from_ref(LLVMConstInt(self.get_int1_type().raw_ptr(), val as c_ulonglong, 1))
         }
     }
+    pub fn get_int64_const(&self, val: i64) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMConstInt(self.get_int64_type().raw_ptr(), val as c_ulonglong, 1))
+        }
+    }
 
     pub fn append_basic_block(&self, fun: &LLVMFunction, name: &str) -> LLVMBasicBlock {
         unsafe {

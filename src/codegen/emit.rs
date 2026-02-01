@@ -155,6 +155,11 @@ impl<'i> LLVMEmit<'i> {
         let block = self.context().append_basic_block(&fun, "entry");
         self.builder().set_position_at_end(&block);
 
+        // Initialize GC with 1MB heap (131072 words * 8 bytes/word = 1MB)
+        let gc_init_fn = self.generator.declare_gc_init();
+        let heap_size = self.context().get_int64_const(131072);
+        self.builder().call(&gc_init_fn, &mut vec![heap_size], "");
+
         let mut symtbl = prelude.sub_env();
         self.gen_expr(def.body(), &mut symtbl);
 
@@ -315,8 +320,14 @@ impl<'i> LLVMEmit<'i> {
 
                 // make a closure type
                 let cls_ty_actual = self.generator.get_actual_cls_type(&fv_tys);
-                // allocate for closure
-                let cls_value = self.builder().alloca(&cls_ty_actual, "cls.actual");
+
+                // Allocate closure on heap using gc_alloc
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let cls_size = self.generator.get_type_size(&cls_ty_actual);
+                let size_val = self.context().get_int64_const(cls_size as i64);
+                let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "cls.raw");
+                let cls_value = self.builder().bit_cast(&raw_ptr, &cls_ty_actual.get_ptr(0), "cls.actual");
+
                 let cls_cast = self.builder().bit_cast(&cls_value, &cls_ty, "cls.cast");
                 self.builder().store(&cls_cast, &cls_ptr);
 
@@ -403,8 +414,12 @@ impl<'i> LLVMEmit<'i> {
                     self.generator.gen_instantiated_user_type(type_name, type_args)
                 };
 
-                // Allocate on stack
-                let adt_ptr = self.builder().alloca(&adt_ty, "adt");
+                // Allocate ADT on heap using gc_alloc
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let adt_size = self.generator.get_type_size(&adt_ty);
+                let size_val = self.context().get_int64_const(adt_size as i64);
+                let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "adt.raw");
+                let adt_ptr = self.builder().bit_cast(&raw_ptr, &adt_ty.get_ptr(0), "adt");
 
                 // Store tag
                 let tag_val = self.context().get_int32_const(tag as i32);

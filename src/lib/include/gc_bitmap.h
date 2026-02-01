@@ -38,7 +38,7 @@ typedef struct {
 #define Get_free_size(p) (((gc_free_t *)(p))->size)
 #define Set_free_size(p, s) (Get_free_size(p) = s)
 #define Get_free_next(p) (((gc_free_t *)(p))->next)
-#define Set_free_next(p, n) (Get_free_next(p)->next = n)
+#define Set_free_next(p, n) (((gc_free_t *)(p))->next = (gc_free_t *)(n))
 
 void visitRootObj(void *obj);
 

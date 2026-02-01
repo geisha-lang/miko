@@ -26,15 +26,6 @@ inline static bool check_ptr(uintptr_t ptr);
 
 void gc_init(size_t init_size_words)
 {
-    // _gc_heaps = (gc_heap_t *)malloc(sizeof(gc_heap_t));
-    // _gc_heaps->heap = new_heap(init_size_words);
-    // if (_gc_heaps == NULL)
-    // {
-    //     fprintf(stderr, "Failed allocate heap\n");
-    //     abort(); // init heap failed, all hope lost
-    // }
-    // _gc_heaps->next = NULL;
-
     _gc_heap = new_heap(init_size_words);
     mark_ctx.bitslen = _gc_heap->bitslen;
     mark_ctx.bits = (bitmap_t *)calloc(_gc_heap->bitslen, Bitmap_size);
@@ -42,17 +33,19 @@ void gc_init(size_t init_size_words)
     if (_gc_heap == NULL || mark_ctx.bits == NULL)
     {
         fprintf(stderr, "Initial allocate failed\n");
-        abort(); // init heap failed, all hope lost
+        abort();
     }
 
     _free_list = _gc_heap->base;
     Set_free_size(_free_list, init_size_words);
     Set_free_next(_free_list, NULL);
 
-    // get frame address of main
-    _root_start = __builtin_frame_address(1);
+    // get frame address of gc_init (called from main entry)
+    // Using frame 0 instead of 1 because LLVM may eliminate the caller's frame
+    _root_start = (uintptr_t)__builtin_frame_address(0);
 #ifdef __DEBUG
-    fprintf(__DEBUG_OUT, "Root start at current main frame address: %p\n", _root_start);
+    fprintf(__DEBUG_OUT, "gc_init: heap base=%p, end=%p, root_start=%p\n",
+            (void*)_gc_heap->base, (void*)_gc_heap->end, (void*)_root_start);
 #endif
 }
 
@@ -68,17 +61,19 @@ void *gc_alloc(size_t size_bytes)
         if (ret == NULL)
         {
             fprintf(stderr, "GC allocate failed\n");
-            abort(); // TODO: extend new heap
+            abort();
         }
     }
+    // Initialize header with object size (words - 1 for header itself)
+    // Header stores (size << 1), setting low bit for type (0 = struct)
+    *ret = (words - 1) << 1;
+    INC_PTR_BYTES(ret, Header_size);
+    // bitmap_set_alloc expects pointer after header
     bitmap_set_alloc(ret, words);
-    PTR_INC_BYTES(ret, Header_size);
-    #ifdef __DEBUG
-    
-        fprintf(__DEBUG_OUT, "allocated object at %p\n", ret);
-    
-    #endif
-        return ret;
+#ifdef __DEBUG
+    fprintf(__DEBUG_OUT, "gc_alloc: %zu bytes -> %p (%zu words)\n", size_bytes, (void*)ret, words);
+#endif
+    return ret;
 }
 
 /*
@@ -133,7 +128,9 @@ gc_heap_t *new_heap(size_t max_size_words)
     memset(base, 0, sizeof(gc_heap_t) + bitslen * Bitmap_size);
     gc_heap_t *ret = (gc_heap_t *)base;
 
-    INC_PTR_BYTES(base, sizeof(gc_heap_t));
+    // Skip past gc_heap_t fixed fields AND the bits[] flexible array
+    // The bits[] array is stored inline in gc_heap_t, so heap space starts after it
+    INC_PTR_BYTES(base, sizeof(gc_heap_t) + bitslen * Bitmap_size);
 
     ret->base = (uintptr_t)base;
 
@@ -158,7 +155,7 @@ void bitmap_set_alloc(const void *ptr, size_t size_words)
 void bitmap_collect()
 {
     // get the frame address before `gc_alloc`
-    _root_end = __builtin_frame_address(1);
+    _root_end = (uintptr_t)__builtin_frame_address(1);
 
 #ifdef __DEBUG
     fprintf(__DEBUG_OUT, "current root end address: %p\n", _root_end);
@@ -197,7 +194,7 @@ void bitmap_mark_obj(const void *obj)
     // scan fields
     size_t obj_size = Get_size(obj);
     void *cur = obj;
-    PTR_INC_BYTES(obj, obj_size * WORD_SIZE);
+    INC_PTR_BYTES(obj, obj_size * WORD_SIZE);
     while ((uintptr_t)cur < (uintptr_t)obj)
     {
         void *field = *(void **)cur;
@@ -205,20 +202,124 @@ void bitmap_mark_obj(const void *obj)
         {
             bitmap_mark_obj(field);
         }
-        PTR_INC_BYTES(cur, 4); // increase by struct padding size
+        INC_PTR_BYTES(cur, 4); // increase by struct padding size
     }
 }
 
 void bitmap_sweep()
 {
-    
+    // Reset free list - we'll rebuild it during sweep
+    _free_list = 0;
+    gc_free_t *last_free = NULL;
+
+    uintptr_t cur = _gc_heap->base;
+    uintptr_t free_start = 0;
+    size_t free_size = 0;
+
+    while (cur < _gc_heap->end)
+    {
+        const uintptr_t offset = cur - _gc_heap->base;
+        const size_t idx = OFFSET_TO_IDX(offset);
+        const bitmap_t mask = OFFSET_TO_MASK(offset);
+
+        // Check if this position has an allocated object
+        if (_gc_heap->bits[idx] & mask)
+        {
+            // Get object size from header
+            value_t *obj = (value_t *)cur;
+            INC_PTR_BYTES(obj, Header_size);
+            size_t obj_words = Get_size(obj) + 1; // +1 for header
+
+            // Check if object is marked
+            if (mark_ctx.bits[idx] & mask)
+            {
+                // Object is alive - if we had a free run, add it to free list
+                if (free_size > 0)
+                {
+                    gc_free_t *frag = (gc_free_t *)free_start;
+                    frag->size = free_size;
+                    frag->next = NULL;
+
+                    if (last_free == NULL)
+                    {
+                        _free_list = free_start;
+                    }
+                    else
+                    {
+                        last_free->next = frag;
+                    }
+                    last_free = frag;
+
+#ifdef __DEBUG
+                    fprintf(__DEBUG_OUT, "free fragment at %p, size %zu words\n", (void *)free_start, free_size);
+#endif
+                    free_size = 0;
+                }
+
+#ifdef __DEBUG
+                fprintf(__DEBUG_OUT, "keeping live object at %p, size %zu words\n", (void *)cur, obj_words);
+#endif
+                cur += obj_words * WORD_SIZE;
+            }
+            else
+            {
+                // Object is dead - clear allocation bit and add to free run
+                _gc_heap->bits[idx] &= ~mask;
+
+                if (free_size == 0)
+                {
+                    free_start = cur;
+                }
+                free_size += obj_words;
+
+#ifdef __DEBUG
+                fprintf(__DEBUG_OUT, "sweeping dead object at %p, size %zu words\n", (void *)cur, obj_words);
+#endif
+                cur += obj_words * WORD_SIZE;
+            }
+        }
+        else
+        {
+            // No object here - extend free run or start new one
+            if (free_size == 0)
+            {
+                free_start = cur;
+            }
+            free_size++;
+            cur += WORD_SIZE;
+        }
+    }
+
+    // Add final free run if any
+    if (free_size > 0)
+    {
+        gc_free_t *frag = (gc_free_t *)free_start;
+        frag->size = free_size;
+        frag->next = NULL;
+
+        if (last_free == NULL)
+        {
+            _free_list = free_start;
+        }
+        else
+        {
+            last_free->next = frag;
+        }
+
+#ifdef __DEBUG
+        fprintf(__DEBUG_OUT, "final free fragment at %p, size %zu words\n", (void *)free_start, free_size);
+#endif
+    }
+
+    // Clear mark bitmap for next collection
+    memset(mark_ctx.bits, 0, mark_ctx.bitslen * Bitmap_size);
 }
 
 static inline bool check_ptr(uintptr_t ptr)
 {
     // assume it is actual pointer when it is
     // not 0, is times of 8, and
-    if (ptr == 0 && ptr % 8 != 0)
+    if (ptr == 0 || ptr % 8 != 0)
     {
         return false;
     }

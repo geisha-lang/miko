@@ -121,6 +121,7 @@ After implementing a feature:
 When encountering issues:
 - If a proper fix requires deeper architectural changes, **document the workaround** in `docs/todo/`
 - Create a markdown file describing: the issue, the workaround applied, and what a proper fix would look like
+- The document for TODO things should name start with `TODO_`. After resolve change it to `COMPLETED_`, and update the content.
 - This prevents technical debt from being forgotten
 
 ## Gotchas

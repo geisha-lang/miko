@@ -507,6 +507,36 @@ impl LLVMCodegen {
         }
     }
 
+    /// Declare gc_init(size_t) -> void
+    pub fn declare_gc_init(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("gc_init") {
+            return f;
+        }
+        let size_ty = self.context.get_int64_type(); // size_t
+        let void_ty = self.context.get_void_type();
+        let fn_ty = LLVMContext::get_function_type(&void_ty, &vec![size_ty], false);
+        self.module.add_function("gc_init", &fn_ty)
+    }
+
+    /// Declare gc_alloc(size_t) -> i8*
+    pub fn declare_gc_alloc(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("gc_alloc") {
+            return f;
+        }
+        let size_ty = self.context.get_int64_type(); // size_t
+        let ptr_ty = self.context.get_int8_type().get_ptr(0); // i8*
+        let fn_ty = LLVMContext::get_function_type(&ptr_ty, &vec![size_ty], false);
+        self.module.add_function("gc_alloc", &fn_ty)
+    }
+
+    /// Get the size in bytes of an LLVM type
+    pub fn get_type_size(&self, ty: &LLVMType) -> u64 {
+        unsafe {
+            let target_data = llvm_sys::target::LLVMGetModuleDataLayout(self.module.raw_ptr());
+            llvm_sys::target::LLVMABISizeOfType(target_data, ty.raw_ptr())
+        }
+    }
+
 
     pub fn create_entry_block_alloca(&self,
                                      fun: &LLVMFunction,

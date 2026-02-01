@@ -16,6 +16,7 @@ void putChar(const char c, void *fv)
 void putNumber(const uint32_t n, void *fv)
 {
     printf("%d", n);
+    fflush(stdout);
 }
 
 void putFloat(const double f, void *fv)

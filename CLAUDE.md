@@ -9,20 +9,25 @@ Miko is a compiler for the Geisha language (a functional programming language) i
 ## Build Commands
 
 ```bash
-# Build (stable Rust 2021 edition)
+# Build compiler (also builds the runtime library)
 cargo build
 
 # Run tests
 cargo test
 
-# Compile Geisha source to object file
-./target/debug/miko -o output.o input.gs
+# Compile Geisha source to executable (auto-links with runtime)
+./target/debug/miko -o output input.gs
 
-# Link with runtime to create executable
-cc -o output base.o output.o
+# Compile to object file only (no linking)
+./target/debug/miko -c -o output.o input.gs
 
 # Emit LLVM IR (for debugging)
-./target/debug/miko -e input.gs
+./target/debug/miko -e -o /dev/null input.gs
+
+# Use custom runtime library path
+./target/debug/miko --runtime /path/to/runtime.a -o output input.gs
+# Or via environment variable
+GEISHA_RUNTIME=/path/to/runtime.a ./target/debug/miko -o output input.gs
 
 # Run REPL mode (experimental, not fully implemented)
 ./target/debug/miko -r
@@ -51,7 +56,12 @@ The PEG grammar is defined inline in `src/syntax/parser/mod.rs` using the `peg::
 
 ### Runtime
 
-`base.o` contains the precompiled runtime library (print functions, etc.). Must be linked with compiled output.
+The runtime library (`src/lib/`) is built automatically with `cargo build`:
+- `src/lib/base.c` - I/O functions (`printLn`, `putNumber`, etc.)
+- `src/lib/runtime/gc_bitmap.c` - Mark-and-sweep garbage collector
+- `src/lib/include/` - Header files for value representation and GC
+
+The runtime is compiled via the `cc` crate in `build.rs` and automatically linked when producing executables.
 
 ## Geisha Language Syntax
 
@@ -107,6 +117,7 @@ instance Eq Int {            # Implement for type
 - `libllvm/` - local crate wrapping LLVM APIs
 - `peg` 0.8 - inline PEG parser generator
 - `clap` 4 - command-line argument parsing
+- `cc` 1.0 - C compiler integration for building runtime (build dependency)
 
 ## Development Workflow
 
@@ -130,7 +141,7 @@ When encountering issues:
 - Formal grammar specification in `CFG` file at project root
 - Some deprecated LLVM API warnings exist (opaque pointers) but don't affect functionality
 - REPL mode (`-r`) is experimental and not fully implemented
-- Complete compilation workflow:
+- Quick test:
   ```bash
-  cargo build && ./target/debug/miko -o out.o test/fibonacci.gs && cc -o fib base.o out.o && ./fib
+  cargo build && ./target/debug/miko -o fib test/fibonacci.gs && ./fib
   ```

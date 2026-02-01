@@ -12,3 +12,6 @@ clap = { version = "4", features = ["derive"] }
 libllvm = { path = "./libllvm" }
 libc = "0.2"
 peg = "0.8"
+
+[build-dependencies]
+cc = "1.0"

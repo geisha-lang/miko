@@ -23,6 +23,11 @@ Source Code (.gs)
    └──────────────┘
        │
        ▼
+   ┌─────────────────┐
+   │ Escape Analysis │  Determine allocation strategies
+   └─────────────────┘
+       │
+       ▼
    ┌──────────────┐
    │ Code Generation │  → LLVM IR
    └──────────────┘
@@ -34,7 +39,7 @@ Source Code (.gs)
        │
        ▼
    ┌────────┐
-   │ Linker │  Link with base.o → Executable
+   │ Linker │  Link with runtime → Executable
    └────────┘
 ```
 
@@ -163,9 +168,51 @@ def _lambda_entry(x, fv) = fv.n + x
 def makeAdder(n) = MakeCls(closure, Closure(_lambda_entry, [n]))
 ```
 
-## Stage 4: Code Generation
+## Stage 4: Escape Analysis
 
-The code generator emits LLVM IR from core terms.
+Escape analysis determines which values can be safely stack-allocated versus those that must be heap-allocated.
+
+### Implementation
+
+Located in `src/core/escape.rs`.
+
+### Purpose
+
+- Optimize memory allocation by using stack instead of GC heap when safe
+- Reduce garbage collection pressure
+- Improve performance for short-lived values
+
+### Two-Phase Analysis
+
+1. **Parameter Escape Analysis**: Bottom-up traversal of call graph to determine how function parameters escape:
+   - `NoEscape`: Parameter is used locally only
+   - `EscapesCapture`: Parameter is captured by a closure
+   - `EscapesReturn`: Parameter is returned from the function
+   - `EscapesStore`: Parameter is stored in a heap-allocated ADT
+
+2. **Local Allocation Analysis**: For each function, determine which local bindings can be stack-allocated:
+   - Closures (MakeCls) that don't escape → stack
+   - ADT values (MakeData) that don't escape → stack
+   - Recursive ADTs always → heap (can grow unboundedly)
+
+### Escape Rules
+
+A value must be heap-allocated if:
+- Captured by a closure (pointer types)
+- Returned from function (in tail position)
+- Stored in an escaping or recursive ADT
+- Passed to a callee's escaping parameter
+- Is a recursive ADT (e.g., List, Tree)
+
+### Output
+
+`EscapeAnalysis` struct containing:
+- Per-function allocation strategies for local bindings
+- Set of recursive ADT names
+
+## Stage 5: Code Generation
+
+The code generator emits LLVM IR from core terms, using escape analysis results to choose allocation strategies.
 
 ### Implementation
 
@@ -219,7 +266,7 @@ ADTs use a tagged union:
 %Maybe = type { i32, i8* }  ; {tag, payload_ptr}
 ```
 
-## Stage 5: Object File Generation
+## Stage 6: Object File Generation
 
 LLVM compiles the IR to native object code.
 
@@ -235,7 +282,7 @@ LLVM compiles the IR to native object code.
 ./target/debug/miko -o output.o input.gs
 ```
 
-## Stage 6: Linking
+## Stage 7: Linking
 
 The object file must be linked with the runtime library.
 
@@ -310,5 +357,7 @@ else:
 | `src/typeinfer/constraint.rs` | Constraint solving |
 | `src/core/convert.rs` | K-conversion |
 | `src/core/term.rs` | Core IR types |
+| `src/core/escape.rs` | Escape analysis |
 | `src/codegen/emit.rs` | LLVM emission |
-| `src/lib/base.c` | Runtime library source |
+| `src/lib/base.c` | Runtime library (I/O) |
+| `src/lib/runtime/gc_bitmap.c` | Garbage collector |

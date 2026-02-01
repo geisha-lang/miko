@@ -275,19 +275,108 @@ switch i32 %tag, label %default [
 ]
 ```
 
-## Memory Safety
+## Garbage Collection
 
-### Current State
+Geisha uses a mark-and-sweep garbage collector for heap-allocated values.
 
-- Stack allocation for most values
-- No garbage collection
-- No runtime bounds checking
+### Initialization
 
-### Implications
+The GC is initialized at program start with a configurable heap size:
 
-- Closures that escape their defining scope may cause issues
-- Recursive data structures may cause stack overflow
-- Memory leaks possible with dynamically allocated data
+```llvm
+; In main():
+call void @gc_init(i64 131072)  ; 1MB heap (131072 words × 8 bytes)
+```
+
+### Allocation
+
+Heap allocation uses `gc_alloc`:
+
+```llvm
+%ptr = call i8* @gc_alloc(i64 %size_bytes)
+```
+
+### When GC Runs
+
+Collection is triggered automatically when:
+- Heap space is exhausted during allocation
+- The allocator cannot find a free block of sufficient size
+
+### Root Scanning
+
+The collector scans:
+- Stack frames (using frame pointer introspection)
+- Global variables
+
+## Escape Analysis
+
+Escape analysis determines whether values can be stack-allocated or must be heap-allocated.
+
+### Purpose
+
+- Reduce GC pressure by stack-allocating short-lived values
+- Improve cache locality for local data
+- Eliminate allocation overhead for non-escaping values
+
+### Implementation
+
+Located in `src/core/escape.rs`. Runs after K-conversion, before code generation.
+
+### Escape Rules
+
+A value **escapes** (must be heap-allocated) if:
+
+1. **Captured by closure**: Pointer is copied into a closure's environment
+2. **Returned from function**: In tail position of a function
+3. **Stored in escaping ADT**: Field of an ADT that itself escapes
+4. **Passed to escaping parameter**: Callee's corresponding parameter escapes
+5. **Recursive ADT**: Can grow unboundedly (e.g., List, Tree)
+
+A value **does not escape** (can be stack-allocated) if:
+- Used only in local computations
+- Pattern matched and destructured locally
+- Passed to non-escaping function parameters
+
+### Example: Stack-Allocated ADT
+
+```
+def main() =
+    let p = MkPair(10, 20) in   // p does not escape
+    match p {
+        MkPair(a, b) -> putNumber(a + b)
+    }
+```
+
+Generated code uses `alloca`:
+```llvm
+%adt.stack = alloca { i32, { i32, i32 } }
+```
+
+### Example: Heap-Allocated ADT
+
+```
+def identity(x) = x    // x escapes via return
+
+def main() =
+    let p = MkPair(1, 2) in
+    putNumber(match identity(p) { ... })
+```
+
+Generated code uses `gc_alloc`:
+```llvm
+%adt.raw = call i8* @gc_alloc(i64 12)
+```
+
+### Recursive ADT Detection
+
+The compiler detects self-referential ADTs using `AdtInfo::is_recursive()`:
+
+```
+data List a { Nil, Cons(a, List a) }  // Recursive: Cons contains List a
+data Pair a b { MkPair(a, b) }        // Not recursive
+```
+
+Recursive ADTs are always heap-allocated because they can grow to arbitrary size.
 
 ## Example: Complete Layout
 
@@ -335,7 +424,7 @@ Memory usage:
 
 Potential improvements:
 
-1. **Heap Allocation**: For values that escape stack scope
-2. **Garbage Collection**: Automatic memory management
-3. **Unboxing Optimization**: Avoid pointer indirection for small types
-4. **Region-Based Memory**: Efficient allocation and deallocation
+1. **Generational GC**: Separate young/old generations for better performance
+2. **Unboxing Optimization**: Avoid pointer indirection for small types
+3. **Region-Based Memory**: Efficient allocation and deallocation for related objects
+4. **Size-Based Stack Threshold**: Stack-allocate values under a size limit

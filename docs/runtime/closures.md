@@ -211,18 +211,48 @@ def example(a, b, c) =
 
 ## Memory Management
 
-### Current Implementation
+### Escape-Based Allocation
 
-Closure environments are stack-allocated when possible:
+The compiler uses escape analysis to determine closure allocation strategy:
 
+**Stack Allocation** (non-escaping closures):
 ```llvm
-%env = alloca { i32, i32 }  ; Stack allocation
+%cls.stack = alloca { i8*, { i32 } }  ; Fast, no GC overhead
 ```
 
-### Limitations
+**Heap Allocation** (escaping closures):
+```llvm
+%cls.raw = call i8* @gc_alloc(i64 16)  ; GC-managed
+```
 
-- Closures that escape their defining scope may cause issues
-- No garbage collection for dynamically allocated closures
+### When Closures Escape
+
+A closure escapes and must be heap-allocated if:
+- Returned from a function
+- Stored in a data structure that escapes
+- Captured by another escaping closure
+
+### Example: Non-Escaping Closure
+
+```
+def main() =
+    let f = (x) -> x + 1 in  // f does not escape
+    putNumber(f(5))          // Used locally only
+```
+
+The closure `f` is stack-allocated because it's only used within `main`.
+
+### Example: Escaping Closure
+
+```
+def makeAdder(n) = (x) -> n + x  // Closure is returned
+
+def main() =
+    let add5 = makeAdder(5) in
+    putNumber(add5(10))
+```
+
+The closure returned by `makeAdder` must be heap-allocated because it escapes via return.
 
 ## Example: Counter
 

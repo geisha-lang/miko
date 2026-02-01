@@ -1,4 +1,5 @@
 use crate::core::*;
+use crate::core::escape::{EscapeAnalysis, AllocationStrategy};
 use crate::types::*;
 use crate::internal::*;
 use crate::utils::*;
@@ -27,6 +28,11 @@ pub struct LLVMEmit<'i> {
     pub generator: LLVMCodegen,
     interner: &'i mut Interner,
     funpass: bool,
+    escape_info: EscapeAnalysis,
+    current_func: Option<Id>,
+    /// The binding Id when generating the value of a Let expression
+    /// Used to look up allocation strategy for MakeData
+    current_let_binding: Option<Id>,
 }
 
 pub type VarEnv<'a> = SymTable<'a, Id, LLVMValue>;
@@ -46,11 +52,32 @@ pub type VarEnv<'a> = SymTable<'a, Id, LLVMValue>;
 
 
 impl<'i> LLVMEmit<'i> {
-    pub fn new(name: &str, interner: &'i mut Interner, adt_registry: AdtRegistry) -> Self {
+    pub fn new(name: &str, interner: &'i mut Interner, adt_registry: AdtRegistry, escape_info: EscapeAnalysis) -> Self {
         LLVMEmit {
             generator: LLVMCodegen::new(name, adt_registry),
             interner,
-            funpass: true
+            funpass: true,
+            escape_info,
+            current_func: None,
+            current_let_binding: None,
+        }
+    }
+
+    /// Get allocation strategy for a binding in the current function
+    fn get_allocation_strategy(&self, binding_id: &Id) -> AllocationStrategy {
+        if let Some(func_id) = &self.current_func {
+            self.escape_info.get_strategy(func_id, binding_id)
+        } else {
+            AllocationStrategy::Heap // Default to heap if no current function
+        }
+    }
+
+    /// Get allocation strategy for the current let binding (used by MakeData)
+    fn get_current_let_allocation_strategy(&self) -> AllocationStrategy {
+        if let Some(binding_id) = &self.current_let_binding {
+            self.get_allocation_strategy(binding_id)
+        } else {
+            AllocationStrategy::Heap // Not in a let binding context
         }
     }
     pub fn dump(&mut self) {
@@ -60,6 +87,9 @@ impl<'i> LLVMEmit<'i> {
         self.funpass = false;
     }
     pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
+        // Set current function for escape analysis lookups
+        self.current_func = Some(def.name());
+
         // A global function definition
         let fun_type = def.ref_type();
 
@@ -146,9 +176,15 @@ impl<'i> LLVMEmit<'i> {
         } else {
             if self.funpass { self.generator.passer.run(&fun); }
         }
+
+        // Clear current function
+        self.current_func = None;
     }
 
     pub fn gen_main(&mut self, def: &FunDef, prelude: &VarEnv) {
+        // Set current function for escape analysis lookups
+        self.current_func = Some(def.name());
+
         let main_ty = self.generator.get_main_type();
         let fun = self.module().add_function("main", &main_ty);
 
@@ -166,9 +202,12 @@ impl<'i> LLVMEmit<'i> {
         let zero = self.context().get_int32_const(0);
         self.builder().ret(&zero);
 
-        
+
         fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction);
         if self.funpass { self.generator.passer.run(&fun); }
+
+        // Clear current function
+        self.current_func = None;
     }
     /// Long bull shit
     fn gen_expr<'a: 'b, 'b>(&mut self,
@@ -199,7 +238,14 @@ impl<'i> LLVMEmit<'i> {
                 let block = self.builder().get_insert_block();
                 let fun = block.get_parent();
 
+                // Set current let binding for MakeData to look up allocation strategy
+                let old_let_binding = self.current_let_binding;
+                self.current_let_binding = Some(var);
+
                 let init = self.gen_expr(val, symbols);
+
+                // Restore previous let binding context
+                self.current_let_binding = old_let_binding;
 
                 // For ADT values, use the actual value type instead of the declared type
                 // because the declared type may have unresolved type variables (i64 fallback)
@@ -296,6 +342,9 @@ impl<'i> LLVMEmit<'i> {
                 let exp = exp.as_ref();
                 let &VarDecl(ref var, ref tyvar) = var_decl;
 
+                // Check escape analysis to determine allocation strategy
+                let alloc_strategy = self.get_allocation_strategy(var);
+
                 // make a alloca of closure pointer
                 let cls_ty = self.generator.get_closure_type().get_ptr(0);
                 let cls_ptr = {
@@ -321,12 +370,21 @@ impl<'i> LLVMEmit<'i> {
                 // make a closure type
                 let cls_ty_actual = self.generator.get_actual_cls_type(&fv_tys);
 
-                // Allocate closure on heap using gc_alloc
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
-                let cls_size = self.generator.get_type_size(&cls_ty_actual);
-                let size_val = self.context().get_int64_const(cls_size as i64);
-                let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "cls.raw");
-                let cls_value = self.builder().bit_cast(&raw_ptr, &cls_ty_actual.get_ptr(0), "cls.actual");
+                // Allocate closure based on escape analysis
+                let cls_value = match alloc_strategy {
+                    AllocationStrategy::Stack => {
+                        // Stack allocation - use alloca
+                        self.builder().alloca(&cls_ty_actual, "cls.stack")
+                    }
+                    AllocationStrategy::Heap => {
+                        // Heap allocation via gc_alloc
+                        let gc_alloc_fn = self.generator.declare_gc_alloc();
+                        let cls_size = self.generator.get_type_size(&cls_ty_actual);
+                        let size_val = self.context().get_int64_const(cls_size as i64);
+                        let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "cls.raw");
+                        self.builder().bit_cast(&raw_ptr, &cls_ty_actual.get_ptr(0), "cls.actual")
+                    }
+                };
 
                 let cls_cast = self.builder().bit_cast(&cls_value, &cls_ty, "cls.cast");
                 self.builder().store(&cls_cast, &cls_ptr);
@@ -414,12 +472,30 @@ impl<'i> LLVMEmit<'i> {
                     self.generator.gen_instantiated_user_type(type_name, type_args)
                 };
 
-                // Allocate ADT on heap using gc_alloc
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
-                let adt_size = self.generator.get_type_size(&adt_ty);
-                let size_val = self.context().get_int64_const(adt_size as i64);
-                let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "adt.raw");
-                let adt_ptr = self.builder().bit_cast(&raw_ptr, &adt_ty.get_ptr(0), "adt");
+                // Check allocation strategy based on escape analysis
+                // Recursive ADTs are always heap-allocated regardless of escape analysis
+                let is_recursive = self.escape_info.is_recursive_adt(type_name);
+                let alloc_strategy = if is_recursive {
+                    AllocationStrategy::Heap
+                } else {
+                    self.get_current_let_allocation_strategy()
+                };
+
+                // Allocate ADT based on escape analysis
+                let adt_ptr = match alloc_strategy {
+                    AllocationStrategy::Stack => {
+                        // Stack allocation - use alloca
+                        self.builder().alloca(&adt_ty, "adt.stack")
+                    }
+                    AllocationStrategy::Heap => {
+                        // Heap allocation via gc_alloc
+                        let gc_alloc_fn = self.generator.declare_gc_alloc();
+                        let adt_size = self.generator.get_type_size(&adt_ty);
+                        let size_val = self.context().get_int64_const(adt_size as i64);
+                        let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "adt.raw");
+                        self.builder().bit_cast(&raw_ptr, &adt_ty.get_ptr(0), "adt")
+                    }
+                };
 
                 // Store tag
                 let tag_val = self.context().get_int32_const(tag as i32);

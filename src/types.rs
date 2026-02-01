@@ -242,6 +242,24 @@ impl AdtInfo {
             (v.name.clone(), v.scheme.clone())
         }).collect()
     }
+
+    /// Check if this ADT is recursive (self-referential)
+    /// Recursive ADTs like List or Tree can grow unboundedly and must always be heap-allocated
+    pub fn is_recursive(&self) -> bool {
+        self.variants.iter().any(|v| {
+            v.field_types.iter().any(|ft| type_mentions(&self.name, ft))
+        })
+    }
+}
+
+/// Check if a type mentions a given ADT name (used for recursive ADT detection)
+pub fn type_mentions(adt_name: &str, ty: &Type) -> bool {
+    match ty {
+        Type::Con(name) => name == adt_name,
+        Type::Comp(base, arg) => type_mentions(adt_name, base) || type_mentions(adt_name, arg),
+        Type::Arr(p, r) | Type::Prod(p, r) => type_mentions(adt_name, p) || type_mentions(adt_name, r),
+        Type::Var(_) | Type::Void => false,
+    }
 }
 
 /// Registry of all ADT definitions

@@ -147,9 +147,12 @@ fn compile(name: &str, src: &str) -> Result<LLVMCodegen, CompileError> {
     // K-conversion (core term generation) with monomorphization
     let (mut top, _) = K::go(defs, &mut inter, adt_registry.clone(), instantiation_registry);
 
+    // Escape analysis for stack allocation optimization
+    let escape_info = miko::core::escape::analyze_all(&top, &adt_registry, 128);
+
     // Code generation
     let main_id = inter.intern("main");
-    let mut emitter = LLVMEmit::new(name, &mut inter, adt_registry);
+    let mut emitter = LLVMEmit::new(name, &mut inter, adt_registry, escape_info);
     let main_fn = top.remove(&main_id);
     let env = VarEnv::new();
     if let Some(mf) = main_fn {

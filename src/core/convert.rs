@@ -185,6 +185,8 @@ impl<'i> K<'i> {
                 for inst in instantiations {
                     self.specialize_function(&original_def, &inst);
                 }
+                // Remove the original polymorphic function - only specialized versions should be codegen'd
+                self.global.remove(&fn_id);
             }
         }
     }

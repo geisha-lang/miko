@@ -1,298 +1,120 @@
 # Type System
 
-Geisha has a powerful static type system based on Hindley-Milner with extensions for algebraic data types and typeclasses (concepts).
+Geisha has a static Hindley-Milner type system extended with algebraic data types, first-class tuples, explicit multi-argument function arities, and monomorphized concepts (typeclasses).
 
 ## Primitive Types
 
-### Int
+- **`Int`**: 32-bit signed integer (`42`, `-100`)
+- **`Float`**: 64-bit IEEE-754 double (`3.14159`, `-2.5e-3`)
+- **`Char`**: 8-bit character (`'A'`, `'\n'`)
+- **`String`**: Null-terminated UTF-8 string (`"Hello, World!"`)
+- **`Bool`**: Boolean (`true`, `false`)
+- **`Void`** (also written `()`): Unit type (`()`)
 
-32-bit signed integer.
+## Function Types vs First-Class Tuple Types
 
-```
-def x: Int = 42
-def y: Int = -100
-```
+Geisha cleanly separates **function parameter arity** from **first-class tuple values**:
 
-### Float
+### Function Types
 
-64-bit double-precision floating point.
-
-```
-def pi: Float = 3.14159
-def e: Float = 2.71828
-```
-
-### String
-
-UTF-8 encoded string.
+Function arrows `->` are **right-associative** and carry explicit parameter arity:
 
 ```
-def greeting: String = "Hello, World!"
+() -> Int                   // 0-parameter function
+Int -> Int                  // 1-parameter function (equivalent to (Int) -> Int)
+(Int, Int) -> Int           // 2-parameter function
+Int -> Int -> Int           // Curried function: Int -> (Int -> Int)
+((Int) -> Int, Int) -> Int  // Higher-order 2-parameter function
 ```
-
-### Bool
-
-Boolean type with two values.
-
-```
-def yes: Bool = true
-def no: Bool = false
-```
-
-### Void
-
-Unit type, used for functions that perform side effects.
-
-```
-def greet(): Void = printLn("Hello")
-```
-
-## Function Types
-
-Function types use the arrow `->`:
-
-```
-Int -> Int              // Function from Int to Int
-Int -> Int -> Int       // Curried function (Int -> (Int -> Int))
-(Int * Int) -> Int      // Function taking a pair
-```
-
-### Multi-parameter Functions
-
-Functions with multiple parameters use product types:
 
 ```
 def add(x: Int, y: Int): Int = x + y
-// Type: Int * Int -> Int
-```
-
-### Higher-Order Functions
-
-Functions can take or return other functions:
-
-```
-def twice(f: Int -> Int, x: Int): Int = f(f(x))
-// Type: (Int -> Int) * Int -> Int
+// Type: (Int, Int) -> Int
 
 def makeAdder(n: Int): Int -> Int = (x) -> n + x
-// Type: Int -> Int -> Int
+// Type: Int -> (Int -> Int)
 ```
 
-## Product Types
+### Tuple Types
 
-Product types (tuples) use `*`:
-
-```
-Int * String            // Pair of Int and String
-Int * Float * Bool      // Triple
-a * b * c               // Polymorphic product
-```
-
-In function types, `*` binds tighter than `->`:
+First-class tuples group two or more heterogeneous values:
 
 ```
-Int * Int -> Bool       // (Int * Int) -> Bool, not Int * (Int -> Bool)
+def origin: (Int, Int) = (0, 0)
+def record: (String, Int, Bool) = ("Alice", 30, true)
+
+def swap(p: (a, b)): (b, a) = match p {
+    (x, y) -> (y, x)
+}
+// Type: forall a b. (a, b) -> (b, a)
 ```
 
-## Type Variables
+Notice the difference:
+- `def f(x: Int, y: Int): Int` has 2 parameters: `(Int, Int) -> Int`, called as `f(1, 2)`.
+- `def g(p: (Int, Int)): Int` has 1 tuple parameter: `((Int, Int)) -> Int`, called as `g((1, 2))`.
 
-Type variables represent generic types:
+## Polymorphism & Type Schemes
 
-```
-a                       // Type variable
-a -> a                  // Same type in and out
-a -> b                  // Potentially different types
-```
-
-### Polymorphism
-
-Functions can work with any type:
+Functions and let-bound values are generalized automatically via Hindley-Milner let-polymorphism:
 
 ```
 def identity(x) = x
 // Inferred: forall a. a -> a
 
 def first(x, y) = x
-// Inferred: forall a b. a * b -> a
+// Inferred: forall a b. (a, b) -> a
 
 def compose(f, g, x) = f(g(x))
-// Inferred: forall a b c. (b -> c) * (a -> b) * a -> c
+// Inferred: forall a b c. (b -> c, a -> b, a) -> c
 ```
 
-## Type Schemes
+## Constrained Polymorphism (Concepts)
 
-A type scheme is a type with universal quantification:
-
-```
-forall a. a -> a
-forall a b. a * b -> a
-forall a b c. (b -> c) * (a -> b) * a -> c
-```
-
-The `forall` binds type variables that can be instantiated to any concrete type.
-
-## Constrained Polymorphism
-
-Type constraints restrict which types a type variable can represent:
+Concept constraints restrict type variables to types implementing an interface:
 
 ```
-forall (Eq a). a * a -> Bool
-forall (Eq a, Ord a). a * a -> Int
-forall (Show a). a -> String
+forall a. (Eq a) => (a, a) -> Bool
+forall a. (Eq a, Show a) => a -> String
+forall k v. (Eq k) => (k, List (k, v)) -> Maybe v
 ```
 
-Multiple constraints on the same variable:
-
-```
-forall (Eq a, Show a). a -> Bool
-```
-
-Constraints on different variables:
-
-```
-forall (Eq a, Show b). a * b -> String
-```
+Built-in arithmetic (`+`, `-`, `*`, `/`, unary `-`), equality (`==`, `!=`), and ordering (`<`, `<=`, `>`, `>=`) operators carry built-in numeric/comparison constraints so invalid expressions like `"a" + "b"` or `true + false` are rejected during type checking.
 
 ## Type Annotations
 
-### On Parameters
-
-```
-def add(x: Int, y: Int) = x + y
-```
-
-### On Return Types
-
-```
-def add(x, y): Int = x + y
-```
-
-### Full Annotations
+Annotations may appear inline on parameters, return types, `let` bindings, or as standalone forward signatures:
 
 ```
 def add(x: Int, y: Int): Int = x + y
+
+equal: forall a. (Eq a) => (a, a) -> Bool
+def equal(x, y) = eq(x, y)
 ```
-
-### On Lambdas
-
-```
-(x: Int) -> x + 1
-(x: Int, y: Float) -> x
-```
-
-### Polymorphic Annotations
-
-```
-def identity(x: a): a = x
-def const(x: a, y: b): a = x
-```
-
-### Constrained Annotations
-
-```
-def equal(x, y): forall (Eq a). a * a -> Bool = eq(x, y)
-```
-
-## Algebraic Data Types
-
-Custom types are defined with `data`:
-
-```
-data Maybe a {
-    Nothing,
-    Just(a)
-}
-```
-
-The type `Maybe` is parameterized by `a`. Constructors have these types:
-
-```
-Nothing : forall a. Maybe a
-Just    : forall a. a -> Maybe a
-```
-
-See [ADT](adt.md) for complete documentation.
-
-## Type Inference
-
-Geisha uses Hindley-Milner type inference. Most types can be inferred automatically:
-
-```
-def add(x, y) = x + y
-// Inferred: forall a. a * a -> a (with numeric constraint)
-
-def identity(x) = x
-// Inferred: forall a. a -> a
-
-def apply(f, x) = f(x)
-// Inferred: forall a b. (a -> b) * a -> b
-```
-
-See [Type Inference](type-inference.md) for algorithm details.
 
 ## Type Aliases
 
-Create type synonyms with `type`:
+Type synonyms are expanded transparently during type checking:
 
 ```
-type IntList = List Int
-type Pair a b = a * b
+type Pair a b = (a, b)
 type Predicate a = a -> Bool
+type IntList = List Int
 ```
 
-## Examples
+Cyclic type aliases are rejected at compile time.
 
-### Polymorphic List Operations
+## Algebraic Data Types
 
-```
-data List a {
-    Nil,
-    Cons(a, List a)
-}
-
-def head(xs: List a): a = match xs {
-    Cons(h, _) -> h
-}
-
-def tail(xs: List a): List a = match xs {
-    Cons(_, t) -> t
-}
-
-def map(f: a -> b, xs: List a): List b = match xs {
-    Nil -> Nil,
-    Cons(h, t) -> Cons(f(h), map(f, t))
-}
-```
-
-### Maybe Type
+Custom sum/product types are defined with `data`:
 
 ```
 data Maybe a {
     Nothing,
-    Just(a)
+    Just(a),
 }
 
-def fromMaybe(default: a, opt: Maybe a): a = match opt {
-    Nothing -> default,
-    Just(x) -> x
-}
-
-def mapMaybe(f: a -> b, opt: Maybe a): Maybe b = match opt {
-    Nothing -> Nothing,
-    Just(x) -> Just(f(x))
-}
+// Nothing : forall a. Maybe a
+// Just    : forall a. a -> Maybe a
 ```
 
-### Either Type
-
-```
-data Either a b {
-    Left(a),
-    Right(b)
-}
-
-def either(f: a -> c, g: b -> c, e: Either a b): c = match e {
-    Left(x) -> f(x),
-    Right(y) -> g(y)
-}
-```
+See [ADT](adt.md) for complete documentation.

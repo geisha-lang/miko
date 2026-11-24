@@ -1,321 +1,90 @@
 # Concepts (Typeclasses)
 
-Concepts provide a way to define interfaces that types can implement. They enable constrained polymorphism, allowing functions to work with any type that implements certain operations.
+Concepts define interfaces that types can implement, enabling constrained polymorphism compiled via zero-overhead static monomorphization.
 
 ## Defining Concepts
 
-### Basic Syntax
-
-```
-concept ConceptName a {
-    method1: Type1,
-    method2: Type2,
-    ...
-}
-```
-
-The type variable `a` represents the type implementing the concept.
-
-### Example: Eq
-
 ```
 concept Eq a {
-    eq: a * a -> Bool
+    eq: (a, a) -> Bool
 }
-```
 
-This defines an `Eq` concept requiring an `eq` method that compares two values of the same type.
-
-### Example: Ord
-
-```
 concept Ord a {
-    compare: a * a -> Int
+    compare: (a, a) -> Int
 }
-```
 
-Returns negative for less-than, zero for equal, positive for greater-than.
-
-### Example: Show
-
-```
 concept Show a {
     show: a -> String
 }
 ```
 
-Converts a value to its string representation.
-
-## Implementing Concepts
-
-### Instance Syntax
+Superclass constraints on concepts are also supported:
 
 ```
-instance ConceptName Type {
-    def method1(args) = body,
-    def method2(args) = body,
-    ...
+concept Ord a (Eq a) => {
+    compare: (a, a) -> Int
 }
 ```
 
-### Example: Eq for Int
+## Implementing Instances
+
+### Concrete Instances
 
 ```
 instance Eq Int {
     def eq(x, y) = x == y
 }
-```
 
-### Example: Eq for Bool
-
-```
 instance Eq Bool {
-    def eq(x, y) = if (x) y else (if (y) false else true)
+    def eq(x, y) = x == y
 }
 ```
 
-### Example: Show for Int
+### Generic & Constrained Instances
 
-```
-instance Show Int {
-    def show(n) = intToString(n)
-}
-```
-
-## Constrained Instances
-
-Instances can require constraints on type parameters:
-
-### Syntax
-
-```
-instance (Constraint a) => ConceptName (Type a) {
-    def method(args) = body
-}
-```
-
-### Example: Eq for Maybe
+Instances for parameterized ADTs can require concept constraints on their type parameters:
 
 ```
 instance (Eq a) => Eq (Maybe a) {
-    def eq(x, y) = match x {
-        Nothing -> match y {
-            Nothing -> true,
-            _ -> false
-        },
-        Just(a) -> match y {
-            Nothing -> false,
-            Just(b) -> eq(a, b)
-        }
+    def eq(x, y) = match (x, y) {
+        (Nothing, Nothing) -> true,
+        (Just(a), Just(b)) -> eq(a, b),
+        _ -> false,
     }
 }
-```
 
-### Example: Eq for List
-
-```
 instance (Eq a) => Eq (List a) {
-    def eq(xs, ys) = match xs {
-        Nil -> match ys {
-            Nil -> true,
-            _ -> false
-        },
-        Cons(x, xt) -> match ys {
-            Nil -> false,
-            Cons(y, yt) -> if (eq(x, y)) eq(xt, yt) else false
-        }
+    def eq(xs, ys) = match (xs, ys) {
+        (Nil, Nil) -> true,
+        (Cons(x, xt), Cons(y, yt)) -> eq(x, y) && eq(xt, yt),
+        _ -> false,
     }
 }
 ```
 
-### Multiple Constraints
+Chained instances compose automatically: with `Eq Int`, `Eq (Maybe a)`, and `Eq (List a)` in scope, `eq` works on `List (Maybe Int)`.
+
+## Writing Constrained Functions
+
+Constraints can be inferred automatically or written explicitly with `forall ... =>`:
 
 ```
-instance (Eq a, Eq b) => Eq (Pair a b) {
-    def eq(p1, p2) = match p1 {
-        Pair(a1, b1) -> match p2 {
-            Pair(a2, b2) -> eq(a1, a2) && eq(b1, b2)
-        }
-    }
-}
-```
-
-## Using Concepts
-
-### Constrained Functions
-
-Functions can require concept constraints:
-
-```
-def equal(x, y): forall (Eq a). a * a -> Bool = eq(x, y)
-
-def notEqual(x, y): forall (Eq a). a * a -> Bool =
-    if (eq(x, y)) false else true
-```
-
-### Type Inference with Constraints
-
-Constraints are inferred when concept methods are used:
-
-```
+// Inferred: forall a. (Eq a) => (a, a, a) -> Bool
 def allEqual(x, y, z) = eq(x, y) && eq(y, z)
-// Inferred: forall (Eq a). a * a * a -> Bool
-```
 
-### Constraint Propagation
-
-Constraints propagate through function calls:
-
-```
-def member(x, lst) = match lst {
-    Nil -> false,
-    Cons(h, t) -> if (eq(x, h)) true else member(x, t)
-}
-// Inferred: forall (Eq a). a * List a -> Bool
-```
-
-## Standard Concepts
-
-### Eq
-
-Equality comparison:
-
-```
-concept Eq a {
-    eq: a * a -> Bool
-}
-
-// Derived operations
-def notEq(x, y): forall (Eq a). a * a -> Bool =
-    if (eq(x, y)) false else true
-```
-
-### Ord
-
-Ordering comparison:
-
-```
-concept Ord a {
-    compare: a * a -> Int
-}
-
-// Derived operations
-def lt(x, y): forall (Ord a). a * a -> Bool = compare(x, y) < 0
-def gt(x, y): forall (Ord a). a * a -> Bool = compare(x, y) > 0
-def le(x, y): forall (Ord a). a * a -> Bool = compare(x, y) <= 0
-def ge(x, y): forall (Ord a). a * a -> Bool = compare(x, y) >= 0
-
-def min(x, y): forall (Ord a). a * a -> a =
-    if (compare(x, y) <= 0) x else y
-
-def max(x, y): forall (Ord a). a * a -> a =
-    if (compare(x, y) >= 0) x else y
-```
-
-### Show
-
-String representation:
-
-```
-concept Show a {
-    show: a -> String
-}
-```
-
-## Examples
-
-### Sorting with Ord
-
-```
-def insert(x, lst): forall (Ord a). a * List a -> List a =
-    match lst {
-        Nil -> Cons(x, Nil),
-        Cons(h, t) ->
-            if (compare(x, h) <= 0) Cons(x, lst)
-            else Cons(h, insert(x, t))
-    }
-
-def insertionSort(lst): forall (Ord a). List a -> List a =
-    match lst {
-        Nil -> Nil,
-        Cons(h, t) -> insert(h, insertionSort(t))
-    }
-```
-
-### Generic Contains
-
-```
-def contains(x, lst): forall (Eq a). a * List a -> Bool =
-    match lst {
-        Nil -> false,
-        Cons(h, t) -> if (eq(x, h)) true else contains(x, t)
-    }
-```
-
-### Remove Duplicates
-
-```
-def nub(lst): forall (Eq a). List a -> List a =
-    match lst {
-        Nil -> Nil,
-        Cons(h, t) -> Cons(h, nub(filter((x) -> notEq(x, h), t)))
-    }
-```
-
-### Generic Lookup
-
-```
-def lookup(key, pairs): forall (Eq k). k * List (Pair k v) -> Maybe v =
+// Explicit constrained signature (including unconstrained type variable `v`)
+def lookup(key, pairs): forall k v. (Eq k) => (k, List (k, v)) -> Maybe v =
     match pairs {
         Nil -> Nothing,
-        Cons(p, rest) -> match p {
-            Pair(k, v) ->
-                if (eq(key, k)) Just(v)
-                else lookup(key, rest)
-        }
+        Cons((k, v), rest) ->
+            if (eq(key, k)) Just(v)
+            else lookup(key, rest),
     }
 ```
 
-## Design Patterns
+## Static Dispatch via Monomorphization
 
-### Default Implementations
-
-Provide default implementations using other methods:
-
-```
-concept Eq a {
-    eq: a * a -> Bool
-}
-
-// notEq as a regular function using eq
-def notEq(x, y): forall (Eq a). a * a -> Bool =
-    if (eq(x, y)) false else true
-```
-
-### Concept Composition
-
-Build on existing concepts:
-
-```
-concept Ord a {
-    compare: a * a -> Int
-}
-
-// Functions that require Ord can use comparison
-def sort(lst): forall (Ord a). List a -> List a = ...
-def binarySearch(x, arr): forall (Ord a). a * Array a -> Maybe Int = ...
-```
-
-### Instance Chaining
-
-Instances can depend on other instances:
-
-```
-instance Eq Int { def eq(x, y) = x == y }
-
-instance (Eq a) => Eq (Maybe a) { ... }
-
-instance (Eq a) => Eq (List a) { ... }
-
-// Now Eq (List (Maybe Int)) is available!
-```
+Unlike Haskell's runtime dictionary passing, Geisha resolves all concept method calls statically during monomorphization:
+- Calling `eq(1, 2)` resolves directly to `Eq Int`'s `eq` implementation.
+- Calling a constrained generic function `allEqual(1, 1, 1)` specializes `allEqual_Int` and rewrites its internal `eq` calls to `Eq Int`'s `eq`.
+- Calling `eq` on a type with no matching instance produces a compile-time `NoInstance` type error.

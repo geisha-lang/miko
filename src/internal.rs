@@ -1,22 +1,12 @@
-use std::string::*;
-
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::ops::DerefMut;
-
-use std::iter::IntoIterator;
-use std::iter::DoubleEndedIterator;
-
 use crate::utils::*;
 use crate::types::*;
-
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct VarDecl(pub Id, pub Scheme);
 
 impl VarDecl {
     pub fn name(&self) -> Id {
-        self.0.clone()
+        self.0
     }
 }
 
@@ -24,65 +14,67 @@ impl VarDecl {
 pub enum Lit {
     Int(i32),
     Float(f64),
+    Char(u8),
     Str(String),
     Bool(bool),
+    Unit,
 }
 
 impl Lit {
     pub fn lit_type(&self) -> Type {
-        use self::Lit::*;
-        let ty_str = match *self {
-            Lit::Int(_) => "Int",
-            Lit::Float(_) => "Float",
-            Lit::Str(_) => "String",
-            Lit::Bool(_) => "Bool",
-        };
-
-        Type::Con(ty_str.to_string())
+        match *self {
+            Lit::Int(_) => Type::Con("Int".to_string()),
+            Lit::Float(_) => Type::Con("Float".to_string()),
+            Lit::Char(_) => Type::Con("Char".to_string()),
+            Lit::Str(_) => Type::Con("String".to_string()),
+            Lit::Bool(_) => Type::Con("Bool".to_string()),
+            Lit::Unit => Type::Void,
+        }
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
 pub enum BinOp {
-    /// The `+` operator (addition)
+    /// `+`
     Add,
-    /// The `-` operator (subtraction)
+    /// `-`
     Sub,
-    /// The `*` operator (multiplication)
+    /// `*`
     Mul,
-    /// The `/` operator (division)
+    /// `/`
     Div,
-    /// The `%` operator (modulus)
+    /// `%`
     Rem,
-    /// The `&&` operator (logical and)
+    /// `&&`
     And,
-    /// The `||` operator (logical or)
+    /// `||`
     Or,
-    /// The `^` operator (bitwise xor)
+    /// `^`
     BitXor,
-    /// The `&` operator (bitwise and)
+    /// `&`
     BitAnd,
-    /// The `|` operator (bitwise or)
+    /// `|`
     BitOr,
-    /// The `<<` operator (shift left)
+    /// `<<`
     Shl,
-    /// The `>>` operator (shift right)
+    /// `>>`
     Shr,
-    /// The `==` operator (equality)
+    /// `==`
     Eq,
-    /// The `<` operator (less than)
+    /// `<`
     Lt,
-    /// The `<=` operator (less than or equal to)
+    /// `<=`
     Le,
-    /// The `!=` operator (not equal to)
+    /// `!=`
     Ne,
-    /// The `>=` operator (greater than or equal to)
+    /// `>=`
     Ge,
-    /// The `>` operator (greater than)
+    /// `>`
     Gt,
     /// `.`
     Dot,
 }
+
 impl BinOp {
     pub fn as_str(&self) -> &'static str {
         use self::BinOp::*;
@@ -108,6 +100,7 @@ impl BinOp {
             Dot => ".",
         }
     }
+
     pub fn take(op_str: &str) -> BinOp {
         use self::BinOp::*;
         match op_str {
@@ -122,16 +115,18 @@ impl BinOp {
             ">=" => Ge,
             ">" => Gt,
             "==" => Eq,
-            _ => unreachable!(),
+            "&&" => And,
+            "||" => Or,
+            _ => unreachable!("Unknown binary operator: {}", op_str),
         }
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
 pub enum UnOp {
-    /// The `!` operator for logical inversion
+    /// `!` logical NOT
     Not,
-    /// The `-` operator for negation
+    /// `-` arithmetic negation
     Neg,
 }
 

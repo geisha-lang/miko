@@ -1,59 +1,30 @@
-/// Escape analysis for stack allocation optimization
-///
-/// This module performs interprocedural escape analysis to determine which
-/// allocations (closures and ADTs) can safely be stack-allocated instead of
-/// using gc_alloc().
-///
-/// A value escapes (must be heap-allocated) if:
-/// 1. Captured by a closure (pointer captured, pointee must survive)
-/// 2. Returned from function (in tail position)
-/// 3. Stored in an escaping ADT
-/// 4. Passed to an escaping parameter of a called function
-/// 5. Is a recursive ADT (can grow unboundedly)
-/// 6. Size > threshold
+/// Interprocedural + fixed-point intraprocedural escape analysis for safe stack allocation.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 
 use crate::core::term::*;
 use crate::internal::VarDecl;
-use crate::types::{AdtRegistry, Type, Scheme};
+use crate::types::{compute_recursive_adts, AdtRegistry};
 use crate::utils::{Id, P};
 
-/// Allocation strategy for a value
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocationStrategy {
-    /// Allocate on stack (fast, no GC overhead)
     Stack,
-    /// Allocate on heap via gc_alloc (required for escaping values)
     Heap,
 }
 
-/// How a parameter escapes from its function
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParamEscape {
-    /// Parameter does not escape
     NoEscape,
-    /// Parameter is captured by a closure created in this function
     EscapesCapture,
-    /// Parameter is returned from the function
     EscapesReturn,
-    /// Parameter is stored in a heap-allocated ADT
     EscapesStore,
 }
 
-impl ParamEscape {
-    fn escapes(&self) -> bool {
-        !matches!(self, ParamEscape::NoEscape)
-    }
-}
-
-/// Escape information for a single function
 #[derive(Clone, Debug)]
 pub struct FunctionEscapeInfo {
-    /// How each parameter escapes (indexed by parameter position)
     pub param_escapes: Vec<ParamEscape>,
-    /// Allocation strategy for local bindings (by binding Id)
     pub allocations: HashMap<Id, AllocationStrategy>,
 }
 
@@ -66,83 +37,61 @@ impl FunctionEscapeInfo {
     }
 }
 
-/// Global escape analysis result
 #[derive(Clone, Debug)]
 pub struct EscapeAnalysis {
-    /// Per-function escape information
     pub functions: HashMap<Id, FunctionEscapeInfo>,
-    /// Set of recursive ADT names (always heap-allocated)
     recursive_adts: HashSet<String>,
-    /// Size threshold for stack allocation (bytes)
+    #[allow(dead_code)]
     size_threshold: usize,
 }
 
 impl EscapeAnalysis {
-    /// Get allocation strategy for a binding in a function
     pub fn get_strategy(&self, func_id: &Id, binding_id: &Id) -> AllocationStrategy {
         self.functions
             .get(func_id)
             .and_then(|info| info.allocations.get(binding_id))
             .copied()
-            .unwrap_or(AllocationStrategy::Heap) // Default to heap if unknown
+            .unwrap_or(AllocationStrategy::Heap)
     }
 
-    /// Check if an ADT is recursive
     pub fn is_recursive_adt(&self, adt_name: &str) -> bool {
         self.recursive_adts.contains(adt_name)
     }
 }
 
-/// Perform escape analysis on all functions
 pub fn analyze_all(
     functions: &HashMap<Id, P<FunDef>>,
     adt_registry: &AdtRegistry,
     size_threshold: usize,
 ) -> EscapeAnalysis {
-    // Build set of recursive ADTs
-    let recursive_adts: HashSet<String> = adt_registry
-        .iter()
-        .filter(|(_, info)| info.is_recursive())
-        .map(|(name, _)| name.clone())
-        .collect();
+    // Detect both self-recursive and mutually recursive ADTs via graph reachability
+    let recursive_adts = compute_recursive_adts(adt_registry);
 
-    // Build call graph for interprocedural analysis
-    let call_graph = build_call_graph(functions);
-
-    // Phase 1: Compute parameter escape properties (bottom-up)
+    // Phase 1: Interprocedural parameter escape fixed-point
     let mut param_escapes: HashMap<Id, Vec<ParamEscape>> = HashMap::new();
-
-    // Initialize all functions with NoEscape for all parameters
     for (func_id, func_def) in functions {
-        let param_count = func_def.parameters().len();
-        param_escapes.insert(*func_id, vec![ParamEscape::NoEscape; param_count]);
+        param_escapes.insert(
+            *func_id,
+            vec![ParamEscape::NoEscape; func_def.parameters().len()],
+        );
     }
 
-    // Iterate until fixed point (simple worklist algorithm)
     let mut changed = true;
     let mut iterations = 0;
-    const MAX_ITERATIONS: usize = 100;
-
-    while changed && iterations < MAX_ITERATIONS {
+    while changed && iterations < 100 {
         changed = false;
         iterations += 1;
-
         for (func_id, func_def) in functions {
-            let old_escapes = param_escapes.get(func_id).cloned().unwrap_or_default();
-            let new_escapes = analyze_param_escapes(
-                func_def,
-                &param_escapes,
-                &recursive_adts,
-            );
-
-            if new_escapes != old_escapes {
+            let old = param_escapes.get(func_id).cloned().unwrap_or_default();
+            let next = analyze_param_escapes(func_def, &param_escapes, &recursive_adts);
+            if next != old {
                 changed = true;
-                param_escapes.insert(*func_id, new_escapes);
+                param_escapes.insert(*func_id, next);
             }
         }
     }
 
-    // Phase 2: Determine local allocation strategies
+    // Phase 2: Intraprocedural fixed-point allocation analysis
     let mut analysis = EscapeAnalysis {
         functions: HashMap::new(),
         recursive_adts,
@@ -150,91 +99,50 @@ pub fn analyze_all(
     };
 
     for (func_id, func_def) in functions {
-        let func_param_escapes = param_escapes.get(func_id).cloned().unwrap_or_default();
-        let func_info = analyze_local_allocations(
+        let f_pes = param_escapes.get(func_id).cloned().unwrap_or_default();
+        let info = analyze_local_allocations(
             func_def,
-            &func_param_escapes,
+            &f_pes,
             &param_escapes,
             &analysis.recursive_adts,
-            size_threshold,
         );
-        analysis.functions.insert(*func_id, func_info);
+        analysis.functions.insert(*func_id, info);
     }
 
     analysis
 }
 
-/// Build a simple call graph: function -> set of called functions
-fn build_call_graph(functions: &HashMap<Id, P<FunDef>>) -> HashMap<Id, HashSet<Id>> {
-    let mut graph: HashMap<Id, HashSet<Id>> = HashMap::new();
-
-    for (func_id, func_def) in functions {
-        let mut callees = HashSet::new();
-        collect_callees(func_def.body(), &mut callees);
-        graph.insert(*func_id, callees);
-    }
-
-    graph
-}
-
-/// Collect all function Ids called from a term
-fn collect_callees(term: &TaggedTerm, callees: &mut HashSet<Id>) {
+fn collect_vars_in_expr(term: &TaggedTerm, out: &mut HashSet<Id>) {
     match term.body() {
-        Term::ApplyDir(VarDecl(id, _), args) => {
-            callees.insert(*id);
-            for arg in args {
-                collect_callees(arg.deref(), callees);
-            }
+        Term::Var(id) => {
+            out.insert(*id);
         }
-        Term::ApplyCls(callee, args) => {
-            collect_callees(callee.deref(), callees);
-            for arg in args {
-                collect_callees(arg.deref(), callees);
-            }
-        }
-        Term::Let(_, val, body) => {
-            collect_callees(val.deref(), callees);
-            collect_callees(body.deref(), callees);
-        }
-        Term::MakeCls(_, _, body) => {
-            collect_callees(body.deref(), callees);
-        }
-        Term::If(c, t, f) => {
-            collect_callees(c.deref(), callees);
-            collect_callees(t.deref(), callees);
-            collect_callees(f.deref(), callees);
-        }
-        Term::Binary(_, l, r) => {
-            collect_callees(l.deref(), callees);
-            collect_callees(r.deref(), callees);
-        }
-        Term::Unary(_, e) => {
-            collect_callees(e.deref(), callees);
-        }
-        Term::Match(scrutinee, arms) => {
-            collect_callees(scrutinee.deref(), callees);
-            for (_, _, body) in arms {
-                collect_callees(body.deref(), callees);
+        Term::Tuple(es) | Term::Block(es) => {
+            for e in es {
+                collect_vars_in_expr(e, out);
             }
         }
         Term::MakeData { fields, .. } => {
             for f in fields {
-                collect_callees(f.deref(), callees);
+                collect_vars_in_expr(f, out);
             }
         }
-        Term::GetTag(node) | Term::GetField(node, _) => {
-            collect_callees(node.deref(), callees);
+        Term::If(_, t, f) => {
+            collect_vars_in_expr(t, out);
+            collect_vars_in_expr(f, out);
         }
-        Term::Block(items) | Term::List(items) => {
-            for item in items {
-                collect_callees(item.deref(), callees);
+        Term::Match(_, arms) => {
+            for (_, _, b) in arms {
+                collect_vars_in_expr(b, out);
             }
         }
-        Term::Lit(_) | Term::Var(_) => {}
+        Term::Let(_, _, b) | Term::MakeCls(_, _, b) => {
+            collect_vars_in_expr(b, out);
+        }
+        _ => {}
     }
 }
 
-/// Analyze how parameters escape from a function
 fn analyze_param_escapes(
     func_def: &FunDef,
     known_escapes: &HashMap<Id, Vec<ParamEscape>>,
@@ -242,28 +150,23 @@ fn analyze_param_escapes(
 ) -> Vec<ParamEscape> {
     let params = func_def.parameters();
     let mut escapes = vec![ParamEscape::NoEscape; params.len()];
-
-    // Build param id -> index mapping
     let param_ids: HashMap<Id, usize> = params
         .iter()
         .enumerate()
         .map(|(i, VarDecl(id, _))| (*id, i))
         .collect();
 
-    // Analyze the body
     analyze_param_escapes_in_term(
         func_def.body(),
         &param_ids,
         &mut escapes,
         known_escapes,
         recursive_adts,
-        true, // Initial position is tail
+        true,
     );
-
     escapes
 }
 
-/// Analyze parameter escapes in a term
 fn analyze_param_escapes_in_term(
     term: &TaggedTerm,
     param_ids: &HashMap<Id, usize>,
@@ -274,165 +177,311 @@ fn analyze_param_escapes_in_term(
 ) {
     match term.body() {
         Term::Var(id) => {
-            // If a parameter is in tail position, it escapes via return
             if in_tail {
                 if let Some(&idx) = param_ids.get(id) {
                     escapes[idx] = ParamEscape::EscapesReturn;
                 }
             }
         }
+        Term::Tuple(elems) => {
+            for el in elems {
+                analyze_param_escapes_in_term(
+                    el.deref(),
+                    param_ids,
+                    escapes,
+                    known_escapes,
+                    recursive_adts,
+                    in_tail,
+                );
+            }
+        }
         Term::MakeCls(_, cls, body) => {
-            // Parameters captured by closure escape
             for fv_id in cls.fv() {
                 if let Some(&idx) = param_ids.get(&fv_id) {
-                    // Check if the parameter is a pointer type that would escape
-                    // For now, conservatively mark all captured params as escaping
                     if escapes[idx] == ParamEscape::NoEscape {
                         escapes[idx] = ParamEscape::EscapesCapture;
                     }
                 }
             }
-            analyze_param_escapes_in_term(body.deref(), param_ids, escapes, known_escapes, recursive_adts, in_tail);
+            analyze_param_escapes_in_term(
+                body.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                in_tail,
+            );
         }
         Term::Let(_, val, body) => {
-            // Value is not in tail position
-            analyze_param_escapes_in_term(val.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
-            // Body inherits tail position
-            analyze_param_escapes_in_term(body.deref(), param_ids, escapes, known_escapes, recursive_adts, in_tail);
+            analyze_param_escapes_in_term(
+                val.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
+            analyze_param_escapes_in_term(
+                body.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                in_tail,
+            );
         }
         Term::ApplyDir(VarDecl(callee_id, _), args) => {
-            // Check if arguments are passed to escaping parameters
             if let Some(callee_escapes) = known_escapes.get(callee_id) {
                 for (i, arg) in args.iter().enumerate() {
-                    if let Term::Var(arg_id) = arg.body() {
-                        if let Some(&param_idx) = param_ids.get(arg_id) {
+                    let mut arg_vars = HashSet::new();
+                    collect_vars_in_expr(arg, &mut arg_vars);
+                    for avid in arg_vars {
+                        if let Some(&param_idx) = param_ids.get(&avid) {
                             if i < callee_escapes.len() {
                                 match callee_escapes[i] {
                                     ParamEscape::EscapesCapture | ParamEscape::EscapesStore => {
-                                        // Arg escapes unconditionally
-                                        if escapes[param_idx] == ParamEscape::NoEscape {
-                                            escapes[param_idx] = ParamEscape::EscapesStore;
-                                        }
+                                        escapes[param_idx] = ParamEscape::EscapesStore;
                                     }
-                                    ParamEscape::EscapesReturn => {
-                                        // Arg escapes only if call result escapes
-                                        if in_tail && escapes[param_idx] == ParamEscape::NoEscape {
+                                    ParamEscape::EscapesReturn if in_tail => {
+                                        if escapes[param_idx] == ParamEscape::NoEscape {
                                             escapes[param_idx] = ParamEscape::EscapesReturn;
                                         }
                                     }
-                                    ParamEscape::NoEscape => {}
+                                    _ => {}
                                 }
                             }
                         }
                     }
-                    // Recurse into non-variable args
-                    analyze_param_escapes_in_term(arg.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+                    analyze_param_escapes_in_term(
+                        arg.deref(),
+                        param_ids,
+                        escapes,
+                        known_escapes,
+                        recursive_adts,
+                        false,
+                    );
                 }
             } else {
-                // Unknown callee - conservatively analyze args
                 for arg in args {
-                    analyze_param_escapes_in_term(arg.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+                    analyze_param_escapes_in_term(
+                        arg.deref(),
+                        param_ids,
+                        escapes,
+                        known_escapes,
+                        recursive_adts,
+                        true,
+                    );
                 }
             }
         }
         Term::ApplyCls(callee, args) => {
-            // Closure call - can't know param escapes, analyze args conservatively
-            analyze_param_escapes_in_term(callee.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+            analyze_param_escapes_in_term(
+                callee.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
             for arg in args {
-                analyze_param_escapes_in_term(arg.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+                // Unknown closure may return or store its argument
+                analyze_param_escapes_in_term(
+                    arg.deref(),
+                    param_ids,
+                    escapes,
+                    known_escapes,
+                    recursive_adts,
+                    true,
+                );
             }
         }
         Term::If(c, t, f) => {
-            analyze_param_escapes_in_term(c.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
-            // Both branches inherit tail position
-            analyze_param_escapes_in_term(t.deref(), param_ids, escapes, known_escapes, recursive_adts, in_tail);
-            analyze_param_escapes_in_term(f.deref(), param_ids, escapes, known_escapes, recursive_adts, in_tail);
+            analyze_param_escapes_in_term(
+                c.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
+            analyze_param_escapes_in_term(
+                t.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                in_tail,
+            );
+            analyze_param_escapes_in_term(
+                f.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                in_tail,
+            );
         }
         Term::Binary(_, l, r) => {
-            analyze_param_escapes_in_term(l.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
-            analyze_param_escapes_in_term(r.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+            analyze_param_escapes_in_term(
+                l.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
+            analyze_param_escapes_in_term(
+                r.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
         }
-        Term::Unary(_, e) => {
-            analyze_param_escapes_in_term(e.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+        Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
+            analyze_param_escapes_in_term(
+                e.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
         }
         Term::Match(scrutinee, arms) => {
-            analyze_param_escapes_in_term(scrutinee.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
-            for (_, _, body) in arms {
-                // All arms inherit tail position
-                analyze_param_escapes_in_term(body.deref(), param_ids, escapes, known_escapes, recursive_adts, in_tail);
-            }
-        }
-        Term::MakeData { type_name, fields, .. } => {
-            let is_recursive = recursive_adts.contains(type_name);
-            for field in fields {
-                if let Term::Var(fid) = field.body() {
-                    if let Some(&idx) = param_ids.get(fid) {
-                        // If stored in recursive ADT or in tail position, escapes
-                        if is_recursive || in_tail {
-                            if escapes[idx] == ParamEscape::NoEscape {
-                                escapes[idx] = ParamEscape::EscapesStore;
-                            }
+            // Note: matching an ADT and returning one of its extracted fields means a component of scrutinee may escape!
+            if in_tail {
+                let mut svars = HashSet::new();
+                collect_vars_in_expr(scrutinee, &mut svars);
+                for sv in svars {
+                    if let Some(&idx) = param_ids.get(&sv) {
+                        if escapes[idx] == ParamEscape::NoEscape {
+                            escapes[idx] = ParamEscape::EscapesReturn;
                         }
                     }
                 }
-                analyze_param_escapes_in_term(field.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+            }
+            analyze_param_escapes_in_term(
+                scrutinee.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
+            for (_, guard, body) in arms {
+                if let Some(ref g) = guard {
+                    analyze_param_escapes_in_term(
+                        g.deref(),
+                        param_ids,
+                        escapes,
+                        known_escapes,
+                        recursive_adts,
+                        false,
+                    );
+                }
+                analyze_param_escapes_in_term(
+                    body.deref(),
+                    param_ids,
+                    escapes,
+                    known_escapes,
+                    recursive_adts,
+                    in_tail,
+                );
             }
         }
-        Term::GetTag(node) | Term::GetField(node, _) => {
-            analyze_param_escapes_in_term(node.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
+        Term::MakeData {
+            type_name, fields, ..
+        } => {
+            let is_rec = recursive_adts.contains(type_name);
+            for field in fields {
+                analyze_param_escapes_in_term(
+                    field.deref(),
+                    param_ids,
+                    escapes,
+                    known_escapes,
+                    recursive_adts,
+                    is_rec || in_tail,
+                );
+            }
         }
         Term::Block(items) => {
             for (i, item) in items.iter().enumerate() {
-                let is_last = i == items.len() - 1;
-                analyze_param_escapes_in_term(item.deref(), param_ids, escapes, known_escapes, recursive_adts, in_tail && is_last);
+                let is_last = i + 1 == items.len();
+                analyze_param_escapes_in_term(
+                    item.deref(),
+                    param_ids,
+                    escapes,
+                    known_escapes,
+                    recursive_adts,
+                    in_tail && is_last,
+                );
             }
         }
-        Term::List(items) => {
-            for item in items {
-                analyze_param_escapes_in_term(item.deref(), param_ids, escapes, known_escapes, recursive_adts, false);
-            }
-        }
-        Term::Lit(_) => {}
+        Term::Lit(_) | Term::GlobalVar(_) => {}
     }
 }
 
-/// Analyze local allocations in a function to determine stack vs heap
+#[derive(Clone, Debug)]
+struct AllocInfo {
+    is_recursive_adt: bool,
+    /// Local bindings directly stored inside this allocation (fields of `MakeData` or captured vars of `MakeCls`)
+    contained_vars: Vec<Id>,
+}
+
 fn analyze_local_allocations(
     func_def: &FunDef,
     param_escapes: &[ParamEscape],
     all_param_escapes: &HashMap<Id, Vec<ParamEscape>>,
     recursive_adts: &HashSet<String>,
-    size_threshold: usize,
 ) -> FunctionEscapeInfo {
-    let param_count = func_def.parameters().len();
-    let mut info = FunctionEscapeInfo::new(param_count);
+    let mut info = FunctionEscapeInfo::new(func_def.parameters().len());
     info.param_escapes = param_escapes.to_vec();
 
-    // Collect all local allocations (MakeCls, MakeData bindings)
     let mut allocations: HashMap<Id, AllocInfo> = HashMap::new();
     collect_allocations(func_def.body(), &mut allocations, recursive_adts);
 
-    // Track which allocations escape
     let mut escaping: HashSet<Id> = HashSet::new();
+    for (id, ainfo) in &allocations {
+        if ainfo.is_recursive_adt {
+            escaping.insert(*id);
+        }
+    }
 
-    // Analyze escaping
+    // Initial escape seed pass
     analyze_allocation_escapes(
         func_def.body(),
         &allocations,
         &mut escaping,
         all_param_escapes,
         recursive_adts,
-        true, // start in tail position
+        true,
     );
 
-    // Determine strategies
-    for (id, alloc_info) in &allocations {
+    // Fixed-point containment propagation:
+    // If outer allocation `outer_id` escapes, EVERY allocation `inner_id` stored in its fields or captured in its closure MUST ALSO escape!
+    loop {
+        let prev_len = escaping.len();
+        let current_escaping: Vec<Id> = escaping.iter().copied().collect();
+        for outer_id in current_escaping {
+            if let Some(ainfo) = allocations.get(&outer_id) {
+                for &inner_id in &ainfo.contained_vars {
+                    if allocations.contains_key(&inner_id) {
+                        escaping.insert(inner_id);
+                    }
+                }
+            }
+        }
+        if escaping.len() == prev_len {
+            break;
+        }
+    }
+
+    for (id, _) in &allocations {
         let strategy = if escaping.contains(id) {
             AllocationStrategy::Heap
-        } else if alloc_info.is_recursive_adt {
-            AllocationStrategy::Heap // Recursive ADTs always on heap
         } else {
-            // Could be stack-allocated
             AllocationStrategy::Stack
         };
         info.allocations.insert(*id, strategy);
@@ -441,18 +490,6 @@ fn analyze_local_allocations(
     info
 }
 
-/// Information about a local allocation
-#[derive(Clone, Debug)]
-struct AllocInfo {
-    /// Is this a MakeCls (closure)?
-    is_closure: bool,
-    /// Is this a recursive ADT?
-    is_recursive_adt: bool,
-    /// Free variables (for closures)
-    free_vars: Vec<Id>,
-}
-
-/// Collect all allocation sites in a term
 fn collect_allocations(
     term: &TaggedTerm,
     allocations: &mut HashMap<Id, AllocInfo>,
@@ -460,22 +497,31 @@ fn collect_allocations(
 ) {
     match term.body() {
         Term::MakeCls(VarDecl(id, _), cls, body) => {
-            allocations.insert(*id, AllocInfo {
-                is_closure: true,
-                is_recursive_adt: false,
-                free_vars: cls.fv(),
-            });
+            allocations.insert(
+                *id,
+                AllocInfo {
+                    is_recursive_adt: false,
+                    contained_vars: cls.fv(),
+                },
+            );
             collect_allocations(body.deref(), allocations, recursive_adts);
         }
         Term::Let(VarDecl(id, _), val, body) => {
-            // Check if val is MakeData
-            if let Term::MakeData { type_name, .. } = val.body() {
-                let is_recursive = recursive_adts.contains(type_name);
-                allocations.insert(*id, AllocInfo {
-                    is_closure: false,
-                    is_recursive_adt: is_recursive,
-                    free_vars: vec![],
-                });
+            if let Term::MakeData {
+                type_name, fields, ..
+            } = val.body()
+            {
+                let mut contained = HashSet::new();
+                for f in fields {
+                    collect_vars_in_expr(f, &mut contained);
+                }
+                allocations.insert(
+                    *id,
+                    AllocInfo {
+                        is_recursive_adt: recursive_adts.contains(type_name),
+                        contained_vars: contained.into_iter().collect(),
+                    },
+                );
             }
             collect_allocations(val.deref(), allocations, recursive_adts);
             collect_allocations(body.deref(), allocations, recursive_adts);
@@ -489,41 +535,38 @@ fn collect_allocations(
             collect_allocations(l.deref(), allocations, recursive_adts);
             collect_allocations(r.deref(), allocations, recursive_adts);
         }
-        Term::Unary(_, e) => {
+        Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
             collect_allocations(e.deref(), allocations, recursive_adts);
         }
         Term::Match(scrutinee, arms) => {
             collect_allocations(scrutinee.deref(), allocations, recursive_adts);
-            for (_, _, body) in arms {
+            for (_, guard, body) in arms {
+                if let Some(ref g) = guard {
+                    collect_allocations(g.deref(), allocations, recursive_adts);
+                }
                 collect_allocations(body.deref(), allocations, recursive_adts);
             }
         }
-        Term::ApplyDir(_, args) | Term::ApplyCls(_, args) => {
-            if let Term::ApplyCls(callee, _) = term.body() {
-                collect_allocations(callee.deref(), allocations, recursive_adts);
-            }
+        Term::ApplyDir(_, args) => {
             for arg in args {
                 collect_allocations(arg.deref(), allocations, recursive_adts);
             }
         }
-        Term::MakeData { fields, .. } => {
+        Term::ApplyCls(callee, args) => {
+            collect_allocations(callee.deref(), allocations, recursive_adts);
+            for arg in args {
+                collect_allocations(arg.deref(), allocations, recursive_adts);
+            }
+        }
+        Term::MakeData { fields, .. } | Term::Tuple(fields) | Term::Block(fields) => {
             for f in fields {
                 collect_allocations(f.deref(), allocations, recursive_adts);
             }
         }
-        Term::GetTag(node) | Term::GetField(node, _) => {
-            collect_allocations(node.deref(), allocations, recursive_adts);
-        }
-        Term::Block(items) | Term::List(items) => {
-            for item in items {
-                collect_allocations(item.deref(), allocations, recursive_adts);
-            }
-        }
-        Term::Lit(_) | Term::Var(_) => {}
+        Term::Lit(_) | Term::Var(_) | Term::GlobalVar(_) => {}
     }
 }
 
-/// Analyze which allocations escape
 fn analyze_allocation_escapes(
     term: &TaggedTerm,
     allocations: &HashMap<Id, AllocInfo>,
@@ -534,133 +577,268 @@ fn analyze_allocation_escapes(
 ) {
     match term.body() {
         Term::Var(id) => {
-            // If an allocation is in tail position, it escapes
             if in_tail && allocations.contains_key(id) {
                 escaping.insert(*id);
             }
         }
-        Term::MakeCls(VarDecl(cls_id, _), cls, body) => {
-            // Check if the closure itself escapes (in tail position of body)
-            // Values captured by the closure must be on heap if they're pointer types
+        Term::Tuple(elems) => {
+            for el in elems {
+                analyze_allocation_escapes(
+                    el.deref(),
+                    allocations,
+                    escaping,
+                    all_param_escapes,
+                    recursive_adts,
+                    in_tail,
+                );
+            }
+        }
+        Term::MakeCls(_, cls, body) => {
             for fv_id in cls.fv() {
                 if allocations.contains_key(&fv_id) {
-                    // Captured allocation escapes
                     escaping.insert(fv_id);
                 }
             }
-            analyze_allocation_escapes(body.deref(), allocations, escaping, all_param_escapes, recursive_adts, in_tail);
+            analyze_allocation_escapes(
+                body.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                in_tail,
+            );
         }
         Term::Let(VarDecl(var_id, _), val, body) => {
-            // Check if this binding is for a MakeData
-            if let Term::MakeData { type_name, fields, .. } = val.body() {
-                let is_recursive = recursive_adts.contains(type_name);
-                if is_recursive {
-                    // Recursive ADT always escapes
-                    escaping.insert(*var_id);
+            // Note: if `val` is a `MakeData` directly bound to `var_id`, its fields only escape if `var_id` escapes
+            // (handled by fixed-point propagation over `contained_vars`!).
+            // Any anonymous `MakeData` nested inside sub-expressions of `val` is heap-allocated, so its fields DO escape!
+            if let Term::MakeData { fields, .. } = val.body() {
+                for f in fields {
+                    analyze_allocation_escapes(
+                        f.deref(),
+                        allocations,
+                        escaping,
+                        all_param_escapes,
+                        recursive_adts,
+                        false,
+                    );
                 }
-                // Check if any field is an escaping allocation
-                for field in fields {
-                    if let Term::Var(fid) = field.body() {
-                        if escaping.contains(fid) {
-                            // This ADT contains an escaping value, so it must escape too
-                            escaping.insert(*var_id);
-                        }
+            } else {
+                // If `val` aliases or extracts an existing allocation (e.g. `let b = a`), conservatively mark if `b` is used
+                let mut aliased = HashSet::new();
+                collect_vars_in_expr(val, &mut aliased);
+                for aid in aliased {
+                    if allocations.contains_key(&aid) {
+                        escaping.insert(aid);
                     }
                 }
+                analyze_allocation_escapes(
+                    val.deref(),
+                    allocations,
+                    escaping,
+                    all_param_escapes,
+                    recursive_adts,
+                    false,
+                );
             }
-            analyze_allocation_escapes(val.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
-            analyze_allocation_escapes(body.deref(), allocations, escaping, all_param_escapes, recursive_adts, in_tail);
+            let _ = var_id;
+            analyze_allocation_escapes(
+                body.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                in_tail,
+            );
         }
         Term::ApplyDir(VarDecl(callee_id, _), args) => {
-            // Check if arguments passed to escaping parameters
             if let Some(callee_escapes) = all_param_escapes.get(callee_id) {
                 for (i, arg) in args.iter().enumerate() {
-                    if let Term::Var(arg_id) = arg.body() {
-                        if allocations.contains_key(arg_id) && i < callee_escapes.len() {
-                            match callee_escapes[i] {
-                                ParamEscape::EscapesCapture | ParamEscape::EscapesStore => {
-                                    escaping.insert(*arg_id);
-                                }
-                                ParamEscape::EscapesReturn => {
-                                    // Only escapes if call result escapes (i.e., in tail)
-                                    if in_tail {
-                                        escaping.insert(*arg_id);
-                                    }
-                                }
-                                ParamEscape::NoEscape => {}
+                    let arg_escapes = if i < callee_escapes.len() {
+                        match callee_escapes[i] {
+                            ParamEscape::EscapesCapture | ParamEscape::EscapesStore => true,
+                            ParamEscape::EscapesReturn => in_tail,
+                            ParamEscape::NoEscape => false,
+                        }
+                    } else {
+                        true
+                    };
+                    if arg_escapes {
+                        let mut avars = HashSet::new();
+                        collect_vars_in_expr(arg, &mut avars);
+                        for av in avars {
+                            if allocations.contains_key(&av) {
+                                escaping.insert(av);
                             }
                         }
                     }
-                    analyze_allocation_escapes(arg.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+                    analyze_allocation_escapes(
+                        arg.deref(),
+                        allocations,
+                        escaping,
+                        all_param_escapes,
+                        recursive_adts,
+                        arg_escapes,
+                    );
                 }
             } else {
-                // Unknown callee, analyze args conservatively
+                // Unknown external/runtime function: mark any passed allocations as escaping
                 for arg in args {
-                    analyze_allocation_escapes(arg.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+                    analyze_allocation_escapes(
+                        arg.deref(),
+                        allocations,
+                        escaping,
+                        all_param_escapes,
+                        recursive_adts,
+                        true,
+                    );
                 }
             }
         }
         Term::ApplyCls(callee, args) => {
-            // Closure call - can't know param escapes, but analyze subterms
-            analyze_allocation_escapes(callee.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+            analyze_allocation_escapes(
+                callee.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
+            );
             for arg in args {
-                // Conservative: assume args to unknown closure might escape
-                if let Term::Var(arg_id) = arg.body() {
-                    if allocations.contains_key(arg_id) {
-                        escaping.insert(*arg_id);
-                    }
-                }
-                analyze_allocation_escapes(arg.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+                analyze_allocation_escapes(
+                    arg.deref(),
+                    allocations,
+                    escaping,
+                    all_param_escapes,
+                    recursive_adts,
+                    true,
+                );
             }
         }
         Term::If(c, t, f) => {
-            analyze_allocation_escapes(c.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
-            analyze_allocation_escapes(t.deref(), allocations, escaping, all_param_escapes, recursive_adts, in_tail);
-            analyze_allocation_escapes(f.deref(), allocations, escaping, all_param_escapes, recursive_adts, in_tail);
+            analyze_allocation_escapes(
+                c.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
+            );
+            analyze_allocation_escapes(
+                t.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                in_tail,
+            );
+            analyze_allocation_escapes(
+                f.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                in_tail,
+            );
         }
         Term::Binary(_, l, r) => {
-            analyze_allocation_escapes(l.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
-            analyze_allocation_escapes(r.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+            analyze_allocation_escapes(
+                l.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
+            );
+            analyze_allocation_escapes(
+                r.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
+            );
         }
-        Term::Unary(_, e) => {
-            analyze_allocation_escapes(e.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+        Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
+            analyze_allocation_escapes(
+                e.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
+            );
         }
         Term::Match(scrutinee, arms) => {
-            analyze_allocation_escapes(scrutinee.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
-            for (_, _, body) in arms {
-                analyze_allocation_escapes(body.deref(), allocations, escaping, all_param_escapes, recursive_adts, in_tail);
-            }
-        }
-        Term::MakeData { type_name, fields, .. } => {
-            // If this MakeData is in tail position (not bound to a variable),
-            // it will be heap allocated anyway
-            let is_recursive = recursive_adts.contains(type_name);
-            for field in fields {
-                if let Term::Var(fid) = field.body() {
-                    if allocations.contains_key(fid) {
-                        if is_recursive || in_tail {
-                            // Stored in escaping ADT
-                            escaping.insert(*fid);
+            // If match is in tail position, an extracted field from `scrutinee` might be returned;
+            // any inner allocation stored in `scrutinee` that returns must be on heap if `scrutinee` is destructured to return an inner pointer.
+            if in_tail {
+                if let Term::Var(sid) = scrutinee.body() {
+                    if let Some(ainfo) = allocations.get(sid) {
+                        for &inner in &ainfo.contained_vars {
+                            if allocations.contains_key(&inner) {
+                                escaping.insert(inner);
+                            }
                         }
                     }
                 }
-                analyze_allocation_escapes(field.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+            }
+            analyze_allocation_escapes(
+                scrutinee.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
+            );
+            for (_, guard, body) in arms {
+                if let Some(ref g) = guard {
+                    analyze_allocation_escapes(
+                        g.deref(),
+                        allocations,
+                        escaping,
+                        all_param_escapes,
+                        recursive_adts,
+                        false,
+                    );
+                }
+                analyze_allocation_escapes(
+                    body.deref(),
+                    allocations,
+                    escaping,
+                    all_param_escapes,
+                    recursive_adts,
+                    in_tail,
+                );
             }
         }
-        Term::GetTag(node) | Term::GetField(node, _) => {
-            analyze_allocation_escapes(node.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
+        Term::MakeData { fields, .. } => {
+            // Anonymous MakeData (not directly bound to a Let) is always Heap-allocated,
+            // so any local allocation stored into its fields escapes onto the heap!
+            for field in fields {
+                analyze_allocation_escapes(
+                    field.deref(),
+                    allocations,
+                    escaping,
+                    all_param_escapes,
+                    recursive_adts,
+                    true,
+                );
+            }
         }
         Term::Block(items) => {
             for (i, item) in items.iter().enumerate() {
-                let is_last = i == items.len() - 1;
-                analyze_allocation_escapes(item.deref(), allocations, escaping, all_param_escapes, recursive_adts, in_tail && is_last);
+                let is_last = i + 1 == items.len();
+                analyze_allocation_escapes(
+                    item.deref(),
+                    allocations,
+                    escaping,
+                    all_param_escapes,
+                    recursive_adts,
+                    in_tail && is_last,
+                );
             }
         }
-        Term::List(items) => {
-            for item in items {
-                analyze_allocation_escapes(item.deref(), allocations, escaping, all_param_escapes, recursive_adts, false);
-            }
-        }
-        Term::Lit(_) => {}
+        Term::Lit(_) | Term::GlobalVar(_) => {}
     }
 }

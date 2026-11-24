@@ -7,7 +7,7 @@ build = "build.rs"
 
 [dependencies]
 bytecount = "0.6"
-llvm-sys = "140"
+llvm-sys = "201"
 clap = { version = "4", features = ["derive"] }
 libllvm = { path = "./libllvm" }
 libc = "0.2"

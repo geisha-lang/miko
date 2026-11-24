@@ -1,5 +1,5 @@
 concept Eq a {
-    eq: a * a -> Bool
+    eq: (a, a) -> Bool
 }
 
 instance Eq Int {

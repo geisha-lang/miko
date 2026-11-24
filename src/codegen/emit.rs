@@ -1,189 +1,187 @@
-use crate::core::*;
-use crate::core::escape::{EscapeAnalysis, AllocationStrategy};
-use crate::types::*;
-use crate::internal::*;
-use crate::utils::*;
-use crate::syntax::form::{Pattern, Form};
-
-use crate::codegen::llvm::*;
-
+use std::collections::HashMap;
 use std::ops::Deref;
 
-/// Check if a type contains any type variables
-fn contains_type_var(ty: &Type) -> bool {
-    match ty {
-        Type::Var(_) => true,
-        Type::Con(_) | Type::Void => false,
-        Type::Arr(p, r) => contains_type_var(p) || contains_type_var(r),
-        Type::Prod(l, r) => contains_type_var(l) || contains_type_var(r),
-        Type::Comp(base, arg) => contains_type_var(base) || contains_type_var(arg),
-    }
+use crate::codegen::llvm::*;
+use crate::core::escape::{AllocationStrategy, EscapeAnalysis};
+use crate::core::*;
+use crate::internal::*;
+use crate::syntax::form::Pattern;
+use crate::types::*;
+use crate::utils::*;
+use llvm_sys::analysis::LLVMVerifierFailureAction;
+
+/// Explicit variable slot tracking both pointer `LLVMValue` and stored element `LLVMType`
+/// (eliminates all `LLVMGetElementType` calls for LLVM 20 opaque pointers).
+#[derive(Clone, Copy, Debug)]
+pub struct VarSlot {
+    pub ptr: LLVMValue,
+    pub ty: LLVMType,
 }
 
+pub type VarEnv<'a> = SymTable<'a, Id, VarSlot>;
+
 pub trait EmitProvider {
-    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = FunDef>;
+    fn gen_module<T>(&mut self, module: T)
+    where
+        T: IntoIterator<Item = FunDef>;
 }
 
 pub struct LLVMEmit<'i> {
     pub generator: LLVMCodegen,
     interner: &'i mut Interner,
-    funpass: bool,
     escape_info: EscapeAnalysis,
     current_func: Option<Id>,
-    /// The binding Id when generating the value of a Let expression
-    /// Used to look up allocation strategy for MakeData
-    current_let_binding: Option<Id>,
+    /// Set ONLY for the immediate RHS of a `Let` binding; consumed immediately via `.take()` so it never leaks to subexpressions!
+    pending_let_binding: Option<Id>,
+    global_slots: HashMap<Id, (VarSlot, Type)>,
 }
 
-pub type VarEnv<'a> = SymTable<'a, Id, LLVMValue>;
-
-//fn with_var<'a, 'b: 'a, F, R>(sym: &mut VarEnv<'a>, var: Id, val: LLVMValue, mut cb: F) -> R
-//    where F: FnMut(&mut VarEnv<'a>) -> R
-//{
-//    let old = sym.insert(var, val);
-//    let res = cb(sym);
-//    if let Some(o) = old {
-//        sym.insert(var, o);
-//    } else {
-//        sym.remove(&var);
-//    }
-//    res
-//}
-
-
 impl<'i> LLVMEmit<'i> {
-    pub fn new(name: &str, interner: &'i mut Interner, adt_registry: AdtRegistry, escape_info: EscapeAnalysis) -> Self {
+    pub fn new(
+        name: &str,
+        interner: &'i mut Interner,
+        adt_registry: AdtRegistry,
+        escape_info: EscapeAnalysis,
+    ) -> Self {
         LLVMEmit {
             generator: LLVMCodegen::new(name, adt_registry),
             interner,
-            funpass: true,
             escape_info,
             current_func: None,
-            current_let_binding: None,
+            pending_let_binding: None,
+            global_slots: HashMap::new(),
         }
     }
 
-    /// Get allocation strategy for a binding in the current function
     fn get_allocation_strategy(&self, binding_id: &Id) -> AllocationStrategy {
         if let Some(func_id) = &self.current_func {
             self.escape_info.get_strategy(func_id, binding_id)
         } else {
-            AllocationStrategy::Heap // Default to heap if no current function
+            AllocationStrategy::Heap
         }
     }
 
-    /// Get allocation strategy for the current let binding (used by MakeData)
-    fn get_current_let_allocation_strategy(&self) -> AllocationStrategy {
-        if let Some(binding_id) = &self.current_let_binding {
-            self.get_allocation_strategy(binding_id)
-        } else {
-            AllocationStrategy::Heap // Not in a let binding context
-        }
-    }
     pub fn dump(&mut self) {
-        self.generator.module.dump()
+        self.generator.module.dump();
     }
-    pub fn close_function_pass(&mut self) {
-        self.funpass = false;
+
+    /// Declare LLVM globals for all top-level value definitions (`def pi = 3.14`) before emitting functions.
+    pub fn declare_globals(&mut self, globals: &[GlobalValDef]) {
+        for g in globals {
+            let gname = format!("__gval_{}", self.interner.trace(g.name));
+            let val_llvm_ty = self.generator.get_val_llvm_type(&g.ty);
+            let global_ptr = self.generator.module.add_global(&val_llvm_ty, &gname);
+            self.global_slots.insert(
+                g.name,
+                (
+                    VarSlot {
+                        ptr: global_ptr,
+                        ty: val_llvm_ty,
+                    },
+                    g.ty.clone(),
+                ),
+            );
+        }
     }
+
     pub fn gen_top_level(&mut self, def: &FunDef, prelude: &VarEnv) {
-        // Set current function for escape analysis lookups
         self.current_func = Some(def.name());
+        self.pending_let_binding = None;
 
-        // A global function definition
         let fun_type = def.ref_type();
-
-        let void_ret = if let Type::Arr(_, ret) = fun_type {
-            matches!(ret.as_ref(), Type::Void)
-        } else {
-            false
+        let void_ret = match fun_type {
+            Type::Arr(_, ret) => {
+                matches!(ret.as_ref(), Type::Void)
+                    || matches!(ret.as_ref(), Type::Con(n) if n == "Void")
+            }
+            _ => false,
         };
+
         let def_name = self.interner.trace(def.name()).to_owned();
         let fun = self.generator.get_or_add_function(&def_name, fun_type);
         let arg_count = fun.count_params();
 
-        // Check redefinition
-
         if fun.count_basic_blocks() != 0 {
-            panic!("Redefine function");
+            panic!("Redefined function: {}", def_name);
         }
-        let block = self.context().append_basic_block(&fun, "entry");
+        let entry_blk = self.context().append_basic_block(&fun, "entry");
+        self.builder().set_position_at_end(&entry_blk);
 
-        self.builder().set_position_at_end(&block);
-
-        // Create a sub environment for current function generating
         let mut symtbl = prelude.sub_env();
 
+        // Bind regular parameters cleanly (1-to-1 with explicit arity!)
         let param_defs = def.parameters();
-        let mut param_count = param_defs.len();
-        let param_allocas = self.alloca_for_vars(&fun, param_defs);
-
-        if param_allocas.len() + 1 < arg_count {
-            let last_formal = param_defs.last();
-            if let Some(p) = last_formal {
-                let &VarDecl(ref id, ref ty) = p;
-                param_count = param_count - 1;
-                // Actual parameters counts more than formal, last formal parameter type is production
-                let flatten_count = ty.body().prod_to_vec().len();
-                let last_alloca = self.alloca_for_var(&fun, p);
-                for i in 0..flatten_count {
-                    let idx_name = i.to_string();
-                    let arg = fun.get_param(i + param_count);
-                    let arg_name = self.trace_id(id.to_owned()).to_owned() + idx_name.as_str();
-                    arg.set_name(arg_name.as_str());
-                    let field = self.builder().struct_field_ptr(&last_alloca, i, idx_name.as_str());
-                    self.builder().store(&arg, &field);
-                }
-                symtbl.insert(id.to_owned(), last_alloca);
-            }
-        }
-        for i in 0..param_count {
-            let var = param_allocas[i];
+        for (i, VarDecl(pname, pscm)) in param_defs.iter().enumerate() {
+            let p_llvm_ty = self.generator.get_val_llvm_type(pscm.body());
+            let trace_name = self.interner.trace(*pname).to_owned();
             let arg = fun.get_param(i);
-            let pname = param_defs[i].name();
-            arg.set_name(self.trace_id(pname));
-            self.builder().store(&arg, &var);
-            symtbl.insert(pname, var);
+            arg.set_name(&trace_name);
+            let slot_ptr = self
+                .generator
+                .create_entry_block_alloca(&fun, &trace_name, &p_llvm_ty);
+            self.builder().store(&arg, &slot_ptr);
+            symtbl.insert(
+                *pname,
+                VarSlot {
+                    ptr: slot_ptr,
+                    ty: p_llvm_ty,
+                },
+            );
         }
 
-
+        // Unpack closure environment from trailing `ptr %fvs` parameter
         let p_fvs = fun.get_param(arg_count - 1);
         p_fvs.set_name("fvs");
 
         let formal_fvs = def.fv();
-        let fv_allocas = self.alloca_for_vars(&fun, formal_fvs);
-        let fv_tys = fv_allocas.iter().map(|v| v.get_type().get_element()).collect();
-        let fv_ty_actual = self.context().get_struct_type(&fv_tys, false);
-        let fv_ptr_actual = self.builder().bit_cast(&p_fvs, &fv_ty_actual.get_ptr(0), "fv");
+        if !formal_fvs.is_empty() {
+            let fv_llvm_tys: Vec<LLVMType> = formal_fvs
+                .iter()
+                .map(|VarDecl(_, scm)| self.generator.get_val_llvm_type(scm.body()))
+                .collect();
+            let fv_struct_ty = self.context().get_struct_type(&fv_llvm_tys, false);
 
-        for (i, fv) in fv_allocas.into_iter().enumerate() {
-            let fv_id = formal_fvs[i].name();
-            let fv_name = self.interner.trace(fv_id);
-            let fv_val_ptr = self.builder().struct_field_ptr(&fv_ptr_actual, i, "tmp");
-            let fv_ty_actual = fv.get_type();
-            let fv_val = self.builder().load(&fv_val_ptr, fv_name);
-            self.builder().store(&fv_val, &fv);
-            symtbl.insert(fv_id, fv);
+            for (i, VarDecl(fv_id, _)) in formal_fvs.iter().enumerate() {
+                let elem_ty = fv_llvm_tys[i];
+                let fv_name = self.interner.trace(*fv_id).to_owned();
+                let slot_ptr = self
+                    .generator
+                    .create_entry_block_alloca(&fun, &fv_name, &elem_ty);
+                let field_ptr =
+                    self.builder()
+                        .struct_field_ptr(&fv_struct_ty, &p_fvs, i, "fv.gep");
+                let fv_val = self.builder().load(&elem_ty, &field_ptr, &fv_name);
+                self.builder().store(&fv_val, &slot_ptr);
+                symtbl.insert(
+                    *fv_id,
+                    VarSlot {
+                        ptr: slot_ptr,
+                        ty: elem_ty,
+                    },
+                );
+            }
         }
-
 
         let fun_body = self.gen_expr(def.body(), &mut symtbl);
-
-        self.builder().ret(&fun_body);
-
-        if !fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction) {
-            panic!();
-        } else {
-            if self.funpass { self.generator.passer.run(&fun); }
+        if !self.builder().current_block_has_terminator() {
+            if void_ret {
+                self.builder().ret_void();
+            } else {
+                self.builder().ret(&fun_body);
+            }
         }
 
-        // Clear current function
+        if !fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction) {
+            self.generator.module.dump();
+            panic!("LLVM verification failed for function '{}'", def_name);
+        }
+
         self.current_func = None;
     }
 
-    pub fn gen_main(&mut self, def: &FunDef, prelude: &VarEnv) {
-        // Set current function for escape analysis lookups
+    pub fn gen_main(&mut self, def: &FunDef, globals: &[GlobalValDef], prelude: &VarEnv) {
         self.current_func = Some(def.name());
+        self.pending_let_binding = None;
 
         let main_ty = self.generator.get_main_type();
         let fun = self.module().add_function("main", &main_ty);
@@ -191,242 +189,330 @@ impl<'i> LLVMEmit<'i> {
         let block = self.context().append_basic_block(&fun, "entry");
         self.builder().set_position_at_end(&block);
 
-        // Initialize GC with 1MB heap (131072 words * 8 bytes/word = 1MB)
-        let gc_init_fn = self.generator.declare_gc_init();
-        let heap_size = self.context().get_int64_const(131072);
-        self.builder().call(&gc_init_fn, &mut vec![heap_size], "");
+        // Anchor stack root at the very top of `main`'s entry frame!
+        let i64_ty = self.context().get_int64_type();
+        let stack_anchor = self.builder().alloca(&i64_ty, "gc.stack.anchor");
+        let zero64 = self.context().get_int64_const(0);
+        self.builder().store(&zero64, &stack_anchor);
 
+        let gc_init_fn = self.generator.declare_gc_init_with_stack();
+        let heap_size = self.context().get_int64_const(131072);
+        self.builder()
+            .call(&gc_init_fn, &mut [heap_size, stack_anchor], "");
+
+        // Register pointer-typed global value slots with GC and evaluate top-level value initializers in order
         let mut symtbl = prelude.sub_env();
+        let gc_reg_fn = self.generator.declare_gc_register_root();
+        for g in globals {
+            let (slot, g_ty) = self.global_slots[&g.name].clone();
+            if is_gc_pointer_type(&g_ty) {
+                self.builder().call(&gc_reg_fn, &mut [slot.ptr], "");
+            }
+            self.pending_let_binding = None;
+            let init_val = self.gen_expr(&g.init, &mut symtbl);
+            self.builder().store(&init_val, &slot.ptr);
+        }
+
         self.gen_expr(def.body(), &mut symtbl);
 
-        let zero = self.context().get_int32_const(0);
-        self.builder().ret(&zero);
+        if !self.builder().current_block_has_terminator() {
+            let zero = self.context().get_int32_const(0);
+            self.builder().ret(&zero);
+        }
 
+        if !fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction) {
+            self.generator.module.dump();
+            panic!("LLVM verification failed for 'main'");
+        }
 
-        fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction);
-        if self.funpass { self.generator.passer.run(&fun); }
-
-        // Clear current function
         self.current_func = None;
     }
-    /// Long bull shit
-    fn gen_expr<'a: 'b, 'b>(&mut self,
-                            term: &'a TaggedTerm,
-                            symbols: &mut VarEnv<'b>)
-                            -> LLVMValue {
+
+    fn gen_expr<'a: 'b, 'b>(
+        &mut self,
+        term: &'a TaggedTerm,
+        symbols: &mut VarEnv<'b>,
+    ) -> LLVMValue {
         use self::Term::*;
-        let ret = match *term.body() {
+
+        // Take `pending_let_binding` immediately so nested sub-expressions NEVER inherit an outer `let`'s Stack strategy!
+        let direct_let_binding = self.pending_let_binding.take();
+
+        match *term.body() {
             Lit(ref lit) => self.generator.gen_lit(lit),
+
             Var(vn) => {
-                let var_name = self.interner.trace(vn);
-                match symbols.lookup(&vn) {
-                    Some(v) => self.builder().load(v, var_name),
-                    _ => {
-                        eprintln!("cannot find variable {}", self.interner.trace(vn));
-                        unreachable!()
-                    }
+                let var_name = self.interner.trace(vn).to_owned();
+                if let Some(slot) = symbols.lookup(&vn).copied() {
+                    self.builder().load(&slot.ty, &slot.ptr, &var_name)
+                } else if let Some(slot) = self.global_slots.get(&vn).map(|(s, _)| *s) {
+                    self.builder().load(&slot.ty, &slot.ptr, &var_name)
+                } else {
+                    panic!("Variable '{}' not found in codegen symbol table", var_name);
                 }
             }
+
+            GlobalVar(vn) => {
+                let var_name = self.interner.trace(vn).to_owned();
+                let slot = self
+                    .global_slots
+                    .get(&vn)
+                    .map(|(s, _)| *s)
+                    .unwrap_or_else(|| panic!("Global value '{}' not declared", var_name));
+                self.builder().load(&slot.ty, &slot.ptr, &var_name)
+            }
+
+            Tuple(ref elems) => {
+                let tuple_llvm_ty = self.generator.get_val_llvm_type(term.ref_scheme().body());
+                let mut agg = tuple_llvm_ty.get_undef();
+                for (i, el) in elems.iter().enumerate() {
+                    let v = self.gen_expr(el, symbols);
+                    agg = self.builder().insert_value(&agg, &v, i, "tup.ins");
+                }
+                agg
+            }
+
+            Unary(op, ref operand) => {
+                let val = self.gen_expr(operand, symbols);
+                match op {
+                    UnOp::Not => {
+                        let one = self.context().get_int1_const(1);
+                        self.builder().xor(&val, &one, "not")
+                    }
+                    UnOp::Neg => match operand.ref_scheme().body() {
+                        Type::Con(n) if n == "Float" => self.builder().fneg(&val, "fneg"),
+                        _ => self.builder().neg(&val, "neg"),
+                    },
+                }
+            }
+
+            // Short-circuit `&&`!
+            Binary(BinOp::And, ref lhs, ref rhs) => {
+                let lval = self.gen_expr(lhs, symbols);
+                let lhs_end_blk = self.builder().get_insert_block();
+                let parent = lhs_end_blk.get_parent();
+
+                let rhs_blk = self.context().append_basic_block(&parent, "and.rhs");
+                let merge_blk = self.context().append_basic_block(&parent, "and.end");
+
+                self.builder().cond_br(&lval, &rhs_blk, &merge_blk);
+
+                self.builder().set_position_at_end(&rhs_blk);
+                let rval = self.gen_expr(rhs, symbols);
+                let rhs_end_blk = self.builder().get_insert_block();
+                self.builder().br(&merge_blk);
+
+                self.builder().set_position_at_end(&merge_blk);
+                let false_val = self.context().get_int1_const(0);
+                let i1_ty = self.context().get_int1_type();
+                self.builder().phi_node(
+                    &i1_ty,
+                    &[(&false_val, &lhs_end_blk), (&rval, &rhs_end_blk)],
+                    "and.res",
+                )
+            }
+
+            // Short-circuit `||`!
+            Binary(BinOp::Or, ref lhs, ref rhs) => {
+                let lval = self.gen_expr(lhs, symbols);
+                let lhs_end_blk = self.builder().get_insert_block();
+                let parent = lhs_end_blk.get_parent();
+
+                let rhs_blk = self.context().append_basic_block(&parent, "or.rhs");
+                let merge_blk = self.context().append_basic_block(&parent, "or.end");
+
+                self.builder().cond_br(&lval, &merge_blk, &rhs_blk);
+
+                self.builder().set_position_at_end(&rhs_blk);
+                let rval = self.gen_expr(rhs, symbols);
+                let rhs_end_blk = self.builder().get_insert_block();
+                self.builder().br(&merge_blk);
+
+                self.builder().set_position_at_end(&merge_blk);
+                let true_val = self.context().get_int1_const(1);
+                let i1_ty = self.context().get_int1_type();
+                self.builder().phi_node(
+                    &i1_ty,
+                    &[(&true_val, &lhs_end_blk), (&rval, &rhs_end_blk)],
+                    "or.res",
+                )
+            }
+
             Binary(op, ref lhs, ref rhs) => {
                 let lval = self.gen_expr(lhs, symbols);
                 let rval = self.gen_expr(rhs, symbols);
-
-                self.generator.bin_operator(op, lval, rval, lhs.ref_scheme().body())
+                self.generator
+                    .bin_operator(op, lval, rval, lhs.ref_scheme().body())
             }
-            Let(ref var_decl, ref val, ref exp) => {
-                let &VarDecl(var, ref tyvar) = var_decl;
-                let block = self.builder().get_insert_block();
-                let fun = block.get_parent();
 
-                // Set current let binding for MakeData to look up allocation strategy
-                let old_let_binding = self.current_let_binding;
-                self.current_let_binding = Some(var);
-
+            Let(VarDecl(var, ref tyvar), ref val, ref exp) => {
+                let fun = self.builder().get_insert_block().get_parent();
+                self.pending_let_binding = Some(var);
                 let init = self.gen_expr(val, symbols);
+                self.pending_let_binding = None;
 
-                // Restore previous let binding context
-                self.current_let_binding = old_let_binding;
-
-                // For ADT values, use the actual value type instead of the declared type
-                // because the declared type may have unresolved type variables (i64 fallback)
-                // while the actual value has concrete instantiated types
-                let alloca = {
-                    let var_name = self.interner.trace(var);
-
-                    // Check if this is an ADT type - if so, use the actual init value type
-                    // to preserve the concrete instantiated types
-                    let is_adt = is_adt_type(tyvar.body());
-                    if is_adt {
-                        let init_ty = init.get_type();
-                        self.builder().alloca(&init_ty, var_name)
-                    } else {
-                        self.generator.create_entry_block_alloca(&fun, var_name, tyvar.body())
-                    }
-                };
+                let var_name = self.interner.trace(var).to_owned();
+                let val_llvm_ty = self.generator.get_val_llvm_type(tyvar.body());
+                let alloca = self
+                    .generator
+                    .create_entry_block_alloca(&fun, &var_name, &val_llvm_ty);
                 self.builder().store(&init, &alloca);
 
-
-                symbols.with_var(var, alloca, |sym| self.gen_expr(exp.deref(), sym))
+                symbols.with_var(
+                    var,
+                    VarSlot {
+                        ptr: alloca,
+                        ty: val_llvm_ty,
+                    },
+                    |sym| self.gen_expr(exp.deref(), sym),
+                )
             }
+
             ApplyCls(ref callee, ref args) => {
-                // get the pointer to closure struct
-                let callee_ptr = self.gen_expr(callee, symbols); //.into_function();
+                let callee_ptr = self.gen_expr(callee, symbols);
+                let mut argsv: Vec<LLVMValue> =
+                    args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
 
-                let mut argsv: Vec<_> = args
-                    .iter()
-                    .map(|arg| self.gen_expr(arg, symbols))
-                    .collect();
+                let cls_hdr_ty = self.generator.get_closure_header_type();
+                let ptr_ty = self.context().get_ptr_type();
 
-                // get fvs from closure struct
-                // add fv into arguments (cast to i8*)
-                let fvs_ptr = self.builder().struct_field_ptr(&callee_ptr, 1, "cls.fv");
-                let fvs_ty = self.context().get_int8_type().get_ptr(0);
-                let fvs = self.builder().bit_cast(&fvs_ptr, &fvs_ty, "cls.fv.cast");
-                argsv.push(fvs);
+                // Field 1 of `{ ptr fn, env_struct }` starts at byte offset 8, identical to field 1 of `{ ptr, ptr }`!
+                let fvs_ptr =
+                    self.builder()
+                        .struct_field_ptr(&cls_hdr_ty, &callee_ptr, 1, "cls.fv");
+                argsv.push(fvs_ptr);
 
-                // get actual function entry
-                let fn_entry_ptr = self.builder().struct_field_ptr(&callee_ptr, 0, "cls.fn");
-                // get a void* pointer
-                let fn_entry = self.builder().load(&fn_entry_ptr, "cls.fn.actual");
-                // cast to function pointer
-                let callee_fn_ty = self.generator.get_llvm_type(callee.ref_scheme().body());
-                let callee_ptr_ty = callee_fn_ty.get_ptr(0);
-                let fun =
-                    self.builder().bit_cast(&fn_entry, &callee_ptr_ty, "cls.callee").into_function();
+                let fn_entry_ptr =
+                    self.builder()
+                        .struct_field_ptr(&cls_hdr_ty, &callee_ptr, 0, "cls.fn");
+                let fn_entry = self.builder().load(&ptr_ty, &fn_entry_ptr, "cls.fn.actual");
 
-                self.builder().call_with_type(&callee_fn_ty, &fun, &mut argsv, "call")
+                let callee_fn_ty = self.generator.get_fn_llvm_type(callee.ref_scheme().body());
+                let call_val =
+                    self.builder()
+                        .call_value(&callee_fn_ty, &fn_entry, &mut argsv, "callcls");
+                if callee_fn_ty.get_return_type().is_void() {
+                    self.context().get_uint8_const(0)
+                } else {
+                    call_val
+                }
             }
-            ApplyDir(VarDecl(fun, ref fun_ty), ref args) => {
-                let empty_fv_ty = self.context().get_int8_type().get_ptr(0);
-                let empty_fv_ptr = empty_fv_ty.get_null_ptr();
-                let callee_name = self.interner.trace(fun).to_owned();
-                let callee = self.generator.get_or_add_function(&callee_name, fun_ty.body());
 
-                // Get actual expected parameter types from the LLVM function
+            ApplyDir(VarDecl(fun_id, ref fun_ty), ref args) => {
+                let callee_name = self.interner.trace(fun_id).to_owned();
+                let callee = self.generator.get_or_add_function(&callee_name, fun_ty.body());
                 let fn_ty = callee.get_function_type();
 
-                // Generate argument values with type conversion if needed
-                let mut argsv: Vec<_> = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
-                    let val = self.gen_expr(arg, symbols);
-                    // Get expected parameter type from LLVM function
-                    let expected_llvm_ty = fn_ty.get_param_type(i);
-                    let val_ty = val.get_type();
+                let mut argsv: Vec<LLVMValue> =
+                    args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+                let null_fv = self.context().get_ptr_type().get_null();
+                argsv.push(null_fv);
 
-                    // Check if we need to convert types
-                    if val_ty.raw_ptr() != expected_llvm_ty.raw_ptr() {
-                        let converted = self.coerce_value(&val, &val_ty, &expected_llvm_ty);
-                        argsv.push(converted);
-                    } else {
-                        argsv.push(val);
-                    }
-                }
-                argsv.push(empty_fv_ptr);
-
-                self.builder().call(&callee, &mut argsv, "calldirect")
-            }
-            Block(ref fs) => {
-                let mut it = fs.iter();
-                if let Some(v) = it.next() {
-                    let mut ret = self.gen_expr(v, symbols);
-                    for n in it {
-                        ret = self.gen_expr(n, symbols);
-                    }
-                    ret
+                let call_val = self.builder().call(&callee, &mut argsv, "calldir");
+                if fn_ty.get_return_type().is_void() {
+                    self.context().get_uint8_const(0)
                 } else {
-                    panic!("Empty block")
+                    call_val
                 }
             }
+
+            Block(ref fs) => {
+                let mut ret = self.context().get_uint8_const(0);
+                for n in fs {
+                    ret = self.gen_expr(n, symbols);
+                }
+                ret
+            }
+
             MakeCls(ref var_decl, ref cls, ref exp) => {
-                let cls = cls.as_ref();
-                let exp = exp.as_ref();
-                let &VarDecl(ref var, ref tyvar) = var_decl;
+                let VarDecl(var, ref tyvar) = *var_decl;
+                let alloc_strategy = self.get_allocation_strategy(&var);
+                let ptr_ty = self.context().get_ptr_type();
+                let fun = self.builder().get_insert_block().get_parent();
 
-                // Check escape analysis to determine allocation strategy
-                let alloc_strategy = self.get_allocation_strategy(var);
-
-                // make a alloca of closure pointer
-                let cls_ty = self.generator.get_closure_type().get_ptr(0);
-                let cls_ptr = {
-                    self.builder().alloca(&cls_ty, "cls")
+                let cls_slot_ptr =
+                    self.generator
+                        .create_entry_block_alloca(&fun, "cls.slot", &ptr_ty);
+                let cls_slot = VarSlot {
+                    ptr: cls_slot_ptr,
+                    ty: ptr_ty,
                 };
 
-                let fv_tys: Vec<_> = symbols.with_var(*var, cls_ptr, |sym| {
+                let fv_tys: Vec<LLVMType> = symbols.with_var(var, cls_slot, |sym| {
                     cls.fv()
                         .into_iter()
                         .map(|fv_name| {
-                            match sym.lookup(&fv_name) {
-                                Some(v) => v.get_type().get_element(),
-                                None => {
-                                    eprintln!("unexpected free var: {}", self.interner.trace(fv_name));
-                                    panic!()
-                                }
-                            }
+                            sym.lookup(&fv_name)
+                                .map(|s| s.ty)
+                                .or_else(|| self.global_slots.get(&fv_name).map(|(s, _)| s.ty))
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Unexpected free var '{}' in closure",
+                                        self.interner.trace(fv_name)
+                                    )
+                                })
                         })
                         .collect()
                 });
 
-
-                // make a closure type
                 let cls_ty_actual = self.generator.get_actual_cls_type(&fv_tys);
-
-                // Allocate closure based on escape analysis
-                let cls_value = match alloc_strategy {
-                    AllocationStrategy::Stack => {
-                        // Stack allocation - use alloca
-                        self.builder().alloca(&cls_ty_actual, "cls.stack")
-                    }
+                let cls_obj_ptr = match alloc_strategy {
+                    AllocationStrategy::Stack => self
+                        .generator
+                        .create_entry_block_alloca(&fun, "cls.stack", &cls_ty_actual),
                     AllocationStrategy::Heap => {
-                        // Heap allocation via gc_alloc
                         let gc_alloc_fn = self.generator.declare_gc_alloc();
                         let cls_size = self.generator.get_type_size(&cls_ty_actual);
                         let size_val = self.context().get_int64_const(cls_size as i64);
-                        let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "cls.raw");
-                        self.builder().bit_cast(&raw_ptr, &cls_ty_actual.get_ptr(0), "cls.actual")
+                        self.builder()
+                            .call(&gc_alloc_fn, &mut [size_val], "cls.heap")
                     }
                 };
 
-                let cls_cast = self.builder().bit_cast(&cls_value, &cls_ty, "cls.cast");
-                self.builder().store(&cls_cast, &cls_ptr);
+                self.builder().store(&cls_obj_ptr, &cls_slot_ptr);
 
+                let cls_fun_field =
+                    self.builder()
+                        .struct_field_ptr(&cls_ty_actual, &cls_obj_ptr, 0, "cls.fn");
+                let ent_name = self.interner.trace_string(cls.entry());
+                let fn_ent = self
+                    .generator
+                    .get_or_add_function(&ent_name, tyvar.body())
+                    .into_value();
+                self.builder().store(&fn_ent, &cls_fun_field);
 
-                // set function entry
-                let cls_fun = self.builder().struct_field_ptr(&cls_value, 0, "cls.fn");
-                let fn_ent = {
-                    let ent_name = self.interner.trace_string(cls.entry());
-                    self.generator.get_or_add_function(&ent_name, tyvar.body()).into_value()
-                };
-                let fn_ent_ptr = {
-                    let ptr_ty = self.context().get_int8_type().get_ptr(0);
-                    self.builder().bit_cast(&fn_ent, &ptr_ty, "fn")
-                };
-                self.builder().store(&fn_ent_ptr, &cls_fun);
-
-                symbols.with_var(var_decl.name(), cls_ptr, |sym| {
-                    // store free vars
-                    let cls_fv = self.builder().struct_field_ptr(&cls_value, 1, "cls.fv");
-                    for (i, val_id) in cls.fv().into_iter().enumerate() {
-                        // if variable stored a pointer, it will get (type **)
-                        // if stored a value, (type *)
-                        let val_ptr = sym.lookup(&val_id).expect("cant found free var in evironment");
-                        let val = self.builder().load(&val_ptr, "tmp");
-                        let fv = self.builder().struct_field_ptr(&cls_fv, i, "tmp");
-                        self.builder().store(&val, &fv);
+                symbols.with_var(var, cls_slot, |sym| {
+                    if !fv_tys.is_empty() {
+                        let env_struct_ty = self.context().get_struct_type(&fv_tys, false);
+                        let cls_fv_ptr = self.builder().struct_field_ptr(
+                            &cls_ty_actual,
+                            &cls_obj_ptr,
+                            1,
+                            "cls.fv",
+                        );
+                        for (i, val_id) in cls.fv().into_iter().enumerate() {
+                            let val_slot = sym
+                                .lookup(&val_id)
+                                .copied()
+                                .or_else(|| self.global_slots.get(&val_id).map(|(s, _)| *s))
+                                .expect("Free var must exist in scope");
+                            let val = self.builder().load(&val_slot.ty, &val_slot.ptr, "fv.load");
+                            let fv_field = self.builder().struct_field_ptr(
+                                &env_struct_ty,
+                                &cls_fv_ptr,
+                                i,
+                                "fv.slot",
+                            );
+                            self.builder().store(&val, &fv_field);
+                        }
                     }
                     self.gen_expr(exp, sym)
                 })
-
             }
-            If(ref c, ref t, ref f) => {
-                let c = c.as_ref();
-                let t = t.as_ref();
-                let f = f.as_ref();
-                //                unimplemented!()
-                let cond = self.gen_expr(c, symbols);
-                let zero = self.context().get_int1_const(0);
 
-                let blk = self.builder().get_insert_block();
-                let parent = blk.get_parent();
+            If(ref c, ref t, ref f) => {
+                let cond = self.gen_expr(c, symbols);
+                let parent = self.builder().get_insert_block().get_parent();
                 let then_blk = self.context().append_basic_block(&parent, "if.then");
                 let else_blk = self.context().append_basic_block(&parent, "if.else");
                 let cont_blk = self.context().append_basic_block(&parent, "if.cont");
@@ -434,183 +520,373 @@ impl<'i> LLVMEmit<'i> {
                 self.builder().cond_br(&cond, &then_blk, &else_blk);
 
                 self.builder().set_position_at_end(&then_blk);
-                let then = self.gen_expr(t, symbols);
-                self.builder().br(&cont_blk);
+                let then_val = self.gen_expr(t, symbols);
                 let then_end = self.builder().get_insert_block();
+                self.builder().br(&cont_blk);
 
                 self.builder().set_position_at_end(&else_blk);
-                let els = self.gen_expr(f, symbols);
+                let else_val = self.gen_expr(f, symbols);
+                let else_end = self.builder().get_insert_block();
                 self.builder().br(&cont_blk);
-                let els_end = self.builder().get_insert_block();
 
                 self.builder().set_position_at_end(&cont_blk);
-                self.create_result_phi(&[(then, then_end), (els, els_end)], &cont_blk, "if.res")
+                let res_ty = self.generator.get_val_llvm_type(term.ref_scheme().body());
+                self.builder().phi_node(
+                    &res_ty,
+                    &[(&then_val, &then_end), (&else_val, &else_end)],
+                    "if.res",
+                )
             }
-            List(_) => unimplemented!(),
-            Unary(_, _) => unimplemented!(),
 
-            // ADT Operations
-            MakeData { ref type_name, tag, ref fields, ref field_types, ref type_args } => {
-                // Create an ADT value with the given tag and fields
-                // ADT is represented as: { i32 tag, payload_struct }
-                // Returns a pointer to the allocated ADT struct
-                //
-                // Use the generic ADT type if any type_arg contains a type variable,
-                // otherwise use the instantiated type for better memory efficiency
+            MakeData {
+                ref type_name,
+                tag,
+                ref fields,
+                ref field_types,
+                ref type_args,
+            } => {
+                let field_vals: Vec<LLVMValue> =
+                    fields.iter().map(|f| self.gen_expr(f, symbols)).collect();
 
-                // Get field values
-                let field_vals: Vec<LLVMValue> = fields.iter()
-                    .map(|f| self.gen_expr(f, symbols))
-                    .collect();
+                let adt_storage_ty = self
+                    .generator
+                    .get_adt_storage_llvm_type(type_name, type_args);
 
-                // Use the instantiated ADT type for allocation only if ALL type args are concrete
-                // If any type arg contains a type variable, use the generic type (with i64 slots)
-                let all_concrete = type_args.iter().all(|t| !contains_type_var(t));
-                let adt_ty = if type_args.is_empty() || !all_concrete {
-                    self.generator.gen_user_type(type_name)
-                } else {
-                    self.generator.gen_instantiated_user_type(type_name, type_args)
-                };
-
-                // Check allocation strategy based on escape analysis
-                // Recursive ADTs are always heap-allocated regardless of escape analysis
                 let is_recursive = self.escape_info.is_recursive_adt(type_name);
                 let alloc_strategy = if is_recursive {
                     AllocationStrategy::Heap
+                } else if let Some(bind_id) = direct_let_binding {
+                    self.get_allocation_strategy(&bind_id)
                 } else {
-                    self.get_current_let_allocation_strategy()
+                    AllocationStrategy::Heap
                 };
 
-                // Allocate ADT based on escape analysis
+                let fun = self.builder().get_insert_block().get_parent();
                 let adt_ptr = match alloc_strategy {
-                    AllocationStrategy::Stack => {
-                        // Stack allocation - use alloca
-                        self.builder().alloca(&adt_ty, "adt.stack")
-                    }
+                    AllocationStrategy::Stack => self
+                        .generator
+                        .create_entry_block_alloca(&fun, "adt.stack", &adt_storage_ty),
                     AllocationStrategy::Heap => {
-                        // Heap allocation via gc_alloc
                         let gc_alloc_fn = self.generator.declare_gc_alloc();
-                        let adt_size = self.generator.get_type_size(&adt_ty);
+                        let adt_size = self.generator.get_type_size(&adt_storage_ty);
                         let size_val = self.context().get_int64_const(adt_size as i64);
-                        let raw_ptr = self.builder().call(&gc_alloc_fn, &mut vec![size_val], "adt.raw");
-                        self.builder().bit_cast(&raw_ptr, &adt_ty.get_ptr(0), "adt")
+                        self.builder()
+                            .call(&gc_alloc_fn, &mut [size_val], "adt.heap")
                     }
                 };
 
-                // Store tag
                 let tag_val = self.context().get_int32_const(tag as i32);
-                let tag_ptr = self.builder().struct_field_ptr(&adt_ptr, 0, "adt.tag.ptr");
+                let tag_ptr =
+                    self.builder()
+                        .struct_field_ptr(&adt_storage_ty, &adt_ptr, 0, "adt.tag.ptr");
                 self.builder().store(&tag_val, &tag_ptr);
 
-                // Store payload fields if any
                 if !field_vals.is_empty() {
-                    // Get the actual payload pointer from the allocated struct
-                    // This uses the type from the allocation (which may be generic with i64 slots)
-                    let payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
+                    let payload_ptr = self.builder().struct_field_ptr(
+                        &adt_storage_ty,
+                        &adt_ptr,
+                        1,
+                        "adt.payload.ptr",
+                    );
+                    let variant_field_llvm_tys: Vec<LLVMType> = field_types
+                        .iter()
+                        .map(|ft| self.generator.get_val_llvm_type(ft))
+                        .collect();
+                    let variant_payload_ty =
+                        self.context().get_struct_type(&variant_field_llvm_tys, false);
 
                     for (i, fv) in field_vals.iter().enumerate() {
-                        let field_ptr = self.builder().struct_field_ptr(&payload_ptr, i, "adt.field.ptr");
-                        let field_ty = field_ptr.get_type().get_element();
-                        let val_ty = fv.get_type();
-                        // Convert value to match the actual field type in the allocated struct
-                        // This handles i32 -> i64 promotion for polymorphic slots
-                        let val_to_store = self.convert_to_field_type(fv, &val_ty, &field_ty);
-                        self.builder().store(&val_to_store, &field_ptr);
+                        let field_ptr = self.builder().struct_field_ptr(
+                            &variant_payload_ty,
+                            &payload_ptr,
+                            i,
+                            "adt.field.ptr",
+                        );
+                        self.builder().store(fv, &field_ptr);
                     }
                 }
                 adt_ptr
             }
 
             GetTag(ref node) => {
-                // Extract the tag from an ADT value (pointer)
                 let adt_ptr = self.gen_expr(node, symbols);
-                let tag_ptr = self.builder().struct_field_ptr(&adt_ptr, 0, "adt.tag.ptr");
-                self.builder().load(&tag_ptr, "adt.tag")
+                let i32_ty = self.context().get_int32_type();
+                let hdr_ty = self.context().get_struct_type(&[i32_ty], false);
+                let tag_ptr = self
+                    .builder()
+                    .struct_field_ptr(&hdr_ty, &adt_ptr, 0, "adt.tag.ptr");
+                self.builder().load(&i32_ty, &tag_ptr, "adt.tag")
             }
 
-            GetField(ref node, index) => {
-                // Extract a field from an ADT value's payload (pointer)
-                let adt_ptr = self.gen_expr(node, symbols);
-                let payload_ptr = self.builder().struct_field_ptr(&adt_ptr, 1, "adt.payload.ptr");
-                let field_ptr = self.builder().struct_field_ptr(&payload_ptr, index, "adt.field.ptr");
-                self.builder().load(&field_ptr, "adt.field")
+            GetField(_, _) => {
+                unreachable!("GetField is superseded by structured pattern matching")
             }
 
             Match(ref scrutinee, ref arms) => {
-                // Generate code for pattern matching using a switch on the tag
-                // For ADT patterns, scrutinee_val is a pointer to the ADT struct
                 let scrutinee_val = self.gen_expr(scrutinee, symbols);
-                let scrutinee_type = scrutinee.ref_scheme().body().clone();
+                let scrutinee_ty = scrutinee.ref_scheme().body().clone();
+                let parent = self.builder().get_insert_block().get_parent();
 
-                // Get current function and create basic blocks
-                let blk = self.builder().get_insert_block();
-                let parent = blk.get_parent();
-
-                // Create a continuation block and result phi node
                 let cont_blk = self.context().append_basic_block(&parent, "match.cont");
+                let fail_blk = self.context().append_basic_block(&parent, "match.fail");
 
-                // Check if arms use ADT patterns or simple patterns
-                let has_adt_patterns = arms.iter().any(|(p, _, _)| {
-                    matches!(p, Pattern::Constructor(_, _))
-                });
+                let arm_test_blks: Vec<LLVMBasicBlock> = (0..arms.len())
+                    .map(|i| {
+                        self.context()
+                            .append_basic_block(&parent, &format!("match.test.{}", i))
+                    })
+                    .collect();
 
-                if has_adt_patterns {
-                    // ADT pattern matching: load tag via pointer and switch on it
-                    let tag_ptr = self.builder().struct_field_ptr(&scrutinee_val, 0, "match.tag.ptr");
-                    let tag_val = self.builder().load(&tag_ptr, "match.tag");
+                if arm_test_blks.is_empty() {
+                    self.builder().br(&fail_blk);
+                } else {
+                    self.builder().br(&arm_test_blks[0]);
+                }
 
-                    // Create blocks for each arm
-                    let arm_blocks: Vec<LLVMBasicBlock> = arms.iter().enumerate()
-                        .map(|(i, _)| self.context().append_basic_block(&parent, &format!("match.arm.{}", i)))
-                        .collect();
+                let mut incoming_results: Vec<(LLVMValue, LLVMBasicBlock)> = Vec::new();
 
-                    // Create default block - use unreachable for exhaustive matches
-                    let default_blk = self.context().append_basic_block(&parent, "match.default");
-                    self.builder().set_position_at_end(&default_blk);
-                    self.builder().unreachable();
+                for (i, (pattern, guard_opt, body)) in arms.iter().enumerate() {
+                    let next_fail_blk = if i + 1 < arm_test_blks.len() {
+                        &arm_test_blks[i + 1]
+                    } else {
+                        &fail_blk
+                    };
 
-                    // Build switch instruction
-                    self.builder().set_position_at_end(&blk);
-                    let switch_inst = self.builder().switch(&tag_val, &default_blk, arms.len());
+                    self.builder().set_position_at_end(&arm_test_blks[i]);
+                    let mut arm_symbols = symbols.sub_env();
 
-                    // Generate code for each arm
-                    let mut results: Vec<(LLVMValue, LLVMBasicBlock)> = Vec::new();
+                    // Recursively emit pattern checks & bindings (handles arbitrary nesting, tuples, literals, wildcards, and real variant tags!)
+                    self.emit_pattern_check(
+                        &parent,
+                        &scrutinee_val,
+                        &scrutinee_ty,
+                        pattern,
+                        &mut arm_symbols,
+                        next_fail_blk,
+                    );
 
-                    for (i, ((pattern, _guard, body), arm_blk)) in arms.iter().zip(arm_blocks.iter()).enumerate() {
-                        // Add case to switch
-                        if let Pattern::Constructor(_, _) = pattern {
-                            let tag_const = self.context().get_int32_const(i as i32);
-                            LLVMBuilder::switch_add_case(&switch_inst, &tag_const, arm_blk);
-                        }
-
-                        // Generate arm body
-                        self.builder().set_position_at_end(arm_blk);
-
-                        // Bind pattern variables (scrutinee_val is a pointer)
-                        let mut arm_symbols = symbols.sub_env();
-                        self.bind_pattern_vars_ptr(&scrutinee_val, pattern, &scrutinee_type, &mut arm_symbols);
-
-                        let result = self.gen_expr(body, &mut arm_symbols);
-                        self.builder().br(&cont_blk);
-                        let end_blk = self.builder().get_insert_block();
-                        results.push((result, end_blk));
+                    // Optional match guard `if (cond)`
+                    if let Some(ref guard_term) = guard_opt {
+                        let guard_val = self.gen_expr(guard_term, &mut arm_symbols);
+                        let guard_pass_blk = self
+                            .context()
+                            .append_basic_block(&parent, &format!("match.body.{}", i));
+                        self.builder()
+                            .cond_br(&guard_val, &guard_pass_blk, next_fail_blk);
+                        self.builder().set_position_at_end(&guard_pass_blk);
                     }
 
-                    // Build phi node for result
-                    self.builder().set_position_at_end(&cont_blk);
+                    let body_val = self.gen_expr(body, &mut arm_symbols);
+                    let body_end_blk = self.builder().get_insert_block();
+                    self.builder().br(&cont_blk);
+                    incoming_results.push((body_val, body_end_blk));
+                }
 
-                    self.create_result_phi(&results, &cont_blk, "match.result")
-                } else {
-                    // Simple pattern matching (literals, wildcards, variables)
-                    // Generate a chain of if-then-else
+                // Populate `match.fail` block cleanly with runtime diagnostic abort (no UB!)
+                self.builder().set_position_at_end(&fail_blk);
+                let fail_fn = self.generator.declare_gs_match_fail();
+                self.builder().call(&fail_fn, &mut [], "");
+                self.builder().unreachable();
 
-                    // For simplicity, treat this as a series of comparisons
-                    // This handles literal patterns and wildcards
-                    self.gen_simple_match(&scrutinee_val, arms, symbols, &parent, &cont_blk)
+                self.builder().set_position_at_end(&cont_blk);
+                let res_llvm_ty = self.generator.get_val_llvm_type(term.ref_scheme().body());
+                let refs: Vec<(&LLVMValue, &LLVMBasicBlock)> =
+                    incoming_results.iter().map(|(v, b)| (v, b)).collect();
+                self.builder().phi_node(&res_llvm_ty, &refs, "match.res")
+            }
+        }
+    }
+
+    /// Recursively emit control-flow checks and variable bindings for `pattern` matching `val` of `val_ty`.
+    /// On mismatch at any depth, branches to `fail_blk`; on full match, leaves builder positioned in the success block!
+    fn emit_pattern_check<'b>(
+        &mut self,
+        fun: &LLVMFunction,
+        val: &LLVMValue,
+        val_ty: &Type,
+        pattern: &Pattern,
+        symbols: &mut VarEnv<'b>,
+        fail_blk: &LLVMBasicBlock,
+    ) {
+        match pattern {
+            Pattern::Wildcard => {}
+
+            Pattern::Var(id) => {
+                let vname = self.interner.trace(*id).to_owned();
+                let llvm_ty = self.generator.get_val_llvm_type(val_ty);
+                let slot_ptr = self
+                    .generator
+                    .create_entry_block_alloca(fun, &vname, &llvm_ty);
+                self.builder().store(val, &slot_ptr);
+                symbols.insert(
+                    *id,
+                    VarSlot {
+                        ptr: slot_ptr,
+                        ty: llvm_ty,
+                    },
+                );
+            }
+
+            Pattern::Lit(lit) => {
+                if matches!(lit, Lit::Unit) {
+                    return;
+                }
+                let lit_val = self.generator.gen_lit(lit);
+                let cmp = match lit {
+                    Lit::Int(_) | Lit::Bool(_) | Lit::Char(_) => self.builder().icmp(
+                        LLVMIntPredicate::LLVMIntEQ,
+                        val,
+                        &lit_val,
+                        "pat.eq",
+                    ),
+                    Lit::Float(_) => self.builder().fcmp(
+                        LLVMRealPredicate::LLVMRealOEQ,
+                        val,
+                        &lit_val,
+                        "pat.feq",
+                    ),
+                    Lit::Str(_) => {
+                        let cmp_fn = self.generator.declare_gs_str_cmp();
+                        let diff = self
+                            .builder()
+                            .call(&cmp_fn, &mut [*val, lit_val], "pat.strcmp");
+                        let zero = self.context().get_int32_const(0);
+                        self.builder()
+                            .icmp(LLVMIntPredicate::LLVMIntEQ, &diff, &zero, "pat.streq")
+                    }
+                    Lit::Unit => unreachable!(),
+                };
+                let ok_blk = self.context().append_basic_block(fun, "pat.lit.ok");
+                self.builder().cond_br(&cmp, &ok_blk, fail_blk);
+                self.builder().set_position_at_end(&ok_blk);
+            }
+
+            Pattern::Tuple(sub_pats) => {
+                let elem_tys = match val_ty {
+                    Type::Tuple(es) => es.clone(),
+                    _ => panic!("Tuple pattern matched against non-tuple type: {}", val_ty),
+                };
+                for (i, sub_pat) in sub_pats.iter().enumerate() {
+                    let elem_val = self.builder().extract_value(val, i, "pat.tup.elem");
+                    self.emit_pattern_check(
+                        fun,
+                        &elem_val,
+                        &elem_tys[i],
+                        sub_pat,
+                        symbols,
+                        fail_blk,
+                    );
                 }
             }
-        };
-        ret
+
+            Pattern::Constructor(ctor_name, sub_pats) => {
+                let (adt_name, type_args) = self.extract_adt_name_and_args(val_ty, ctor_name);
+                let adt_info = self
+                    .generator
+                    .adt_registry
+                    .get(&adt_name)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("Unknown ADT '{}' in pattern", adt_name));
+                let variant = adt_info
+                    .variants
+                    .iter()
+                    .find(|v| &v.name == ctor_name)
+                    .unwrap_or_else(|| panic!("Unknown variant '{}'", ctor_name));
+
+                let adt_storage_ty = self
+                    .generator
+                    .get_adt_storage_llvm_type(&adt_name, &type_args);
+
+                // 1. Load variant tag from `*val` (`ptr`) and compare against `variant.tag` (NOT arm index!)
+                let i32_ty = self.context().get_int32_type();
+                let tag_ptr =
+                    self.builder()
+                        .struct_field_ptr(&adt_storage_ty, val, 0, "pat.tag.ptr");
+                let actual_tag = self.builder().load(&i32_ty, &tag_ptr, "pat.tag");
+                let expected_tag = self.context().get_int32_const(variant.tag as i32);
+                let tag_eq = self.builder().icmp(
+                    LLVMIntPredicate::LLVMIntEQ,
+                    &actual_tag,
+                    &expected_tag,
+                    "pat.tag.eq",
+                );
+
+                let tag_ok_blk = self.context().append_basic_block(fun, "pat.ctor.ok");
+                self.builder().cond_br(&tag_eq, &tag_ok_blk, fail_blk);
+                self.builder().set_position_at_end(&tag_ok_blk);
+
+                // 2. Unpack fields and recursively match sub-patterns!
+                if !sub_pats.is_empty() {
+                    let subst: HashMap<String, Type> = adt_info
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(type_args.iter().cloned())
+                        .collect();
+                    let concrete_field_tys: Vec<Type> = variant
+                        .field_types
+                        .iter()
+                        .map(|ft| self.generator.substitute_type(ft, &subst))
+                        .collect();
+                    let field_llvm_tys: Vec<LLVMType> = concrete_field_tys
+                        .iter()
+                        .map(|ft| self.generator.get_val_llvm_type(ft))
+                        .collect();
+                    let variant_payload_ty =
+                        self.context().get_struct_type(&field_llvm_tys, false);
+
+                    let payload_ptr = self.builder().struct_field_ptr(
+                        &adt_storage_ty,
+                        val,
+                        1,
+                        "pat.payload.ptr",
+                    );
+
+                    for (i, sub_pat) in sub_pats.iter().enumerate() {
+                        let field_ptr = self.builder().struct_field_ptr(
+                            &variant_payload_ty,
+                            &payload_ptr,
+                            i,
+                            "pat.field.ptr",
+                        );
+                        let field_val =
+                            self.builder()
+                                .load(&field_llvm_tys[i], &field_ptr, "pat.field");
+                        self.emit_pattern_check(
+                            fun,
+                            &field_val,
+                            &concrete_field_tys[i],
+                            sub_pat,
+                            symbols,
+                            fail_blk,
+                        );
+                    }
+                }
+            }
+
+            Pattern::StructConstructor(_, _) => {
+                unreachable!("StructConstructor patterns are normalized during K-conversion")
+            }
+        }
+    }
+
+    fn extract_adt_name_and_args(&self, val_ty: &Type, ctor_name: &str) -> (String, Vec<Type>) {
+        let mut args = Vec::new();
+        let mut curr = val_ty;
+        while let Type::Comp(base, arg) = curr {
+            args.push(arg.as_ref().clone());
+            curr = base.as_ref();
+        }
+        args.reverse();
+        if let Type::Con(name) = curr {
+            return (name.clone(), args);
+        }
+        for (adt_name, info) in &self.generator.adt_registry {
+            if info.variants.iter().any(|v| v.name == ctor_name) {
+                return (adt_name.clone(), vec![]);
+            }
+        }
+        panic!("Could not determine ADT for constructor '{}'", ctor_name);
     }
 
     fn builder(&self) -> &LLVMBuilder {
@@ -624,491 +900,12 @@ impl<'i> LLVMEmit<'i> {
     fn context(&self) -> &LLVMContext {
         &self.generator.context
     }
-
-    /// Create a phi node for results, handling void types and type mismatches correctly.
-    /// LLVM phi nodes cannot have void type, so we return a dummy value for void results.
-    /// Also handles i32/i64 mismatches by coercing to i32 (the concrete Int type).
-    fn create_result_phi(&mut self, results: &[(LLVMValue, LLVMBasicBlock)], cont_blk: &LLVMBasicBlock, name: &str) -> LLVMValue {
-        if results.is_empty() {
-            return self.context().get_int32_const(0);
-        }
-        let result_ty = results[0].0.get_type();
-        let is_void = unsafe {
-            llvm_sys::core::LLVMGetTypeKind(result_ty.raw_ptr()) == llvm_sys::LLVMTypeKind::LLVMVoidTypeKind
-        };
-        if is_void {
-            self.context().get_int32_const(0)  // Dummy value, won't be used
-        } else {
-            // Check if all result types match
-            let all_same_type = results.iter().all(|(v, _)| v.get_type().raw_ptr() == result_ty.raw_ptr());
-
-            if all_same_type {
-                let incoming: Vec<_> = results.iter().map(|(v, b)| (v, b)).collect();
-                self.builder().phi_node(&result_ty, &incoming, name)
-            } else {
-                // Types differ - likely i32/i64 mismatch from polymorphic functions
-                // Coerce everything to i32 (the concrete Int type)
-                let i32_ty = self.context().get_int32_type();
-
-                // We need to insert conversions in the correct basic blocks
-                // For each result, if it's i64, truncate to i32
-                let converted: Vec<(LLVMValue, LLVMBasicBlock)> = results.iter().map(|(v, blk)| {
-                    let v_ty = v.get_type();
-                    let v_ty_kind = unsafe {
-                        llvm_sys::core::LLVMGetTypeKind(v_ty.raw_ptr())
-                    };
-
-                    if v_ty_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind {
-                        let bit_width = unsafe {
-                            llvm_sys::core::LLVMGetIntTypeWidth(v_ty.raw_ptr())
-                        };
-                        if bit_width == 64 {
-                            // Need to insert trunc instruction before the branch in blk
-                            // First, find the terminator instruction
-                            let terminator = unsafe {
-                                llvm_sys::core::LLVMGetBasicBlockTerminator(blk.raw_ptr())
-                            };
-                            if !terminator.is_null() {
-                                // Position builder before terminator
-                                unsafe {
-                                    llvm_sys::core::LLVMPositionBuilderBefore(
-                                        self.builder().raw_ptr(),
-                                        terminator
-                                    );
-                                }
-                            }
-                            let truncated = self.builder().trunc(v, &i32_ty, "phi.trunc");
-                            (truncated, blk.clone())
-                        } else if bit_width == 32 {
-                            (v.clone(), blk.clone())
-                        } else {
-                            // Other integer width - try to convert
-                            if bit_width < 32 {
-                                let terminator = unsafe {
-                                    llvm_sys::core::LLVMGetBasicBlockTerminator(blk.raw_ptr())
-                                };
-                                if !terminator.is_null() {
-                                    unsafe {
-                                        llvm_sys::core::LLVMPositionBuilderBefore(
-                                            self.builder().raw_ptr(),
-                                            terminator
-                                        );
-                                    }
-                                }
-                                let extended = self.builder().sext(v, &i32_ty, "phi.sext");
-                                (extended, blk.clone())
-                            } else {
-                                let terminator = unsafe {
-                                    llvm_sys::core::LLVMGetBasicBlockTerminator(blk.raw_ptr())
-                                };
-                                if !terminator.is_null() {
-                                    unsafe {
-                                        llvm_sys::core::LLVMPositionBuilderBefore(
-                                            self.builder().raw_ptr(),
-                                            terminator
-                                        );
-                                    }
-                                }
-                                let truncated = self.builder().trunc(v, &i32_ty, "phi.trunc");
-                                (truncated, blk.clone())
-                            }
-                        }
-                    } else {
-                        // Non-integer type - use as is
-                        (v.clone(), blk.clone())
-                    }
-                }).collect();
-
-                // Restore builder position to continuation block
-                self.builder().set_position_at_end(cont_blk);
-
-                let incoming: Vec<_> = converted.iter().map(|(v, b)| (v, b)).collect();
-                self.builder().phi_node(&i32_ty, &incoming, name)
-            }
-        }
-    }
-
-    fn alloca_for_var(&mut self, fun: &LLVMFunction, var: &VarDecl) -> LLVMValue {
-        let &VarDecl(pname, ref ptype) = var;
-        let name = self.interner.trace(pname);
-        let ty = ptype.body();
-        self.generator.create_entry_block_alloca(&fun, name, ty)
-    }
-
-    fn alloca_for_vars(&mut self, fun: &LLVMFunction, vars: &Vec<VarDecl>) -> Vec<LLVMValue> {
-        vars.iter().map(|v| self.alloca_for_var(fun, v)).collect()
-    }
-
-    fn trace_id(&mut self, id: Id) -> &str {
-        self.interner.trace(id)
-    }
-
-    fn get_value_ptr(&mut self, val: &LLVMValue) -> LLVMValue {
-        let ty = val.get_type();
-        let alloca = self.builder().alloca(&ty, "ptr");
-        self.builder().store(val, &alloca);
-        alloca
-    }
-
-    /// Convert a value to match the expected field type in an ADT
-    /// Handles polymorphic fields (i64) and pointer type mismatches
-    fn convert_to_field_type(&mut self, val: &LLVMValue, val_ty: &LLVMType, field_ty: &LLVMType) -> LLVMValue {
-        if val_ty.raw_ptr() == field_ty.raw_ptr() {
-            // Types match, no conversion needed
-            return val.clone();
-        }
-
-        let i64_ty = self.context().get_int64_type();
-        let i32_ty = self.context().get_int32_type();
-        let i8_ptr_ty = self.context().get_int8_type().get_ptr(0);
-
-        // Check if field is i64 (polymorphic slot)
-        if field_ty.raw_ptr() == i64_ty.raw_ptr() {
-            // Convert value to i64
-            if val_ty.raw_ptr() == i32_ty.raw_ptr() {
-                // i32 -> i64 via sext
-                return self.builder().sext(val, &i64_ty, "sext.i64");
-            } else {
-                // Pointer -> i64 via ptrtoint
-                return self.builder().ptr_to_int(val, &i64_ty, "ptr.to.i64");
-            }
-        }
-
-        // Check if field is i8* (opaque pointer for ADT)
-        if field_ty.raw_ptr() == i8_ptr_ty.raw_ptr() {
-            // Bitcast pointer to i8*
-            return self.builder().bit_cast(val, &i8_ptr_ty, "ptr.cast");
-        }
-
-        // Fallback: try bitcast
-        self.builder().bit_cast(val, field_ty, "field.cast")
-    }
-
-    /// Coerce a value to match the expected type
-    /// Handles integer width differences (i64 <-> i32) and pointer casts
-    fn coerce_value(&mut self, val: &LLVMValue, val_ty: &LLVMType, expected_ty: &LLVMType) -> LLVMValue {
-        let val_kind = unsafe { llvm_sys::core::LLVMGetTypeKind(val_ty.raw_ptr()) };
-        let expected_kind = unsafe { llvm_sys::core::LLVMGetTypeKind(expected_ty.raw_ptr()) };
-
-        // Handle integer type coercion
-        if val_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
-            && expected_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
-        {
-            let val_width = unsafe { llvm_sys::core::LLVMGetIntTypeWidth(val_ty.raw_ptr()) };
-            let expected_width = unsafe { llvm_sys::core::LLVMGetIntTypeWidth(expected_ty.raw_ptr()) };
-
-            if val_width > expected_width {
-                // Truncate (e.g., i64 -> i32)
-                return self.builder().trunc(val, expected_ty, "trunc");
-            } else if val_width < expected_width {
-                // Sign extend (e.g., i32 -> i64)
-                return self.builder().sext(val, expected_ty, "sext");
-            }
-        }
-
-        // Handle pointer to integer coercion
-        if val_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
-            && expected_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
-        {
-            return self.builder().ptr_to_int(val, expected_ty, "ptr.to.int");
-        }
-
-        // Handle integer to pointer coercion
-        if val_kind == llvm_sys::LLVMTypeKind::LLVMIntegerTypeKind
-            && expected_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
-        {
-            return self.builder().int_to_ptr(val, expected_ty, "int.to.ptr");
-        }
-
-        // Handle pointer to pointer (bitcast)
-        if val_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
-            && expected_kind == llvm_sys::LLVMTypeKind::LLVMPointerTypeKind
-        {
-            return self.builder().bit_cast(val, expected_ty, "ptr.cast");
-        }
-
-        // Fallback: try bitcast
-        self.builder().bit_cast(val, expected_ty, "cast")
-    }
-
-    /// Bind pattern variables to their values in the current scope
-    fn bind_pattern_vars<'b>(&mut self, scrutinee: &LLVMValue, pattern: &Pattern, symbols: &mut VarEnv<'b>) {
-        match pattern {
-            Pattern::Var(id) => {
-                // Bind the entire scrutinee to this variable
-                let var_name = self.interner.trace(*id);
-                let alloca = self.builder().alloca(&scrutinee.get_type(), var_name);
-                self.builder().store(scrutinee, &alloca);
-                symbols.insert(*id, alloca);
-            }
-            Pattern::Wildcard | Pattern::Lit(_) => {
-                // No bindings for wildcards or literals
-            }
-            Pattern::Constructor(_, sub_patterns) => {
-                // Extract payload and bind sub-patterns
-                if !sub_patterns.is_empty() {
-                    let payload = self.builder().extract_value(scrutinee, 1, "pat.payload");
-                    for (i, sub_pat) in sub_patterns.iter().enumerate() {
-                        let field = self.builder().extract_value(&payload, i, "pat.field");
-                        self.bind_pattern_vars(&field, sub_pat, symbols);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Bind pattern variables when scrutinee is a pointer to ADT struct
-    /// Uses the scrutinee's concrete type to compute instantiated field types
-    fn bind_pattern_vars_ptr<'b>(
-        &mut self,
-        scrutinee_ptr: &LLVMValue,
-        pattern: &Pattern,
-        scrutinee_type: &Type,
-        symbols: &mut VarEnv<'b>
-    ) {
-        match pattern {
-            Pattern::Var(id) => {
-                // Bind the pointer directly (variable holds pointer to ADT)
-                let var_name = self.interner.trace(*id);
-                let alloca = self.builder().alloca(&scrutinee_ptr.get_type(), var_name);
-                self.builder().store(scrutinee_ptr, &alloca);
-                symbols.insert(*id, alloca);
-            }
-            Pattern::Wildcard | Pattern::Lit(_) => {
-                // No bindings for wildcards or literals
-            }
-            Pattern::Constructor(ctor_name, sub_patterns) => {
-                // Extract payload fields via pointer and bind sub-patterns
-                if !sub_patterns.is_empty() {
-                    // Get instantiated field types from the ADT registry and scrutinee type
-                    // If scrutinee_type is a type variable, try to infer from constructor name
-                    let instantiated_field_types = self.get_instantiated_variant_field_types(
-                        scrutinee_type,
-                        ctor_name
-                    );
-
-                    // If we couldn't get types from scrutinee, try looking up directly from constructor
-                    let field_types = if instantiated_field_types.is_empty() {
-                        // Fall back to looking up variant field types directly
-                        self.get_variant_field_types_by_ctor(ctor_name)
-                    } else {
-                        instantiated_field_types
-                    };
-
-
-                    // Build the payload struct type with instantiated types
-                    let payload_llvm_types: Vec<LLVMType> = field_types.iter()
-                        .map(|t| self.generator.get_instantiated_field_type(t))
-                        .collect();
-                    let payload_ty = self.context().get_struct_type(&payload_llvm_types, false);
-                    let payload_ptr_ty = payload_ty.get_ptr(0);
-
-
-                    // Cast the payload pointer to the correct type
-                    let raw_payload_ptr = self.builder().struct_field_ptr(scrutinee_ptr, 1, "pat.payload.ptr");
-                    let payload_ptr = self.builder().bit_cast(&raw_payload_ptr, &payload_ptr_ty, "pat.payload.typed");
-
-                    for (i, sub_pat) in sub_patterns.iter().enumerate() {
-                        let field_ptr = self.builder().struct_field_ptr(&payload_ptr, i, "pat.field.ptr");
-                        let field_val = self.builder().load(&field_ptr, "pat.field");
-                        self.bind_pattern_vars(&field_val, sub_pat, symbols);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Get instantiated field types for a variant by substituting type parameters
-    fn get_instantiated_variant_field_types(&self, scrutinee_type: &Type, ctor_name: &str) -> Vec<Type> {
-        // Extract the ADT name and type arguments from scrutinee_type
-        // Type::Comp is a pair (base, arg), not (base, Vec<args>)
-        // For multi-param types like `Map k v`, this is nested: Comp(Comp(Map, k), v)
-        let (adt_name, type_args) = match scrutinee_type {
-            Type::Con(name) => (name.as_str(), vec![]),
-            Type::Comp(base, arg) => {
-                // Flatten the Comp chain to get base and all args
-                let mut args = vec![arg.as_ref().clone()];
-                let mut current = base.as_ref();
-                loop {
-                    match current {
-                        Type::Con(name) => {
-                            return self.lookup_and_substitute(name.as_str(), &args, ctor_name);
-                        }
-                        Type::Comp(inner_base, inner_arg) => {
-                            args.insert(0, inner_arg.as_ref().clone());
-                            current = inner_base.as_ref();
-                        }
-                        _ => return vec![],
-                    }
-                }
-            }
-            _ => return vec![],
-        };
-
-        self.lookup_and_substitute(adt_name, &type_args, ctor_name)
-    }
-
-    /// Helper to look up variant and substitute type parameters
-    fn lookup_and_substitute(&self, adt_name: &str, type_args: &[Type], ctor_name: &str) -> Vec<Type> {
-        // Look up ADT in registry
-        if let Some(adt_info) = self.generator.adt_registry.get(adt_name) {
-            // Find the variant
-            if let Some(variant) = adt_info.variants.iter().find(|v| v.name == ctor_name) {
-                // Substitute type parameters with concrete types
-                let params = &adt_info.type_params;
-                variant.field_types.iter()
-                    .map(|ft| self.substitute_type_params(ft, params, type_args))
-                    .collect()
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        }
-    }
-
-    /// Get variant field types by constructor name, without substitution
-    /// Used as fallback when scrutinee type is a type variable
-    fn get_variant_field_types_by_ctor(&self, ctor_name: &str) -> Vec<Type> {
-        for (_adt_name, adt_info) in &self.generator.adt_registry {
-            if let Some(variant) = adt_info.variants.iter().find(|v| v.name == ctor_name) {
-                return variant.field_types.clone();
-            }
-        }
-        vec![]
-    }
-
-    /// Substitute type parameters in a type with concrete types
-    fn substitute_type_params(&self, ty: &Type, params: &[String], args: &[Type]) -> Type {
-        match ty {
-            Type::Var(name) => {
-                // Check if this is a type parameter that should be substituted
-                if let Some(idx) = params.iter().position(|p| p == name) {
-                    if idx < args.len() {
-                        return args[idx].clone();
-                    }
-                }
-                ty.clone()
-            }
-            Type::Con(_) => ty.clone(),
-            Type::Comp(base, inner_arg) => {
-                let new_base = Box::new(self.substitute_type_params(base, params, args));
-                let new_arg = Box::new(self.substitute_type_params(inner_arg, params, args));
-                Type::Comp(new_base, new_arg)
-            }
-            Type::Arr(p, r) => {
-                let new_p = Box::new(self.substitute_type_params(p, params, args));
-                let new_r = Box::new(self.substitute_type_params(r, params, args));
-                Type::Arr(new_p, new_r)
-            }
-            Type::Prod(l, r) => {
-                let new_l = Box::new(self.substitute_type_params(l, params, args));
-                let new_r = Box::new(self.substitute_type_params(r, params, args));
-                Type::Prod(new_l, new_r)
-            }
-            Type::Void => Type::Void,
-        }
-    }
-
-    /// Generate code for simple pattern matching (literals, wildcards, variables)
-    fn gen_simple_match<'a: 'b, 'b>(
-        &mut self,
-        scrutinee: &LLVMValue,
-        arms: &'a [(Pattern, Option<P<Form>>, Box<TaggedTerm>)],
-        symbols: &mut VarEnv<'b>,
-        parent: &LLVMFunction,
-        cont_blk: &LLVMBasicBlock,
-    ) -> LLVMValue {
-        if arms.is_empty() {
-            // No arms - return a default value
-            return self.context().get_int32_const(0);
-        }
-
-        let mut results: Vec<(LLVMValue, LLVMBasicBlock)> = Vec::new();
-
-        // Generate a chain of conditional branches
-        for (i, (pattern, _guard, body)) in arms.iter().enumerate() {
-            let is_last = i == arms.len() - 1;
-
-            match pattern {
-                Pattern::Wildcard | Pattern::Var(_) => {
-                    // Always matches - generate body directly
-                    let mut arm_symbols = symbols.sub_env();
-                    self.bind_pattern_vars(scrutinee, pattern, &mut arm_symbols);
-
-                    let result = self.gen_expr(body, &mut arm_symbols);
-                    self.builder().br(cont_blk);
-                    let end_blk = self.builder().get_insert_block();
-                    results.push((result, end_blk));
-                    break; // No need to check further arms
-                }
-                Pattern::Lit(lit) => {
-                    // Generate comparison
-                    let lit_val = self.generator.gen_lit(lit);
-                    let cmp = match lit {
-                        Lit::Int(_) => {
-                            unsafe {
-                                LLVMValue::from_ref(llvm_sys::core::LLVMBuildICmp(
-                                    self.builder().raw_ptr(),
-                                    LLVMIntPredicate::LLVMIntEQ,
-                                    scrutinee.raw_ptr(),
-                                    lit_val.raw_ptr(),
-                                    crate::codegen::llvm::raw_string("cmp")
-                                ))
-                            }
-                        }
-                        Lit::Bool(_) => {
-                            unsafe {
-                                LLVMValue::from_ref(llvm_sys::core::LLVMBuildICmp(
-                                    self.builder().raw_ptr(),
-                                    LLVMIntPredicate::LLVMIntEQ,
-                                    scrutinee.raw_ptr(),
-                                    lit_val.raw_ptr(),
-                                    crate::codegen::llvm::raw_string("cmp")
-                                ))
-                            }
-                        }
-                        _ => {
-                            // For other types, fall through (simplified)
-                            self.context().get_int1_const(1)
-                        }
-                    };
-
-                    let then_blk = self.context().append_basic_block(parent, &format!("match.then.{}", i));
-                    let else_blk = if is_last {
-                        cont_blk.clone()
-                    } else {
-                        self.context().append_basic_block(parent, &format!("match.else.{}", i))
-                    };
-
-                    self.builder().cond_br(&cmp, &then_blk, &else_blk);
-
-                    // Generate then block
-                    self.builder().set_position_at_end(&then_blk);
-                    let result = self.gen_expr(body, symbols);
-                    self.builder().br(cont_blk);
-                    let end_blk = self.builder().get_insert_block();
-                    results.push((result, end_blk));
-
-                    // Continue from else block if not last
-                    if !is_last {
-                        self.builder().set_position_at_end(&else_blk);
-                    }
-                }
-                Pattern::Constructor(_, _) => {
-                    // Constructor patterns are handled in the ADT case
-                    // This shouldn't happen in simple match
-                    unreachable!("Constructor pattern in simple match")
-                }
-            }
-        }
-
-        // Build phi node for result
-        self.builder().set_position_at_end(cont_blk);
-        self.create_result_phi(&results, cont_blk, "match.result")
-    }
 }
 
 impl EmitProvider for LLVMCodegen {
-    fn gen_module<T>(&mut self, module: T) where T: IntoIterator<Item = FunDef> {}
+    fn gen_module<T>(&mut self, _module: T)
+    where
+        T: IntoIterator<Item = FunDef>,
+    {
+    }
 }

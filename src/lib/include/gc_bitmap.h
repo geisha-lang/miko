@@ -6,45 +6,27 @@
 
 #include "gc.h"
 
-// use one word for a single bitmap line
-typedef size_t bitmap_t;
+typedef uint64_t bitmap_t;
 
-#define Bitmap_size sizeof(bitmap_t)
-
-// // linked list manage heaps
-// typedef struct {
-//     gc_heap_t *heap;
-//     gc_hplst_t *next;
-//     mark_ctx_t *mark;
-// } gc_hplst_t;
-
-typedef struct {
-    uintptr_t base;
-    uintptr_t end;
-    size_t bitslen;
-    bitmap_t bits[];
-} gc_heap_t;
+#define BITS_PER_BITMAP (sizeof(bitmap_t) * 8)
 
 typedef struct gc_free_t {
     size_t size;
     struct gc_free_t *next;
 } gc_free_t;
 
-typedef struct {
-    bitmap_t *bits;
+typedef struct gc_heap_t {
+    uintptr_t base;
+    uintptr_t end;
+    size_t total_words;
     size_t bitslen;
-} mark_ctx_t;
+    bitmap_t *alloc_bits;
+    bitmap_t *mark_bits;
+    struct gc_heap_t *next;
+} gc_heap_t;
 
-#define Get_free_size(p) (((gc_free_t *)(p))->size)
-#define Set_free_size(p, s) (Get_free_size(p) = s)
-#define Get_free_next(p) (((gc_free_t *)(p))->next)
-#define Set_free_next(p, n) (((gc_free_t *)(p))->next = (gc_free_t *)(n))
-
-void visitRootObj(void *obj);
-
-
-#define INC_PTR_BYTES(p, b) (p = (char *)p + b)
-#define OFFSET_TO_IDX(_offset) ((_offset) / WORD_SIZE / sizeof(bitmap_t))
-#define OFFSET_TO_MASK(_offset) (1 << ((_offset) % sizeof(bitmap_t)))
+#define WORD_INDEX(_byte_offset) ((_byte_offset) / WORD_SIZE)
+#define OFFSET_TO_IDX(_byte_offset) (WORD_INDEX(_byte_offset) / BITS_PER_BITMAP)
+#define OFFSET_TO_MASK(_byte_offset) (((bitmap_t)1) << (WORD_INDEX(_byte_offset) % BITS_PER_BITMAP))
 
 #endif

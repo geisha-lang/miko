@@ -5,5 +5,5 @@ authors = ["nameoverflow <i@hcyue.me>"]
 edition = "2021"
 
 [dependencies]
-llvm-sys = "140"
+llvm-sys = "201"
 libc = "0.2"

@@ -1,15 +1,14 @@
-pub use llvm_sys::prelude::{LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMPassManagerRef,
-                        LLVMTypeRef, LLVMValueRef, LLVMBasicBlockRef};
+pub use llvm_sys::prelude::{
+    LLVMBasicBlockRef, LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef,
+};
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyFunction};
-pub use llvm_sys::{ LLVMIntPredicate, LLVMRealPredicate };
-use llvm_sys::transforms;
+pub use llvm_sys::core::*;
+pub use llvm_sys::{LLVMIntPredicate, LLVMRealPredicate};
+use llvm_sys::{LLVMLinkage, LLVMUnnamedAddr};
 
-use std::ptr;
 use libc::{c_char, c_uint, c_ulonglong};
 use std::ffi::CString;
-
-pub use llvm_sys::core::*;
-
+use std::ptr;
 
 pub trait LLVMWrapper<T> {
     fn from_ref(ptr: T) -> Self;
@@ -25,7 +24,7 @@ macro_rules! make_LLVM_wrapper {
                 $wrapper(ptr)
             }
             fn raw_ptr(&self) -> $origin {
-                self.0.clone()
+                self.0
             }
         }
     };
@@ -37,33 +36,28 @@ macro_rules! make_LLVM_wrapper {
                 $wrapper(ptr)
             }
             fn raw_ptr(&self) -> $origin {
-                self.0.clone()
+                self.0
             }
         }
-    }
+    };
 }
 
 make_LLVM_wrapper!(LLVMModuleRef, LLVMModule);
 make_LLVM_wrapper!(LLVMContextRef, LLVMContext);
-make_LLVM_wrapper!(LLVMPassManagerRef, LLVMFunctionPassManager);
 make_LLVM_wrapper!(LLVMValueRef, LLVMValue, Copy);
 make_LLVM_wrapper!(LLVMValueRef, LLVMFunction, Copy);
 make_LLVM_wrapper!(LLVMTypeRef, LLVMType, Copy);
 make_LLVM_wrapper!(LLVMBuilderRef, LLVMBuilder);
 make_LLVM_wrapper!(LLVMBasicBlockRef, LLVMBasicBlock);
 
-
-pub unsafe fn raw_string(s: &str) -> *mut c_char {
-    CString::new(s).unwrap().into_raw()
+pub fn to_cstring(s: &str) -> CString {
+    CString::new(s).unwrap_or_else(|_| CString::new(s.replace('\0', "")).unwrap())
 }
 
-
 macro_rules! method_type_getter {
-    ($name: ident, $fun: ident) => {
+    ($name:ident, $fun:ident) => {
         pub fn $name(&self) -> LLVMType {
-            unsafe {
-                LLVMType::from_ref($fun(self.0))
-            }
+            unsafe { LLVMType::from_ref($fun(self.0)) }
         }
     };
 }
@@ -72,6 +66,7 @@ impl LLVMContext {
     pub fn new() -> Self {
         unsafe { LLVMContext(LLVMContextCreate()) }
     }
+
     method_type_getter!(get_int1_type, LLVMInt1TypeInContext);
     method_type_getter!(get_int8_type, LLVMInt8TypeInContext);
     method_type_getter!(get_int16_type, LLVMInt16TypeInContext);
@@ -80,7 +75,16 @@ impl LLVMContext {
     method_type_getter!(get_double_type, LLVMDoubleTypeInContext);
     method_type_getter!(get_void_type, LLVMVoidTypeInContext);
 
-    pub fn get_function_type(ret: &LLVMType, param: &Vec<LLVMType>, is_var_arg: bool) -> LLVMType {
+    /// LLVM 15+ opaque pointer type (`ptr`)
+    pub fn get_ptr_type(&self) -> LLVMType {
+        unsafe { LLVMType::from_ref(LLVMPointerTypeInContext(self.0, 0)) }
+    }
+
+    pub fn get_array_type(elem_ty: &LLVMType, count: u64) -> LLVMType {
+        unsafe { LLVMType::from_ref(LLVMArrayType2(elem_ty.raw_ptr(), count)) }
+    }
+
+    pub fn get_function_type(ret: &LLVMType, param: &[LLVMType], is_var_arg: bool) -> LLVMType {
         let mut ps: Vec<_> = param.iter().map(|t| t.raw_ptr()).collect();
         let pc = ps.len() as c_uint;
         let flag = if is_var_arg { 1 } else { 0 };
@@ -88,80 +92,105 @@ impl LLVMContext {
         LLVMType::from_ref(fun)
     }
 
-    pub fn get_struct_type(&self, types: &Vec<LLVMType>, packed: bool) -> LLVMType {
+    pub fn get_struct_type(&self, types: &[LLVMType], packed: bool) -> LLVMType {
         let mut mems: Vec<_> = types.iter().map(|t| t.raw_ptr()).collect();
         let flag = if packed { 1 } else { 0 };
         let t = unsafe {
-            LLVMStructTypeInContext(self.0.clone(),
-                                    mems.as_mut_ptr(),
-                                    mems.len() as c_uint,
-                                    flag)
+            LLVMStructTypeInContext(self.0, mems.as_mut_ptr(), mems.len() as c_uint, flag)
         };
         LLVMType(t)
     }
 
-    pub fn get_const_string(&self, s: &str) -> LLVMValue {
+    /// Emit a null-terminated private global constant `[N+1 x i8]` and return its `ptr` (`LLVMValue`).
+    pub fn create_global_string(&self, module: &LLVMModule, s: &str, name: &str) -> LLVMValue {
         unsafe {
-            LLVMValue::from_ref(LLVMConstStringInContext(self.raw_ptr(),
-                                                         raw_string(s),
-                                                         s.len() as ::libc::c_uint,
-                                                         0))
+            let const_arr = LLVMConstStringInContext2(
+                self.0,
+                s.as_ptr() as *const c_char,
+                s.len(),
+                0, // null-terminate!
+            );
+            let arr_ty = LLVMTypeOf(const_arr);
+            let cname = to_cstring(name);
+            let global = LLVMAddGlobal(module.raw_ptr(), arr_ty, cname.as_ptr());
+            LLVMSetInitializer(global, const_arr);
+            LLVMSetGlobalConstant(global, 1);
+            LLVMSetLinkage(global, LLVMLinkage::LLVMPrivateLinkage);
+            LLVMSetUnnamedAddress(global, LLVMUnnamedAddr::LLVMGlobalUnnamedAddr);
+            LLVMValue::from_ref(global)
         }
     }
 
     pub fn get_double_const(&self, val: f64) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref(LLVMConstReal(self.get_double_type().raw_ptr(),
-                                              val as ::libc::c_double))
-        }
+        unsafe { LLVMValue::from_ref(LLVMConstReal(self.get_double_type().raw_ptr(), val)) }
     }
+
     pub fn get_int32_const(&self, val: i32) -> LLVMValue {
         unsafe {
-            LLVMValue::from_ref(LLVMConstInt(self.get_int32_type().raw_ptr(),
-                                             val as c_ulonglong,
-                                             1))
+            LLVMValue::from_ref(LLVMConstInt(
+                self.get_int32_type().raw_ptr(),
+                val as i64 as u64 as c_ulonglong,
+                1,
+            ))
         }
     }
+
     pub fn get_uint8_const(&self, val: u8) -> LLVMValue {
         unsafe {
-            LLVMValue::from_ref(LLVMConstInt(self.get_int8_type().raw_ptr(), val as c_ulonglong, 0))
+            LLVMValue::from_ref(LLVMConstInt(
+                self.get_int8_type().raw_ptr(),
+                val as c_ulonglong,
+                0,
+            ))
         }
     }
+
     pub fn get_int1_const(&self, val: u64) -> LLVMValue {
         unsafe {
-            LLVMValue::from_ref(LLVMConstInt(self.get_int1_type().raw_ptr(), val as c_ulonglong, 1))
+            LLVMValue::from_ref(LLVMConstInt(
+                self.get_int1_type().raw_ptr(),
+                val as c_ulonglong,
+                0,
+            ))
         }
     }
+
     pub fn get_int64_const(&self, val: i64) -> LLVMValue {
         unsafe {
-            LLVMValue::from_ref(LLVMConstInt(self.get_int64_type().raw_ptr(), val as c_ulonglong, 1))
+            LLVMValue::from_ref(LLVMConstInt(
+                self.get_int64_type().raw_ptr(),
+                val as u64 as c_ulonglong,
+                1,
+            ))
         }
     }
 
     pub fn append_basic_block(&self, fun: &LLVMFunction, name: &str) -> LLVMBasicBlock {
+        let cname = to_cstring(name);
         unsafe {
-            LLVMBasicBlock::from_ref(LLVMAppendBasicBlockInContext(self.raw_ptr(),
-                                                                   fun.raw_ptr(),
-                                                                   raw_string(name)))
+            LLVMBasicBlock::from_ref(LLVMAppendBasicBlockInContext(
+                self.raw_ptr(),
+                fun.raw_ptr(),
+                cname.as_ptr(),
+            ))
         }
     }
 }
 
 impl LLVMModule {
-    pub fn new(name: &str) -> Self {
-        unsafe { LLVMModule(LLVMModuleCreateWithName(raw_string(name))) }
-    }
     pub fn in_ctx(name: &str, ctx: &LLVMContext) -> Self {
-        unsafe { LLVMModule(LLVMModuleCreateWithNameInContext(raw_string(name), ctx.raw_ptr())) }
+        let cname = to_cstring(name);
+        unsafe { LLVMModule(LLVMModuleCreateWithNameInContext(cname.as_ptr(), ctx.raw_ptr())) }
     }
+
     pub fn dump(&self) {
         unsafe { LLVMDumpModule(self.raw_ptr()) }
     }
 
     pub fn get_function(&self, fun_name: &str) -> Option<LLVMFunction> {
+        let cname = to_cstring(fun_name);
         unsafe {
-            let n = raw_string(fun_name);
-            let f = LLVMGetNamedFunction(self.0.clone(), n);
+            let f = LLVMGetNamedFunction(self.0, cname.as_ptr());
             if f.is_null() {
                 None
             } else {
@@ -171,95 +200,84 @@ impl LLVMModule {
     }
 
     pub fn add_function(&self, fun_name: &str, fty: &LLVMType) -> LLVMFunction {
+        let cname = to_cstring(fun_name);
         unsafe {
-            let f = LLVMAddFunction(self.raw_ptr(), raw_string(fun_name), fty.raw_ptr());
+            let f = LLVMAddFunction(self.raw_ptr(), cname.as_ptr(), fty.raw_ptr());
             LLVMFunction::from_ref(f)
         }
     }
 
-}
-
-impl LLVMFunctionPassManager {
-    pub fn init_for_module(m: &LLVMModule) -> Self {
+    pub fn add_global(&self, ty: &LLVMType, name: &str) -> LLVMValue {
+        let cname = to_cstring(name);
         unsafe {
-            let llfpm = LLVMCreateFunctionPassManagerForModule(m.raw_ptr());
-            // Note: Some passes have been removed or moved in newer LLVM versions
-            // Using available passes for LLVM 14+
-            transforms::scalar::LLVMAddInstructionCombiningPass(llfpm);
-            transforms::scalar::LLVMAddReassociatePass(llfpm);
-            transforms::scalar::LLVMAddGVNPass(llfpm);
-            transforms::scalar::LLVMAddCFGSimplificationPass(llfpm);
-            transforms::scalar::LLVMAddMergedLoadStoreMotionPass(llfpm);
-            transforms::util::LLVMAddPromoteMemoryToRegisterPass(llfpm);
-            transforms::scalar::LLVMAddTailCallEliminationPass(llfpm);
-            LLVMInitializeFunctionPassManager(llfpm);
-            LLVMFunctionPassManager(llfpm)
+            let g = LLVMAddGlobal(self.raw_ptr(), ty.raw_ptr(), cname.as_ptr());
+            LLVMSetInitializer(g, LLVMConstNull(ty.raw_ptr()));
+            LLVMValue::from_ref(g)
         }
     }
-    pub fn run(&self, f: &LLVMFunction) {
+
+    pub fn get_global(&self, name: &str) -> Option<LLVMValue> {
+        let cname = to_cstring(name);
         unsafe {
-            LLVMRunFunctionPassManager(self.raw_ptr(), f.raw_ptr());
+            let g = LLVMGetNamedGlobal(self.raw_ptr(), cname.as_ptr());
+            if g.is_null() {
+                None
+            } else {
+                Some(LLVMValue::from_ref(g))
+            }
         }
     }
 }
 
 impl LLVMType {
-    pub fn get_ptr(&self, address_space: usize) -> Self {
-        unsafe { LLVMType(LLVMPointerType(self.0.clone(), address_space as c_uint)) }
-    }
-    pub fn get_element(&self) -> Self {
-        unsafe { LLVMType(LLVMGetElementType(self.0.clone())) }
+    pub fn get_null(&self) -> LLVMValue {
+        unsafe { LLVMValue::from_ref(LLVMConstNull(self.raw_ptr())) }
     }
 
-    pub fn get_null_ptr(&self) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref(LLVMConstNull(self.raw_ptr()))
-        }
-    }
-
-    /// Get an undef value of this type (useful for building aggregates)
     pub fn get_undef(&self) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref(LLVMGetUndef(self.raw_ptr()))
-        }
+        unsafe { LLVMValue::from_ref(LLVMGetUndef(self.raw_ptr())) }
     }
 
-    /// Get the parameter type at the given index (for function types)
+    pub fn is_void(&self) -> bool {
+        unsafe { LLVMGetTypeKind(self.raw_ptr()) == llvm_sys::LLVMTypeKind::LLVMVoidTypeKind }
+    }
+
+    pub fn get_return_type(&self) -> Self {
+        unsafe { LLVMType(LLVMGetReturnType(self.raw_ptr())) }
+    }
+
     pub fn get_param_type(&self, idx: usize) -> Self {
         unsafe {
-            let count = LLVMCountParamTypes(self.0.clone()) as usize;
+            let count = LLVMCountParamTypes(self.0) as usize;
             if idx >= count {
                 panic!("Parameter index {} out of bounds (count: {})", idx, count);
             }
             let mut params = vec![ptr::null_mut(); count];
-            LLVMGetParamTypes(self.0.clone(), params.as_mut_ptr());
+            LLVMGetParamTypes(self.0, params.as_mut_ptr());
             LLVMType(params[idx])
         }
     }
 
-    /// Get the number of parameters (for function types)
     pub fn count_param_types(&self) -> usize {
-        unsafe {
-            LLVMCountParamTypes(self.0.clone()) as usize
-        }
+        unsafe { LLVMCountParamTypes(self.0) as usize }
     }
 }
 
 impl LLVMValue {
     pub fn set_name(&self, name: &str) {
-        unsafe { LLVMSetValueName2(self.0.clone(), raw_string(name), name.len()) }
+        unsafe { LLVMSetValueName2(self.0, name.as_ptr() as *const c_char, name.len()) }
     }
 
     pub fn into_function(self) -> LLVMFunction {
         LLVMFunction::from_ref(self.0)
     }
+
     pub fn get_type(&self) -> LLVMType {
         unsafe { LLVMType::from_ref(LLVMTypeOf(self.0)) }
     }
+
     pub fn dump(&self) {
-        unsafe {
-            LLVMDumpValue(self.raw_ptr())
-        }
+        unsafe { LLVMDumpValue(self.raw_ptr()) }
     }
 }
 
@@ -267,9 +285,11 @@ impl LLVMFunction {
     pub fn into_value(self) -> LLVMValue {
         LLVMValue::from_ref(self.0)
     }
+
     pub fn get_function_type(&self) -> LLVMType {
         unsafe { LLVMType::from_ref(LLVMGlobalGetValueType(self.raw_ptr())) }
     }
+
     pub fn count_basic_blocks(&self) -> usize {
         unsafe { LLVMCountBasicBlocks(self.raw_ptr()) as usize }
     }
@@ -291,31 +311,21 @@ impl LLVMFunction {
     }
 }
 
-macro_rules! method_build_instr {
-    ($name: ident, $fun: ident, $($param:ident : $ty:ty),* => $t:ident: &str) => {
-    pub fn $name(&self, $($param: $ty),* , $t: &str) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref($fun(self.raw_ptr(), $($param.raw_ptr()),*, raw_string($t)))
-        }
-    }
-    };
-    ($name: ident, $fun: ident, $($param:ident : $ty:ty),*) => {
-    pub fn $name(&self, $($param: $ty),*) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref($fun(self.raw_ptr(), $($param.raw_ptr()),*))
-        }
-    }
-    };
-}
-
 impl LLVMBuilder {
     pub fn in_ctx(ctx: &LLVMContext) -> Self {
         unsafe { LLVMBuilder(LLVMCreateBuilderInContext(ctx.raw_ptr())) }
     }
 
     pub fn set_position(&self, block: &LLVMBasicBlock, instr: &LLVMValue) {
-        unsafe { LLVMPositionBuilder(self.raw_ptr(), block.raw_ptr(), instr.raw_ptr()) }
+        unsafe {
+            if instr.raw_ptr().is_null() {
+                LLVMPositionBuilderAtEnd(self.raw_ptr(), block.raw_ptr());
+            } else {
+                LLVMPositionBuilder(self.raw_ptr(), block.raw_ptr(), instr.raw_ptr());
+            }
+        }
     }
+
     pub fn set_position_at_end(&self, block: &LLVMBasicBlock) {
         unsafe { LLVMPositionBuilderAtEnd(self.raw_ptr(), block.raw_ptr()) }
     }
@@ -324,129 +334,217 @@ impl LLVMBuilder {
         unsafe { LLVMBasicBlock::from_ref(LLVMGetInsertBlock(self.raw_ptr())) }
     }
 
-    method_build_instr!(alloca, LLVMBuildAlloca, ty: &LLVMType => dest: &str);
-    method_build_instr!(phi, LLVMBuildPhi, ty: &LLVMType => dest: &str);
-    method_build_instr!(store, LLVMBuildStore, val: &LLVMValue, ptr: &LLVMValue);
-
-    pub fn load(&self, ptr: &LLVMValue, dest: &str) -> LLVMValue {
-        let ty = ptr.get_type().get_element();
+    pub fn current_block_has_terminator(&self) -> bool {
         unsafe {
-            LLVMValue::from_ref(LLVMBuildLoad2(self.raw_ptr(), ty.raw_ptr(), ptr.raw_ptr(), raw_string(dest)))
-        }
-    }
-    method_build_instr!(ret, LLVMBuildRet, val: &LLVMValue);
-    method_build_instr!(cond_br, LLVMBuildCondBr, cond: &LLVMValue, then: &LLVMBasicBlock, el: &LLVMBasicBlock);
-    method_build_instr!(br, LLVMBuildBr, cont: &LLVMBasicBlock);
-    method_build_instr!(bit_cast, LLVMBuildBitCast, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
-    method_build_instr!(sext, LLVMBuildSExt, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
-    method_build_instr!(zext, LLVMBuildZExt, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
-    method_build_instr!(trunc, LLVMBuildTrunc, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
-    method_build_instr!(ptr_to_int, LLVMBuildPtrToInt, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
-    method_build_instr!(int_to_ptr, LLVMBuildIntToPtr, val: &LLVMValue, dest_ty: &LLVMType => dest: &str);
-
-    pub fn phi_node<'a, I>(&self, ty: &LLVMType, incoming: I, dest: &str) -> LLVMValue
-        where I: IntoIterator<Item=&'a (&'a LLVMValue, &'a LLVMBasicBlock)>
-    {
-        unsafe {
-            let phi = LLVMBuildPhi(self.raw_ptr(), ty.raw_ptr(), raw_string(dest));
-            let (mut vals, mut blks): (Vec<_>, Vec<_>) = incoming
-                .into_iter()
-                .map(|&(val, blk)| (val.raw_ptr(), blk.raw_ptr()))
-                .unzip();
-            let count = vals.len();
-            LLVMAddIncoming(phi, vals.as_mut_ptr(), blks.as_mut_ptr(), count as c_uint);
-            LLVMValue::from_ref(phi)
+            let blk = LLVMGetInsertBlock(self.raw_ptr());
+            !blk.is_null() && !LLVMGetBasicBlockTerminator(blk).is_null()
         }
     }
 
-    pub fn ret_void(&self) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref(LLVMBuildRet(self.raw_ptr(), ptr::null_mut()))
-        }
+    pub fn alloca(&self, ty: &LLVMType, dest: &str) -> LLVMValue {
+        let c = to_cstring(dest);
+        unsafe { LLVMValue::from_ref(LLVMBuildAlloca(self.raw_ptr(), ty.raw_ptr(), c.as_ptr())) }
     }
 
-    pub fn unreachable(&self) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref(LLVMBuildUnreachable(self.raw_ptr()))
-        }
+    pub fn store(&self, val: &LLVMValue, ptr: &LLVMValue) -> LLVMValue {
+        unsafe { LLVMValue::from_ref(LLVMBuildStore(self.raw_ptr(), val.raw_ptr(), ptr.raw_ptr())) }
     }
 
-    pub fn call(&self, fun: &LLVMFunction, args: &mut Vec<LLVMValue>, name: &str) -> LLVMValue {
-        let fn_ty = fun.get_function_type();
-        self.call_with_type(&fn_ty, fun, args, name)
-    }
-
-    pub fn call_with_type(&self, fn_ty: &LLVMType, fun: &LLVMFunction, args: &mut Vec<LLVMValue>, name: &str) -> LLVMValue {
-        let mut _args: Vec<_> = args.iter_mut().map(|arg| arg.raw_ptr()).collect();
+    /// Explicit-type load (`LLVMBuildLoad2`), compatible with LLVM 20 opaque pointers.
+    pub fn load(&self, elem_ty: &LLVMType, ptr: &LLVMValue, dest: &str) -> LLVMValue {
+        let c = to_cstring(dest);
         unsafe {
-            let f = fun.raw_ptr();
-            // Void-returning functions cannot have a named result
-            let ret_ty = LLVMGetReturnType(fn_ty.raw_ptr());
-            let call_name = if LLVMGetTypeKind(ret_ty) == llvm_sys::LLVMTypeKind::LLVMVoidTypeKind {
-                raw_string("")
-            } else {
-                raw_string(name)
-            };
-            let ret = LLVMBuildCall2(self.raw_ptr(),
-                                     fn_ty.raw_ptr(),
-                                     f,
-                                     _args.as_mut_ptr(),
-                                     args.len() as c_uint,
-                                     call_name);
-            LLVMValue::from_ref(ret)
-        }
-
-    }
-
-    pub fn struct_field_ptr(&self, ptr: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
-        let struct_ty = ptr.get_type().get_element();
-        unsafe {
-            let ret =
-                LLVMBuildStructGEP2(self.raw_ptr(), struct_ty.raw_ptr(), ptr.raw_ptr(), idx as u32, raw_string(name));
-            LLVMValue::from_ref(ret)
-        }
-    }
-
-    /// Build a switch instruction
-    pub fn switch(&self, val: &LLVMValue, default_blk: &LLVMBasicBlock, num_cases: usize) -> LLVMValue {
-        unsafe {
-            LLVMValue::from_ref(LLVMBuildSwitch(
+            LLVMValue::from_ref(LLVMBuildLoad2(
                 self.raw_ptr(),
-                val.raw_ptr(),
-                default_blk.raw_ptr(),
-                num_cases as c_uint
+                elem_ty.raw_ptr(),
+                ptr.raw_ptr(),
+                c.as_ptr(),
             ))
         }
     }
 
-    /// Add a case to a switch instruction
-    pub fn switch_add_case(switch: &LLVMValue, on_val: &LLVMValue, dest: &LLVMBasicBlock) {
+    /// Explicit-type struct GEP (`LLVMBuildStructGEP2`), compatible with LLVM 20 opaque pointers.
+    pub fn struct_field_ptr(
+        &self,
+        struct_ty: &LLVMType,
+        ptr: &LLVMValue,
+        idx: usize,
+        name: &str,
+    ) -> LLVMValue {
+        let c = to_cstring(name);
         unsafe {
-            LLVMAddCase(switch.raw_ptr(), on_val.raw_ptr(), dest.raw_ptr());
+            LLVMValue::from_ref(LLVMBuildStructGEP2(
+                self.raw_ptr(),
+                struct_ty.raw_ptr(),
+                ptr.raw_ptr(),
+                idx as u32,
+                c.as_ptr(),
+            ))
         }
     }
 
-    /// Extract a value from an aggregate (struct/array)
+    pub fn ret(&self, val: &LLVMValue) -> LLVMValue {
+        unsafe { LLVMValue::from_ref(LLVMBuildRet(self.raw_ptr(), val.raw_ptr())) }
+    }
+
+    pub fn ret_void(&self) -> LLVMValue {
+        unsafe { LLVMValue::from_ref(LLVMBuildRetVoid(self.raw_ptr())) }
+    }
+
+    pub fn cond_br(
+        &self,
+        cond: &LLVMValue,
+        then_blk: &LLVMBasicBlock,
+        else_blk: &LLVMBasicBlock,
+    ) -> LLVMValue {
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildCondBr(
+                self.raw_ptr(),
+                cond.raw_ptr(),
+                then_blk.raw_ptr(),
+                else_blk.raw_ptr(),
+            ))
+        }
+    }
+
+    pub fn br(&self, cont: &LLVMBasicBlock) -> LLVMValue {
+        unsafe { LLVMValue::from_ref(LLVMBuildBr(self.raw_ptr(), cont.raw_ptr())) }
+    }
+
+    pub fn unreachable(&self) -> LLVMValue {
+        unsafe { LLVMValue::from_ref(LLVMBuildUnreachable(self.raw_ptr())) }
+    }
+
+    pub fn xor(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildXor(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn neg(&self, val: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe { LLVMValue::from_ref(LLVMBuildNeg(self.raw_ptr(), val.raw_ptr(), c.as_ptr())) }
+    }
+
+    pub fn fneg(&self, val: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe { LLVMValue::from_ref(LLVMBuildFNeg(self.raw_ptr(), val.raw_ptr(), c.as_ptr())) }
+    }
+
+    pub fn icmp(&self, pred: LLVMIntPredicate, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildICmp(
+                self.raw_ptr(),
+                pred,
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn fcmp(&self, pred: LLVMRealPredicate, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildFCmp(
+                self.raw_ptr(),
+                pred,
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn phi_node<'a, I>(&self, ty: &LLVMType, incoming: I, dest: &str) -> LLVMValue
+    where
+        I: IntoIterator<Item = &'a (&'a LLVMValue, &'a LLVMBasicBlock)>,
+    {
+        let c = to_cstring(dest);
+        unsafe {
+            let phi = LLVMBuildPhi(self.raw_ptr(), ty.raw_ptr(), c.as_ptr());
+            let (mut vals, mut blks): (Vec<_>, Vec<_>) = incoming
+                .into_iter()
+                .map(|&(val, blk)| (val.raw_ptr(), blk.raw_ptr()))
+                .unzip();
+            if !vals.is_empty() {
+                LLVMAddIncoming(
+                    phi,
+                    vals.as_mut_ptr(),
+                    blks.as_mut_ptr(),
+                    vals.len() as c_uint,
+                );
+            }
+            LLVMValue::from_ref(phi)
+        }
+    }
+
+    pub fn call(&self, fun: &LLVMFunction, args: &mut [LLVMValue], name: &str) -> LLVMValue {
+        let fn_ty = fun.get_function_type();
+        self.call_value(&fn_ty, &fun.into_value(), args, name)
+    }
+
+    pub fn call_value(
+        &self,
+        fn_ty: &LLVMType,
+        fun_val: &LLVMValue,
+        args: &mut [LLVMValue],
+        name: &str,
+    ) -> LLVMValue {
+        let mut raw_args: Vec<_> = args.iter().map(|arg| arg.raw_ptr()).collect();
+        unsafe {
+            let ret_ty = LLVMGetReturnType(fn_ty.raw_ptr());
+            let c = if LLVMGetTypeKind(ret_ty) == llvm_sys::LLVMTypeKind::LLVMVoidTypeKind {
+                to_cstring("")
+            } else {
+                to_cstring(name)
+            };
+            let ret = LLVMBuildCall2(
+                self.raw_ptr(),
+                fn_ty.raw_ptr(),
+                fun_val.raw_ptr(),
+                raw_args.as_mut_ptr(),
+                raw_args.len() as c_uint,
+                c.as_ptr(),
+            );
+            LLVMValue::from_ref(ret)
+        }
+    }
+
     pub fn extract_value(&self, agg: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
         unsafe {
             LLVMValue::from_ref(LLVMBuildExtractValue(
                 self.raw_ptr(),
                 agg.raw_ptr(),
                 idx as c_uint,
-                raw_string(name)
+                c.as_ptr(),
             ))
         }
     }
 
-    /// Insert a value into an aggregate (struct/array)
-    pub fn insert_value(&self, agg: &LLVMValue, val: &LLVMValue, idx: usize, name: &str) -> LLVMValue {
+    pub fn insert_value(
+        &self,
+        agg: &LLVMValue,
+        val: &LLVMValue,
+        idx: usize,
+        name: &str,
+    ) -> LLVMValue {
+        let c = to_cstring(name);
         unsafe {
             LLVMValue::from_ref(LLVMBuildInsertValue(
                 self.raw_ptr(),
                 agg.raw_ptr(),
                 val.raw_ptr(),
                 idx as c_uint,
-                raw_string(name)
+                c.as_ptr(),
             ))
         }
     }
@@ -469,13 +567,7 @@ impl Drop for LLVMModule {
         }
     }
 }
-impl Drop for LLVMContext {
-    fn drop(&mut self) {
-        unsafe {
-            LLVMContextDispose(self.0);
-        }
-    }
-}
+
 impl Drop for LLVMBuilder {
     fn drop(&mut self) {
         unsafe {
@@ -483,16 +575,11 @@ impl Drop for LLVMBuilder {
         }
     }
 }
-impl Drop for LLVMFunctionPassManager {
+
+impl Drop for LLVMContext {
     fn drop(&mut self) {
         unsafe {
-            LLVMDisposePassManager(self.0);
+            LLVMContextDispose(self.0);
         }
     }
 }
-
-pub type LLVMOperateBuild = unsafe extern "C" fn(LLVMBuilderRef,
-                                                 LLVMValueRef,
-                                                 LLVMValueRef,
-                                                 *const ::libc::c_char)
-                                                 -> LLVMValueRef;

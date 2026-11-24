@@ -1,365 +1,425 @@
-use crate::syntax::form::*;
-use crate::internal::*;
-use crate::types;
-use crate::types::*;
-
-use crate::utils::*;
-
-use std::collections::LinkedList;
-use std::collections::HashMap;
-use std::collections::HashSet;
-
-use std::iter::IntoIterator;
-use std::iter::DoubleEndedIterator;
-
+use std::collections::{HashMap, HashSet, LinkedList};
+use std::mem;
 use std::ops::DerefMut;
 
-use std::mem;
+use crate::internal::*;
+use crate::syntax::form::*;
+use crate::types::{self, *};
+use crate::utils::*;
 
+use super::constraint::Constraint;
+pub use super::error::TypeError;
+use super::mono::{mangle_type, InstantiationRegistry};
 use super::subst::*;
-use super::constraint::{ Constraint };
-pub use super::error::{ TypeError };
-use super::mono::{InstantiationRegistry, Instantiation, CallSite};
+
+#[derive(Clone, Debug)]
+struct WantedConstraint {
+    concept: Name,
+    ty: Type,
+    span: Span,
+}
 
 #[derive(Debug)]
 pub struct Infer<'interner> {
     unique: usize,
     interner: &'interner mut Interner,
     constraints: LinkedList<Constraint>,
-    /// Registry of ADT definitions for pattern matching
-    pub adt_registry: types::AdtRegistry,
-    /// Registry for tracking polymorphic function instantiations
+    subst: Subst,
+    wanted_constraints: Vec<WantedConstraint>,
+    /// Type aliases: name -> (type_params, target_type)
+    pub alias_registry: HashMap<Name, (Vec<Name>, Type)>,
+    /// ADT definitions
+    pub adt_registry: AdtRegistry,
+    /// Concept definitions
+    pub concept_registry: ConceptRegistry,
+    /// Instance definitions
+    pub instance_registry: InstanceRegistry,
+    /// Method name -> (Concept name, index of constrained type parameter in Concept)
+    pub concept_methods: HashMap<Name, (Name, usize)>,
+    /// Polymorphic function registry for monomorphization
     pub instantiation_registry: InstantiationRegistry,
-    /// Active call sites - maps fresh type variables to their call site info
-    call_sites: Vec<CallSite>,
+    /// Names of top-level value (non-function) definitions
+    pub global_values: HashSet<Id>,
 }
-
-
-//fn generalize(e: &TypeEnv, ty: Type) -> Scheme {
-//}
 
 fn to_mono(ty: Type) -> Scheme {
     Scheme::Mono(ty)
 }
 
-/// Check if a type is fully concrete (contains no type variables)
-fn is_concrete_type(ty: &Type) -> bool {
-    match ty {
-        Type::Var(_) => false,
-        Type::Con(_) | Type::Void => true,
-        Type::Arr(p, r) => is_concrete_type(p) && is_concrete_type(r),
-        Type::Prod(l, r) => is_concrete_type(l) && is_concrete_type(r),
-        Type::Comp(base, arg) => is_concrete_type(base) && is_concrete_type(arg),
-    }
-}
-
-
 impl<'i> Infer<'i> {
     pub fn new(interner: &'i mut Interner) -> Infer<'i> {
-        Infer {
+        let mut inf = Infer {
             unique: 0,
-            constraints: LinkedList::new(),
             interner,
+            constraints: LinkedList::new(),
+            subst: HashMap::new(),
+            wanted_constraints: Vec::new(),
+            alias_registry: HashMap::new(),
             adt_registry: HashMap::new(),
+            concept_registry: HashMap::new(),
+            instance_registry: Vec::new(),
+            concept_methods: HashMap::new(),
             instantiation_registry: InstantiationRegistry::new(),
-            call_sites: Vec::new(),
-        }
+            global_values: HashSet::new(),
+        };
+        inf.register_builtin_concepts();
+        inf.register_default_list_adt();
+        inf
     }
 
     pub fn new_env<'a>() -> TypeEnv<'a> {
         TypeEnv::new()
     }
 
-    /// Get a unique id, then increase the counter
+    fn register_builtin_concepts(&mut self) {
+        for (concept, prims) in [
+            ("$Num", &["Int", "Float"][..]),
+            ("$EqOp", &["Int", "Float", "Bool", "Char", "String"][..]),
+            ("$OrdOp", &["Int", "Float", "Char", "String"][..]),
+        ] {
+            self.concept_registry.insert(
+                concept.to_string(),
+                ConceptInfo {
+                    name: concept.to_string(),
+                    type_params: vec!["a".to_string()],
+                    superclasses: vec![],
+                    methods: vec![],
+                },
+            );
+            for p in prims {
+                self.instance_registry.push(InstanceInfo {
+                    concept_name: concept.to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    target_types: vec![Type::Con((*p).to_string())],
+                    method_impls: HashMap::new(),
+                });
+            }
+        }
+    }
+
+    fn register_default_list_adt(&mut self) {
+        let list_ty = Type::compose(Type::Con("List".to_string()), Type::Var("a".to_string()));
+        let nil_scm = Scheme::Poly(vec!["a".to_string()], list_ty.clone());
+        let cons_ty = Type::Arr(
+            vec![Type::Var("a".to_string()), list_ty.clone()],
+            P(list_ty),
+        );
+        let cons_scm = Scheme::Poly(vec!["a".to_string()], cons_ty);
+        self.adt_registry.insert(
+            "List".to_string(),
+            AdtInfo {
+                name: "List".to_string(),
+                type_params: vec!["a".to_string()],
+                variants: vec![
+                    VariantInfo {
+                        name: "Nil".to_string(),
+                        tag: 0,
+                        field_names: None,
+                        field_types: vec![],
+                        scheme: nil_scm,
+                    },
+                    VariantInfo {
+                        name: "Cons".to_string(),
+                        tag: 1,
+                        field_names: None,
+                        field_types: vec![
+                            Type::Var("a".to_string()),
+                            Type::compose(
+                                Type::Con("List".to_string()),
+                                Type::Var("a".to_string()),
+                            ),
+                        ],
+                        scheme: cons_scm,
+                    },
+                ],
+            },
+        );
+    }
+
     fn unique(&mut self) -> usize {
-        self.unique = self.unique + 1;
+        self.unique += 1;
         self.unique
     }
 
-    /// Generate a new temp type variable name
-    /// All generated names start with a dot
     fn fresh(&mut self) -> Type {
-        let mut f = String::from(".");
-        f.push_str(self.unique().to_string().as_str());
-        Type::Var(f)
+        Type::Var(format!(".{}", self.unique()))
     }
 
-    /// Add a constraint
-    fn uni(&mut self, left: (&Type, Span), right: (&Type, Span)) {
-        self.constraints.push_back(Constraint(left.0.clone(), right.0.clone()));
+    fn uni(&mut self, left: &Type, right: &Type, span: Span) {
+        self.constraints
+            .push_back(Constraint(left.clone(), right.clone(), span));
     }
 
-    /// Temporary instantiate a polymorphism type
-    fn instantiate(&mut self, scm: &Scheme) -> Type {
-        self.instantiate_with_tracking(scm, None)
+    /// Expand type aliases recursively, detecting cyclic definitions.
+    pub fn expand_type(&self, ty: &Type, span: Span) -> Result<Type, TypeError> {
+        let mut visiting = HashSet::new();
+        self.expand_type_inner(ty, &mut visiting, span)
     }
 
-    /// Instantiate a polymorphism type with optional tracking for monomorphization
-    fn instantiate_with_tracking(&mut self, scm: &Scheme, fn_name: Option<Name>) -> Type {
-        use self::Scheme::*;
-        match *scm {
-            Mono(ref ty) => ty.clone(),
-            Poly(ref tvs, ref ty) => {
-                let tvs_: Vec<_> = tvs.iter().map(|_| self.fresh()).collect();
-                let sub: Subst = tvs.clone().into_iter().zip(tvs_.clone()).collect();
-
-                // Track this instantiation for monomorphization
-                if let Some(fn_name) = fn_name {
-                    let fresh_var_names: Vec<Name> = tvs_.iter()
-                        .filter_map(|t| if let Type::Var(n) = t { Some(n.clone()) } else { None })
-                        .collect();
-
-                    // Record context for each fresh variable
-                    for (i, var_name) in fresh_var_names.iter().enumerate() {
-                        self.instantiation_registry.record_context(var_name.clone(), fn_name.clone(), i);
+    fn expand_type_inner(
+        &self,
+        ty: &Type,
+        visiting: &mut HashSet<Name>,
+        span: Span,
+    ) -> Result<Type, TypeError> {
+        match ty {
+            Type::Void | Type::Var(_) => Ok(ty.clone()),
+            Type::Con(name) => {
+                if let Some((params, target)) = self.alias_registry.get(name) {
+                    if !params.is_empty() {
+                        return Err(TypeError::TypeAliasError(
+                            format!(
+                                "Type alias '{}' expects {} type argument(s), got 0",
+                                name,
+                                params.len()
+                            ),
+                            span,
+                        ));
                     }
-
-                    // Record the call site
-                    self.call_sites.push(CallSite::new(fn_name, fresh_var_names));
-                }
-
-                ty.clone().apply(&sub)
-            }
-            PolyConstrained(ref tvs, ref _constraints, ref ty) => {
-                // For now, treat constrained poly the same as unconstrained
-                // In the future, we'd also generate "wanted" constraints here
-                let tvs_: Vec<_> = tvs.iter().map(|_| self.fresh()).collect();
-                let sub: Subst = tvs.clone().into_iter().zip(tvs_.clone()).collect();
-
-                // Track this instantiation for monomorphization
-                if let Some(fn_name) = fn_name {
-                    let fresh_var_names: Vec<Name> = tvs_.iter()
-                        .filter_map(|t| if let Type::Var(n) = t { Some(n.clone()) } else { None })
-                        .collect();
-
-                    // Record context for each fresh variable
-                    for (i, var_name) in fresh_var_names.iter().enumerate() {
-                        self.instantiation_registry.record_context(var_name.clone(), fn_name.clone(), i);
+                    if !visiting.insert(name.clone()) {
+                        return Err(TypeError::TypeAliasError(
+                            format!("Cyclic type alias involving '{}'", name),
+                            span,
+                        ));
                     }
-
-                    // Record the call site
-                    self.call_sites.push(CallSite::new(fn_name, fresh_var_names));
-                }
-
-                ty.clone().apply(&sub)
-            }
-            Slot => unreachable!(),
-        }
-    }
-
-    /// Collect concrete instantiations from the substitution after solve()
-    fn collect_instantiations(&mut self, sub: &Subst) {
-        // Process each call site to determine concrete type arguments
-        for call_site in &self.call_sites {
-            let mut type_args = Vec::new();
-            let mut all_concrete = true;
-
-            for fresh_var in &call_site.fresh_vars {
-                if let Some(concrete_type) = sub.get(fresh_var) {
-                    // Check if the type is fully concrete (no type variables)
-                    if is_concrete_type(concrete_type) {
-                        type_args.push(concrete_type.clone());
-                    } else {
-                        all_concrete = false;
-                        break;
-                    }
+                    let res = self.expand_type_inner(target, visiting, span)?;
+                    visiting.remove(name);
+                    Ok(res)
                 } else {
-                    // Type variable wasn't resolved - use a default or skip
-                    all_concrete = false;
-                    break;
+                    Ok(ty.clone())
                 }
             }
+            Type::Arr(params, ret) => {
+                let mut new_ps = Vec::with_capacity(params.len());
+                for p in params {
+                    new_ps.push(self.expand_type_inner(p, visiting, span)?);
+                }
+                let new_r = self.expand_type_inner(ret, visiting, span)?;
+                Ok(Type::Arr(new_ps, P(new_r)))
+            }
+            Type::Tuple(elems) => {
+                let mut new_es = Vec::with_capacity(elems.len());
+                for e in elems {
+                    new_es.push(self.expand_type_inner(e, visiting, span)?);
+                }
+                Ok(Type::Tuple(new_es))
+            }
+            Type::Comp(_, _) => {
+                // Flatten application spine: head arg1 arg2 ...
+                let mut args = Vec::new();
+                let mut curr = ty;
+                while let Type::Comp(base, arg) = curr {
+                    args.push(self.expand_type_inner(arg, visiting, span)?);
+                    curr = base.as_ref();
+                }
+                args.reverse();
 
-            // Only add instantiation if all type arguments are concrete
-            if all_concrete && !type_args.is_empty() {
-                let inst = Instantiation::new(call_site.function.clone(), type_args.clone());
-                self.instantiation_registry.add_instantiation(inst);
+                if let Type::Con(name) = curr {
+                    if let Some((params, target)) = self.alias_registry.get(name) {
+                        if params.len() != args.len() {
+                            return Err(TypeError::TypeAliasError(
+                                format!(
+                                    "Type alias '{}' expects {} type argument(s), got {}",
+                                    name,
+                                    params.len(),
+                                    args.len()
+                                ),
+                                span,
+                            ));
+                        }
+                        if !visiting.insert(name.clone()) {
+                            return Err(TypeError::TypeAliasError(
+                                format!("Cyclic type alias involving '{}'", name),
+                                span,
+                            ));
+                        }
+                        let sub: Subst = params.iter().cloned().zip(args.into_iter()).collect();
+                        let substituted = target.clone().apply(&sub);
+                        let res = self.expand_type_inner(&substituted, visiting, span)?;
+                        visiting.remove(name);
+                        return Ok(res);
+                    }
+                }
+
+                let head = self.expand_type_inner(curr, visiting, span)?;
+                Ok(Type::compose_n(std::iter::once(head).chain(args)))
             }
         }
     }
 
-    /// Collect instantiations from a fully-typed form by walking the AST
-    /// This is called after all types are resolved, so we can look up callee types
-    fn collect_instantiations_from_body(&mut self, form: &Form, env: &TypeEnv) {
-        self.collect_instantiations_from_body_with_imports(form, env, &HashMap::new())
+    pub fn expand_scheme(&self, scm: &Scheme, span: Span) -> Result<Scheme, TypeError> {
+        match scm {
+            Scheme::Mono(t) => Ok(Scheme::Mono(self.expand_type(t, span)?)),
+            Scheme::Poly(vs, t) => Ok(Scheme::Poly(vs.clone(), self.expand_type(t, span)?)),
+            Scheme::PolyConstrained(vs, cs, t) => Ok(Scheme::PolyConstrained(
+                vs.clone(),
+                cs.clone(),
+                self.expand_type(t, span)?,
+            )),
+            Scheme::Slot => Ok(Scheme::Slot),
+        }
     }
 
-    /// Collect instantiations with import alias resolution
-    fn collect_instantiations_from_body_with_imports(
-        &mut self,
-        form: &Form,
-        env: &TypeEnv,
-        import_aliases: &HashMap<Id, Id>,
-    ) {
-        use crate::syntax::form::Expr::*;
+    /// Instantiate a scheme with fresh type variables and emit wanted constraints.
+    fn instantiate(&mut self, scm: &Scheme, span: Span) -> Type {
+        match scm {
+            Scheme::Mono(ty) => ty.clone(),
+            Scheme::Poly(tvs, ty) => {
+                let fresh_vars: Vec<Type> = tvs.iter().map(|_| self.fresh()).collect();
+                let sub: Subst = tvs.iter().cloned().zip(fresh_vars).collect();
+                ty.clone().apply(&sub)
+            }
+            Scheme::PolyConstrained(tvs, constraints, ty) => {
+                let fresh_vars: Vec<Type> = tvs.iter().map(|_| self.fresh()).collect();
+                let sub: Subst = tvs.iter().cloned().zip(fresh_vars).collect();
+                for c in constraints {
+                    let arg_ty = sub
+                        .get(&c.type_arg)
+                        .cloned()
+                        .unwrap_or_else(|| Type::Var(c.type_arg.clone()));
+                    self.wanted_constraints.push(WantedConstraint {
+                        concept: c.concept.clone(),
+                        ty: arg_ty,
+                        span,
+                    });
+                }
+                ty.clone().apply(&sub)
+            }
+            Scheme::Slot => unreachable!("Cannot instantiate Scheme::Slot"),
+        }
+    }
 
-        match &form.node {
-            Apply(callee, args) => {
-                // Get the function name if this is a direct call
-                let fn_name = match &callee.node {
-                    Var(id) => {
-                        // Check if this is an imported name and resolve it
-                        if let Some(qualified_id) = import_aliases.get(id) {
-                            Some(self.interner.trace(*qualified_id).to_string())
-                        } else {
-                            Some(self.interner.trace(*id).to_string())
-                        }
-                    },
-                    QualifiedVar(path) => Some(path.to_string_with(self.interner)),
-                    _ => None,
-                };
+    /// Match an instance pattern type against a concrete/partially-concrete type.
+    fn match_instance_pattern(pattern: &Type, target: &Type, sub: &mut Subst) -> bool {
+        match (pattern, target) {
+            (Type::Var(v), t) => {
+                if let Some(existing) = sub.get(v) {
+                    existing == t
+                } else {
+                    sub.insert(v.clone(), t.clone());
+                    true
+                }
+            }
+            (Type::Void, Type::Void) => true,
+            (Type::Con(a), Type::Con(b)) => a == b,
+            (Type::Comp(b1, a1), Type::Comp(b2, a2)) => {
+                Self::match_instance_pattern(b1, b2, sub)
+                    && Self::match_instance_pattern(a1, a2, sub)
+            }
+            (Type::Tuple(es1), Type::Tuple(es2)) if es1.len() == es2.len() => es1
+                .iter()
+                .zip(es2.iter())
+                .all(|(x, y)| Self::match_instance_pattern(x, y, sub)),
+            (Type::Arr(ps1, r1), Type::Arr(ps2, r2)) if ps1.len() == ps2.len() => {
+                ps1.iter()
+                    .zip(ps2.iter())
+                    .all(|(x, y)| Self::match_instance_pattern(x, y, sub))
+                    && Self::match_instance_pattern(r1, r2, sub)
+            }
+            _ => false,
+        }
+    }
 
-                if let Some(ref name) = fn_name {
-                    // Look up the callee's type in the environment
-                    let callee_id = match &callee.node {
-                        Var(id) => Some(*id),
-                        QualifiedVar(path) => {
-                            let path_str = path.to_string_with(self.interner);
-                            Some(self.interner.intern(&path_str))
-                        },
-                        _ => None,
+    fn given_entails(&self, given: &[(Name, Name)], concept: &str, var: &str) -> bool {
+        let mut stack: Vec<Name> = given
+            .iter()
+            .filter(|(_, v)| v == var)
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut visited = HashSet::new();
+        while let Some(curr) = stack.pop() {
+            if curr == concept {
+                return true;
+            }
+            if visited.insert(curr.clone()) {
+                if let Some(cinfo) = self.concept_registry.get(&curr) {
+                    for sup in &cinfo.superclasses {
+                        stack.push(sup.concept.clone());
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check/reduce a wanted constraint. Residual `Var` constraints are pushed into `residual`.
+    fn discharge_constraint(
+        &self,
+        wc: &WantedConstraint,
+        given: &[(Name, Name)],
+        residual: &mut Vec<WantedConstraint>,
+        depth: usize,
+    ) -> Result<(), TypeError> {
+        if depth > 32 {
+            return Err(TypeError::NoInstance {
+                concept: wc.concept.clone(),
+                ty: wc.ty.clone(),
+                span: wc.span,
+            });
+        }
+        if let Type::Var(ref v) = wc.ty {
+            if self.given_entails(given, &wc.concept, v) {
+                return Ok(());
+            }
+            if !residual
+                .iter()
+                .any(|r| r.concept == wc.concept && r.ty == wc.ty)
+            {
+                residual.push(wc.clone());
+            }
+            return Ok(());
+        }
+
+        // Non-variable head: look up matching instance in `instance_registry`
+        for inst in &self.instance_registry {
+            if inst.concept_name != wc.concept || inst.target_types.is_empty() {
+                continue;
+            }
+            let mut sub = HashMap::new();
+            if Self::match_instance_pattern(&inst.target_types[0], &wc.ty, &mut sub) {
+                // Recursively verify prerequisite constraints
+                for prereq in &inst.constraints {
+                    let prereq_ty = sub
+                        .get(&prereq.type_arg)
+                        .cloned()
+                        .unwrap_or_else(|| Type::Var(prereq.type_arg.clone()));
+                    let sub_wc = WantedConstraint {
+                        concept: prereq.concept.clone(),
+                        ty: prereq_ty,
+                        span: wc.span,
                     };
-
-                    if let Some(id) = callee_id {
-                        if let Some(callee_scheme) = env.lookup(&id) {
-                            // Check if the callee is polymorphic
-                            let type_params = callee_scheme.type_params();
-                            if !type_params.is_empty() {
-                                // Extract concrete type arguments from the call
-                                if let Some(type_args) = self.extract_type_args_from_call(callee_scheme, args, form) {
-                                    if type_args.iter().all(|t| is_concrete_type(t)) {
-                                        let inst = Instantiation::new(name.clone(), type_args);
-                                        self.instantiation_registry.add_instantiation(inst);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.discharge_constraint(&sub_wc, given, residual, depth + 1)?;
                 }
-
-                // Recurse into callee and arguments
-                self.collect_instantiations_from_body_with_imports(callee, env, import_aliases);
-                for arg in args {
-                    self.collect_instantiations_from_body_with_imports(arg, env, import_aliases);
-                }
+                return Ok(());
             }
-
-            // Recurse into sub-expressions
-            Abs(fun) => {
-                self.collect_instantiations_from_body_with_imports(&fun.body, env, import_aliases);
-            }
-            Binary(_, left, right) => {
-                self.collect_instantiations_from_body_with_imports(left, env, import_aliases);
-                self.collect_instantiations_from_body_with_imports(right, env, import_aliases);
-            }
-            Unary(_, expr) => {
-                self.collect_instantiations_from_body_with_imports(expr, env, import_aliases);
-            }
-            Let(_, val, body) => {
-                self.collect_instantiations_from_body_with_imports(val, env, import_aliases);
-                self.collect_instantiations_from_body_with_imports(body, env, import_aliases);
-            }
-            If(cond, then_br, else_br) => {
-                self.collect_instantiations_from_body_with_imports(cond, env, import_aliases);
-                self.collect_instantiations_from_body_with_imports(then_br, env, import_aliases);
-                self.collect_instantiations_from_body_with_imports(else_br, env, import_aliases);
-            }
-            Match(scrutinee, arms) => {
-                self.collect_instantiations_from_body_with_imports(scrutinee, env, import_aliases);
-                for arm in arms {
-                    self.collect_instantiations_from_body_with_imports(&arm.body, env, import_aliases);
-                    if let Some(ref guard) = arm.guard {
-                        self.collect_instantiations_from_body_with_imports(guard, env, import_aliases);
-                    }
-                }
-            }
-            List(exprs) | Block(exprs) => {
-                for e in exprs {
-                    self.collect_instantiations_from_body_with_imports(e, env, import_aliases);
-                }
-            }
-            // Leaf nodes - no recursion needed
-            Lit(_) | Var(_) | QualifiedVar(_) => {}
         }
+
+        Err(TypeError::NoInstance {
+            concept: wc.concept.clone(),
+            ty: wc.ty.clone(),
+            span: wc.span,
+        })
     }
 
-    /// Extract type arguments from a function call based on argument types
-    fn extract_type_args_from_call(&self, callee_scheme: &Scheme, args: &[P<Form>], result_form: &Form) -> Option<Vec<Type>> {
-        let type_params = callee_scheme.type_params();
-        if type_params.is_empty() {
-            return None;
-        }
-
-        // Get the function type body
-        let fn_type = callee_scheme.body();
-
-        // Extract argument types from args (they should already have concrete types)
-        let arg_types: Vec<Type> = args.iter()
-            .map(|a| a.tag.ref_type().clone())
-            .collect();
-
-        // Get result type
-        let result_type = result_form.tag.ref_type().clone();
-
-        // Try to match the function type with concrete types to extract type args
-        let mut subst: HashMap<Name, Type> = HashMap::new();
-
-        // Match argument types
-        if let Type::Arr(param_type, ret_type) = fn_type {
-            // For single argument or product type
-            let product_arg_type = Type::product_n(arg_types.clone());
-            self.match_types(&param_type, &product_arg_type, &mut subst);
-            // Match result type
-            self.match_types(&ret_type, &result_type, &mut subst);
-        }
-
-        // Build type args in order of type parameters
-        let type_args: Vec<Type> = type_params.iter()
-            .filter_map(|p| subst.get(p).cloned())
-            .collect();
-
-        if type_args.len() == type_params.len() {
-            Some(type_args)
-        } else {
-            None
-        }
-    }
-
-    /// Match a polymorphic type with a concrete type, extracting substitutions
-    fn match_types(&self, poly: &Type, concrete: &Type, subst: &mut HashMap<Name, Type>) {
-        match (poly, concrete) {
-            (Type::Var(name), _) => {
-                subst.insert(name.clone(), concrete.clone());
-            }
-            (Type::Arr(p1, p2), Type::Arr(c1, c2)) => {
-                self.match_types(p1, c1, subst);
-                self.match_types(p2, c2, subst);
-            }
-            (Type::Prod(p1, p2), Type::Prod(c1, c2)) => {
-                self.match_types(p1, c1, subst);
-                self.match_types(p2, c2, subst);
-            }
-            (Type::Comp(p1, p2), Type::Comp(c1, c2)) => {
-                self.match_types(p1, c1, subst);
-                self.match_types(p2, c2, subst);
-            }
-            _ => {}
-        }
-    }
-
-    /// Process an ADT definition and register its constructors
-    /// Returns a list of (constructor_name, constructor_type) pairs to add to the environment
-    fn process_adt(&mut self, adt_name: &str, type_params: &[Id], variants: &[Variant]) -> Vec<(Id, Scheme)> {
-        let type_param_names: Vec<Name> = type_params.iter()
+    fn process_adt(
+        &mut self,
+        adt_name: &str,
+        type_params: &[Id],
+        variants: &[Variant],
+        span: Span,
+    ) -> Result<Vec<(Id, Scheme)>, TypeError> {
+        let type_param_names: Vec<Name> = type_params
+            .iter()
             .map(|id| self.interner.trace(*id).to_string())
             .collect();
 
-        // Build the result type: e.g., List a for data List a { ... }
         let result_type = if type_param_names.is_empty() {
             Type::Con(adt_name.to_string())
         } else {
             let base = Type::Con(adt_name.to_string());
-            let params: Vec<Type> = type_param_names.iter()
+            let params: Vec<Type> = type_param_names
+                .iter()
                 .map(|p| Type::Var(p.clone()))
                 .collect();
             Type::compose_n(std::iter::once(base).chain(params))
@@ -369,746 +429,1468 @@ impl<'i> Infer<'i> {
         let mut variant_infos = Vec::new();
 
         for (tag, variant) in variants.iter().enumerate() {
-            let field_types: Vec<Type> = match &variant.body {
-                VariantBody::Unit => vec![],
-                VariantBody::Tuple(fields) => {
-                    fields.iter().map(|f| (*f.ty).clone()).collect()
-                }
+            let (field_names, raw_fields): (Option<Vec<Name>>, Vec<Type>) = match &variant.body {
+                VariantBody::Unit => (None, vec![]),
+                VariantBody::Tuple(fields) => (
+                    None,
+                    fields.iter().map(|f| (*f.ty).clone()).collect(),
+                ),
                 VariantBody::Struct(fields) => {
-                    fields.iter().map(|f| (*f.ty).clone()).collect()
+                    let names: Vec<Name> = fields
+                        .iter()
+                        .map(|f| f.name.clone().unwrap_or_default())
+                        .collect();
+                    let tys: Vec<Type> = fields.iter().map(|f| (*f.ty).clone()).collect();
+                    (Some(names), tys)
                 }
             };
 
-            // Build constructor type
-            // Unit variant: forall a. List a
-            // Tuple variant Cons(a, List a): forall a. a * List a -> List a
+            let mut field_types = Vec::with_capacity(raw_fields.len());
+            for ft in &raw_fields {
+                field_types.push(self.expand_type(ft, span)?);
+            }
+
             let constructor_type = if field_types.is_empty() {
                 result_type.clone()
             } else {
-                let param_type = if field_types.len() == 1 {
-                    field_types[0].clone()
-                } else {
-                    Type::product_n(field_types.clone())
-                };
-                Type::Arr(P(param_type), P(result_type.clone()))
+                Type::Arr(field_types.clone(), P(result_type.clone()))
             };
 
-            // Wrap in Poly if there are type parameters
             let scheme = if type_param_names.is_empty() {
-                Scheme::Mono(constructor_type.clone())
+                Scheme::Mono(constructor_type)
             } else {
-                Scheme::Poly(type_param_names.clone(), constructor_type.clone())
+                Scheme::Poly(type_param_names.clone(), constructor_type)
             };
 
-            // Intern the constructor name and add to results
             let constructor_id = self.interner.intern(&variant.name);
             constructors.push((constructor_id, scheme.clone()));
 
-            variant_infos.push(types::VariantInfo {
+            variant_infos.push(VariantInfo {
                 name: variant.name.clone(),
                 tag,
+                field_names,
                 field_types,
                 scheme,
             });
         }
 
-        // Register the ADT in our registry
-        self.adt_registry.insert(adt_name.to_string(), types::AdtInfo {
-            name: adt_name.to_string(),
-            type_params: type_param_names,
-            variants: variant_infos,
-        });
+        self.adt_registry.insert(
+            adt_name.to_string(),
+            AdtInfo {
+                name: adt_name.to_string(),
+                type_params: type_param_names,
+                variants: variant_infos,
+            },
+        );
 
-        constructors
+        Ok(constructors)
     }
 
-    /// Infer the type of a pattern and return bindings introduced
-    /// Returns (pattern_type, Vec<(binding_name, binding_type)>)
-    fn infer_pattern(&mut self, pattern: &Pattern, env: &TypeEnv) -> Result<(Type, Vec<(Id, Scheme)>), TypeError> {
-        match pattern {
-            Pattern::Var(id) => {
-                // Variable pattern: can match anything, introduces a binding
-                let fresh_ty = self.fresh();
-                Ok((fresh_ty.clone(), vec![(*id, Scheme::Mono(fresh_ty))]))
+    fn process_concept(
+        &mut self,
+        concept_name: &str,
+        type_params: &[Id],
+        superclasses: &[TypeConstraint],
+        methods: &[MethodDecl],
+        span: Span,
+    ) -> Result<Vec<(Id, Scheme)>, TypeError> {
+        let param_names: Vec<Name> = type_params
+            .iter()
+            .map(|id| self.interner.trace(*id).to_string())
+            .collect();
+        let primary_var = param_names
+            .first()
+            .cloned()
+            .ok_or_else(|| TypeError::TypeAliasError("Concept must have a type parameter".to_string(), span))?;
+
+        let sups: Vec<SchemeConstraint> = superclasses
+            .iter()
+            .map(|c| SchemeConstraint {
+                concept: c.concept.clone(),
+                type_arg: c.type_var.clone(),
+            })
+            .collect();
+
+        let mut env_entries = Vec::new();
+        let mut method_infos = Vec::new();
+
+        for m in methods {
+            let m_name = self.interner.trace(m.name).to_string();
+            let expanded_scm = self.expand_scheme(&m.ty, span)?;
+            let body_ty = expanded_scm.body().clone();
+
+            // Build method scheme: `forall <concept_params> <extra_method_params>. (Concept a, ...) => body_ty`
+            let mut binders = param_names.clone();
+            for fv in body_ty.ftv_ordered() {
+                if !binders.contains(&fv) {
+                    binders.push(fv);
+                }
+            }
+            let mut constraints = vec![SchemeConstraint {
+                concept: concept_name.to_string(),
+                type_arg: primary_var.clone(),
+            }];
+            for extra_c in expanded_scm.constraints() {
+                if !constraints.contains(extra_c) {
+                    constraints.push(extra_c.clone());
+                }
             }
 
-            Pattern::Wildcard => {
-                // Wildcard: matches anything, no bindings
-                let fresh_ty = self.fresh();
-                Ok((fresh_ty, vec![]))
-            }
+            let full_scheme = Scheme::PolyConstrained(binders, constraints, body_ty);
+            env_entries.push((m.name, full_scheme.clone()));
+            method_infos.push((m_name.clone(), full_scheme));
+            self.concept_methods
+                .insert(m_name, (concept_name.to_string(), 0));
+        }
 
-            Pattern::Lit(lit) => {
-                // Literal pattern: type is the literal's type, no bindings
-                let ty = lit.lit_type();
-                Ok((ty, vec![]))
-            }
+        self.concept_registry.insert(
+            concept_name.to_string(),
+            ConceptInfo {
+                name: concept_name.to_string(),
+                type_params: param_names,
+                superclasses: sups,
+                methods: method_infos,
+            },
+        );
 
-            Pattern::Constructor(name, sub_patterns) => {
-                // Look up constructor in ADT registry
-                if let Some(adt_info) = self.find_constructor_adt(name) {
-                    // Find the variant
-                    let variant = adt_info.variants.iter()
-                        .find(|v| &v.name == name)
-                        .expect("Constructor not found in ADT");
+        Ok(env_entries)
+    }
 
-                    // Instantiate the constructor type
-                    let ctor_type = self.instantiate(&variant.scheme);
+    /// Register an `instance` and synthesize concrete/generic method `Def`s for typechecking and codegen.
+    fn process_instance(
+        &mut self,
+        concept_name: &str,
+        type_args: &[Type],
+        constraints: &[TypeConstraint],
+        methods: &[MethodImpl],
+        span: Span,
+    ) -> Result<Vec<Def>, TypeError> {
+        let cinfo = self
+            .concept_registry
+            .get(concept_name)
+            .cloned()
+            .ok_or_else(|| TypeError::NotInScope(concept_name.to_string(), span))?;
 
-                    // Collect bindings from sub-patterns
-                    let mut all_bindings = vec![];
+        if type_args.len() != cinfo.type_params.len() {
+            return Err(TypeError::TypeAliasError(
+                format!(
+                    "Concept '{}' expects {} type argument(s), got {}",
+                    concept_name,
+                    cinfo.type_params.len(),
+                    type_args.len()
+                ),
+                span,
+            ));
+        }
 
-                    if sub_patterns.is_empty() {
-                        // Unit constructor: result type is the constructor type itself
-                        Ok((ctor_type, all_bindings))
-                    } else {
-                        // Extract parameter types and result type from arrow type
-                        if let Type::Arr(param_ty, result_ty) = &ctor_type {
-                            // Get individual field types
-                            let field_types: Vec<&Type> = param_ty.prod_to_vec();
+        let mut expanded_args = Vec::with_capacity(type_args.len());
+        for ta in type_args {
+            expanded_args.push(self.expand_type(ta, span)?);
+        }
 
-                            if field_types.len() != sub_patterns.len() {
-                                return Err(TypeError::PatternError(
-                                    format!("Constructor {} expects {} arguments, got {}",
-                                            name, field_types.len(), sub_patterns.len()),
-                                    Span::new(0, 0)
-                                ));
-                            }
-
-                            // Check each sub-pattern
-                            for (sub_pat, expected_ty) in sub_patterns.iter().zip(field_types.iter()) {
-                                let (pat_ty, bindings) = self.infer_pattern(sub_pat, env)?;
-                                // Unify sub-pattern type with expected field type
-                                self.uni((&pat_ty, Span::new(0, 0)), (expected_ty, Span::new(0, 0)));
-                                all_bindings.extend(bindings);
-                            }
-
-                            Ok(((**result_ty).clone(), all_bindings))
-                        } else {
-                            // Non-arrow type means unit constructor was given patterns
-                            Err(TypeError::PatternError(
-                                format!("Constructor {} takes no arguments", name),
-                                Span::new(0, 0)
-                            ))
-                        }
-                    }
-                } else {
-                    // Constructor not found - report error
-                    Err(TypeError::NotInScope(name.clone(), Span::new(0, 0)))
+        // Collect free type variables of the instance head
+        let mut inst_tvs = Vec::new();
+        for ta in &expanded_args {
+            for fv in ta.ftv_ordered() {
+                if !inst_tvs.contains(&fv) {
+                    inst_tvs.push(fv);
                 }
             }
         }
+        for c in constraints {
+            if !inst_tvs.contains(&c.type_var) {
+                inst_tvs.push(c.type_var.clone());
+            }
+        }
+
+        let inst_constraints: Vec<SchemeConstraint> = constraints
+            .iter()
+            .map(|c| SchemeConstraint {
+                concept: c.concept.clone(),
+                type_arg: c.type_var.clone(),
+            })
+            .collect();
+
+        let type_args_mangled = expanded_args
+            .iter()
+            .map(mangle_type)
+            .collect::<Vec<_>>()
+            .join("_");
+
+        let param_sub: Subst = cinfo
+            .type_params
+            .iter()
+            .cloned()
+            .zip(expanded_args.iter().cloned())
+            .collect();
+
+        let mut method_impls_map = HashMap::new();
+        let mut synth_defs = Vec::new();
+
+        for (expected_name, expected_scm) in &cinfo.methods {
+            let m_impl = methods
+                .iter()
+                .find(|mi| self.interner.trace(mi.name) == expected_name)
+                .ok_or_else(|| {
+                    TypeError::NoInstance {
+                        concept: format!(
+                            "{} (missing method '{}')",
+                            concept_name, expected_name
+                        ),
+                        ty: expanded_args[0].clone(),
+                        span,
+                    }
+                })?;
+
+            let mangled_fn_name = format!(
+                "__inst_{}_{}_{}",
+                concept_name.replace('.', "$"),
+                type_args_mangled,
+                expected_name
+            );
+            let mangled_id = self.interner.intern(&mangled_fn_name);
+            method_impls_map.insert(expected_name.clone(), mangled_fn_name);
+
+            // Substitute concept parameter in method body type
+            let inst_method_ty = expected_scm.body().clone().apply(&param_sub);
+            let mut method_tvs = inst_tvs.clone();
+            for fv in inst_method_ty.ftv_ordered() {
+                if !method_tvs.contains(&fv) {
+                    method_tvs.push(fv);
+                }
+            }
+
+            let method_scheme = if method_tvs.is_empty() {
+                Scheme::Mono(inst_method_ty)
+            } else if inst_constraints.is_empty() {
+                Scheme::Poly(method_tvs, inst_method_ty)
+            } else {
+                Scheme::PolyConstrained(method_tvs, inst_constraints.clone(), inst_method_ty)
+            };
+
+            let mut body_form = (*m_impl.body).clone();
+            body_form.tag.annotate = Some(method_scheme);
+            synth_defs.push(Def::value_with_visibility(
+                span,
+                mangled_id,
+                Box::new(body_form),
+                Visibility::Public,
+            ));
+        }
+
+        self.instance_registry.push(InstanceInfo {
+            concept_name: concept_name.to_string(),
+            type_params: inst_tvs,
+            constraints: inst_constraints,
+            target_types: expanded_args,
+            method_impls: method_impls_map,
+        });
+
+        Ok(synth_defs)
     }
 
-    /// Find which ADT a constructor belongs to
-    fn find_constructor_adt(&self, ctor_name: &str) -> Option<types::AdtInfo> {
-        for (_, adt_info) in &self.adt_registry {
-            for variant in &adt_info.variants {
-                if variant.name == ctor_name {
-                    return Some(adt_info.clone());
-                }
+    fn find_constructor_adt(&self, ctor_name: &str) -> Option<AdtInfo> {
+        for adt_info in self.adt_registry.values() {
+            if adt_info.variants.iter().any(|v| v.name == ctor_name) {
+                return Some(adt_info.clone());
             }
         }
         None
     }
 
-    /// The main inference algorithm
-    /// Infering type and tagging form
-    fn infer<'a>(&mut self,
-                     e: &mut TypeEnv,
-                     form: &'a mut Form)
-                     -> Result<&'a Scheme, TypeError> {
+    fn infer_pattern(
+        &mut self,
+        pattern: &Pattern,
+        span: Span,
+    ) -> Result<(Type, Vec<(Id, Scheme)>), TypeError> {
+        let mut seen_vars = HashSet::new();
+        self.infer_pattern_inner(pattern, &mut seen_vars, span)
+    }
+
+    fn infer_pattern_inner(
+        &mut self,
+        pattern: &Pattern,
+        seen_vars: &mut HashSet<Id>,
+        span: Span,
+    ) -> Result<(Type, Vec<(Id, Scheme)>), TypeError> {
+        match pattern {
+            Pattern::Var(id) => {
+                if !seen_vars.insert(*id) {
+                    return Err(TypeError::PatternError(
+                        format!(
+                            "Duplicate variable '{}' in pattern",
+                            self.interner.trace(*id)
+                        ),
+                        span,
+                    ));
+                }
+                let fresh_ty = self.fresh();
+                Ok((fresh_ty.clone(), vec![(*id, Scheme::Mono(fresh_ty))]))
+            }
+            Pattern::Wildcard => Ok((self.fresh(), vec![])),
+            Pattern::Lit(lit) => Ok((lit.lit_type(), vec![])),
+            Pattern::Tuple(pats) => {
+                let mut elem_tys = Vec::with_capacity(pats.len());
+                let mut bindings = Vec::new();
+                for p in pats {
+                    let (t, b) = self.infer_pattern_inner(p, seen_vars, span)?;
+                    elem_tys.push(t);
+                    bindings.extend(b);
+                }
+                Ok((Type::Tuple(elem_tys), bindings))
+            }
+            Pattern::Constructor(name, sub_patterns) => {
+                let adt_info = self
+                    .find_constructor_adt(name)
+                    .ok_or_else(|| TypeError::NotInScope(name.clone(), span))?;
+                let variant = adt_info
+                    .variants
+                    .iter()
+                    .find(|v| &v.name == name)
+                    .unwrap();
+
+                let ctor_type = self.instantiate(&variant.scheme, span);
+                let mut all_bindings = Vec::new();
+
+                if sub_patterns.is_empty() {
+                    if !variant.field_types.is_empty() {
+                        return Err(TypeError::PatternError(
+                            format!(
+                                "Constructor '{}' expects {} argument(s), got 0",
+                                name,
+                                variant.field_types.len()
+                            ),
+                            span,
+                        ));
+                    }
+                    Ok((ctor_type, all_bindings))
+                } else if let Type::Arr(field_types, result_ty) = ctor_type {
+                    if field_types.len() != sub_patterns.len() {
+                        return Err(TypeError::PatternError(
+                            format!(
+                                "Constructor '{}' expects {} argument(s), got {}",
+                                name,
+                                field_types.len(),
+                                sub_patterns.len()
+                            ),
+                            span,
+                        ));
+                    }
+                    for (sub_pat, expected_ty) in sub_patterns.iter().zip(field_types.iter()) {
+                        let (pat_ty, bindings) =
+                            self.infer_pattern_inner(sub_pat, seen_vars, span)?;
+                        self.uni(&pat_ty, expected_ty, span);
+                        all_bindings.extend(bindings);
+                    }
+                    Ok((*result_ty, all_bindings))
+                } else {
+                    Err(TypeError::PatternError(
+                        format!("Unit constructor '{}' takes no arguments", name),
+                        span,
+                    ))
+                }
+            }
+            Pattern::StructConstructor(name, named_pats) => {
+                let adt_info = self
+                    .find_constructor_adt(name)
+                    .ok_or_else(|| TypeError::NotInScope(name.clone(), span))?;
+                let variant = adt_info
+                    .variants
+                    .iter()
+                    .find(|v| &v.name == name)
+                    .unwrap();
+                let decl_names = variant.field_names.as_ref().ok_or_else(|| {
+                    TypeError::PatternError(
+                        format!("Variant '{}' is not a struct variant", name),
+                        span,
+                    )
+                })?;
+
+                let ctor_type = self.instantiate(&variant.scheme, span);
+                if let Type::Arr(field_types, result_ty) = ctor_type {
+                    let mut all_bindings = Vec::new();
+                    for (fname, fpat) in named_pats {
+                        let idx = decl_names.iter().position(|n| n == fname).ok_or_else(|| {
+                            TypeError::PatternError(
+                                format!("Variant '{}' has no field '{}'", name, fname),
+                                span,
+                            )
+                        })?;
+                        let (pat_ty, bindings) =
+                            self.infer_pattern_inner(fpat, seen_vars, span)?;
+                        self.uni(&pat_ty, &field_types[idx], span);
+                        all_bindings.extend(bindings);
+                    }
+                    Ok((*result_ty, all_bindings))
+                } else {
+                    Err(TypeError::PatternError(
+                        format!("Variant '{}' has no fields", name),
+                        span,
+                    ))
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Pattern Exhaustiveness Checking (Maranget usefulness check)
+    // ========================================================================
+
+    fn normalize_struct_pat(&self, pat: &Pattern) -> Pattern {
+        match pat {
+            Pattern::StructConstructor(name, fields) => {
+                if let Some(adt_info) = self.find_constructor_adt(name) {
+                    if let Some(v) = adt_info.variants.iter().find(|v| &v.name == name) {
+                        if let Some(ref fnames) = v.field_names {
+                            let ordered: Vec<Pattern> = fnames
+                                .iter()
+                                .map(|fnm| {
+                                    fields
+                                        .iter()
+                                        .find(|(k, _)| k == fnm)
+                                        .map(|(_, p)| self.normalize_struct_pat(p))
+                                        .unwrap_or(Pattern::Wildcard)
+                                })
+                                .collect();
+                            return Pattern::Constructor(name.clone(), ordered);
+                        }
+                    }
+                }
+                Pattern::Constructor(name.clone(), vec![])
+            }
+            Pattern::Constructor(n, ps) => Pattern::Constructor(
+                n.clone(),
+                ps.iter().map(|p| self.normalize_struct_pat(p)).collect(),
+            ),
+            Pattern::Tuple(ps) => {
+                Pattern::Tuple(ps.iter().map(|p| self.normalize_struct_pat(p)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Find a missing witness pattern if `matrix` does not exhaustively cover `tys`, else `None`.
+    fn find_missing_pattern(&self, matrix: &[Vec<Pattern>], tys: &[Type]) -> Option<String> {
+        if tys.is_empty() {
+            return if matrix.is_empty() {
+                Some("_".to_string())
+            } else {
+                None
+            };
+        }
+        if matrix.is_empty() {
+            return Some("_".to_string());
+        }
+
+        let first_ty = &tys[0];
+        let rest_tys = &tys[1..];
+
+        let is_wild = |p: &Pattern| matches!(p, Pattern::Wildcard | Pattern::Var(_));
+
+        // Maranget base case (empty constructor signature Σ = ∅ in column 0):
+        // When every row in column 0 is a wildcard/variable, peel column 0 directly without splitting constructors
+        // so recursive ADTs (`List a`, `Even`/`Odd`, `Tree a`) terminate immediately!
+        if matrix.iter().all(|row| is_wild(&row[0])) {
+            let sub_matrix: Vec<Vec<Pattern>> = matrix.iter().map(|r| r[1..].to_vec()).collect();
+            return self.find_missing_pattern(&sub_matrix, rest_tys);
+        }
+
+        match first_ty {
+            Type::Void => {
+                let mut sub_matrix = Vec::new();
+                for row in matrix {
+                    match &row[0] {
+                        Pattern::Lit(Lit::Unit) | Pattern::Wildcard | Pattern::Var(_) => {
+                            sub_matrix.push(row[1..].to_vec());
+                        }
+                        _ => {}
+                    }
+                }
+                self.find_missing_pattern(&sub_matrix, rest_tys)
+                    .map(|_| "()".to_string())
+            }
+            Type::Tuple(elem_tys) => {
+                let k = elem_tys.len();
+                let mut new_tys = elem_tys.clone();
+                new_tys.extend_from_slice(rest_tys);
+                let mut sub_matrix = Vec::new();
+                for row in matrix {
+                    match &row[0] {
+                        Pattern::Tuple(ps) if ps.len() == k => {
+                            let mut new_row = ps.clone();
+                            new_row.extend_from_slice(&row[1..]);
+                            sub_matrix.push(new_row);
+                        }
+                        p if is_wild(p) => {
+                            let mut new_row = vec![Pattern::Wildcard; k];
+                            new_row.extend_from_slice(&row[1..]);
+                            sub_matrix.push(new_row);
+                        }
+                        _ => {}
+                    }
+                }
+                self.find_missing_pattern(&sub_matrix, &new_tys)
+            }
+            Type::Con(name) if name == "Bool" => {
+                for b in [true, false] {
+                    let mut sub_matrix = Vec::new();
+                    for row in matrix {
+                        match &row[0] {
+                            Pattern::Lit(Lit::Bool(v)) if *v == b => {
+                                sub_matrix.push(row[1..].to_vec());
+                            }
+                            p if is_wild(p) => {
+                                sub_matrix.push(row[1..].to_vec());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if self.find_missing_pattern(&sub_matrix, rest_tys).is_some() {
+                        return Some(b.to_string());
+                    }
+                }
+                None
+            }
+            _ => {
+                // Check if `first_ty` is an ADT
+                if let Some((adt_name, type_args)) = self.decompose_adt_type(first_ty) {
+                    if let Some(adt_info) = self.adt_registry.get(&adt_name) {
+                        let sub: Subst = adt_info
+                            .type_params
+                            .iter()
+                            .cloned()
+                            .zip(type_args.into_iter())
+                            .collect();
+                        for variant in &adt_info.variants {
+                            let arity = variant.field_types.len();
+                            let field_tys: Vec<Type> = variant
+                                .field_types
+                                .iter()
+                                .map(|ft| ft.clone().apply(&sub))
+                                .collect();
+                            let mut new_tys = field_tys;
+                            new_tys.extend_from_slice(rest_tys);
+
+                            let mut sub_matrix = Vec::new();
+                            for row in matrix {
+                                match &row[0] {
+                                    Pattern::Constructor(cname, sub_pats)
+                                        if cname == &variant.name && sub_pats.len() == arity =>
+                                    {
+                                        let mut new_row = sub_pats.clone();
+                                        new_row.extend_from_slice(&row[1..]);
+                                        sub_matrix.push(new_row);
+                                    }
+                                    p if is_wild(p) => {
+                                        let mut new_row = vec![Pattern::Wildcard; arity];
+                                        new_row.extend_from_slice(&row[1..]);
+                                        sub_matrix.push(new_row);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if let Some(inner_missing) =
+                                self.find_missing_pattern(&sub_matrix, &new_tys)
+                            {
+                                return if arity == 0 {
+                                    Some(variant.name.clone())
+                                } else {
+                                    Some(format!("{}({})", variant.name, inner_missing))
+                                };
+                            }
+                        }
+                        return None;
+                    }
+                }
+
+                // Infinite domain (`Int`, `Float`, `Char`, `String`, or type variable):
+                // requires at least one wildcard/var row covering `rest_tys`.
+                let mut wild_matrix = Vec::new();
+                for row in matrix {
+                    if is_wild(&row[0]) {
+                        wild_matrix.push(row[1..].to_vec());
+                    }
+                }
+                self.find_missing_pattern(&wild_matrix, rest_tys)
+            }
+        }
+    }
+
+    fn decompose_adt_type(&self, ty: &Type) -> Option<(Name, Vec<Type>)> {
+        let mut args = Vec::new();
+        let mut curr = ty;
+        while let Type::Comp(base, arg) = curr {
+            args.push((**arg).clone());
+            curr = base.as_ref();
+        }
+        args.reverse();
+        if let Type::Con(name) = curr {
+            if self.adt_registry.contains_key(name) {
+                return Some((name.clone(), args));
+            }
+        }
+        None
+    }
+
+    fn check_exhaustiveness_in_form(&self, form: &Form) -> Result<(), TypeError> {
+        match &form.node {
+            Expr::Match(scrutinee, arms) => {
+                self.check_exhaustiveness_in_form(scrutinee)?;
+                let mut matrix = Vec::new();
+                for arm in arms {
+                    if let Some(ref g) = arm.guard {
+                        self.check_exhaustiveness_in_form(g)?;
+                    }
+                    self.check_exhaustiveness_in_form(&arm.body)?;
+                    // Guarded arms cannot guarantee coverage
+                    if arm.guard.is_none() {
+                        matrix.push(vec![self.normalize_struct_pat(&arm.pattern)]);
+                    }
+                }
+                let scrut_ty = scrutinee.tag.ref_type().clone();
+                if let Some(missing) = self.find_missing_pattern(&matrix, &[scrut_ty]) {
+                    return Err(TypeError::NonExhaustiveMatch(missing, form.tag.pos));
+                }
+                Ok(())
+            }
+            Expr::Tuple(es) | Expr::List(es) | Expr::Block(es) => {
+                for e in es {
+                    self.check_exhaustiveness_in_form(e)?;
+                }
+                Ok(())
+            }
+            Expr::StructInit(_, fs) => {
+                for (_, v) in fs {
+                    self.check_exhaustiveness_in_form(v)?;
+                }
+                Ok(())
+            }
+            Expr::Apply(c, args) => {
+                self.check_exhaustiveness_in_form(c)?;
+                for a in args {
+                    self.check_exhaustiveness_in_form(a)?;
+                }
+                Ok(())
+            }
+            Expr::Abs(fun) => self.check_exhaustiveness_in_form(&fun.body),
+            Expr::Binary(_, l, r) => {
+                self.check_exhaustiveness_in_form(l)?;
+                self.check_exhaustiveness_in_form(r)
+            }
+            Expr::Unary(_, e) => self.check_exhaustiveness_in_form(e),
+            Expr::Let(_, v, b) => {
+                self.check_exhaustiveness_in_form(v)?;
+                self.check_exhaustiveness_in_form(b)
+            }
+            Expr::If(c, t, f) => {
+                self.check_exhaustiveness_in_form(c)?;
+                self.check_exhaustiveness_in_form(t)?;
+                self.check_exhaustiveness_in_form(f)
+            }
+            Expr::Lit(_) | Expr::Var(_) | Expr::QualifiedVar(_) => Ok(()),
+        }
+    }
+
+    // ========================================================================
+    // Main HM Expression Inference
+    // ========================================================================
+
+    fn env_ftv_with_subst(env: &TypeEnv, sub: &Subst) -> HashSet<Name> {
+        let mut out = HashSet::new();
+        Self::collect_env_ftv_with_subst(env, sub, &mut out);
+        out
+    }
+
+    fn collect_env_ftv_with_subst(env: &TypeEnv, sub: &Subst, out: &mut HashSet<Name>) {
+        for scm in env.local_values() {
+            out.extend(scm.clone().apply(sub).ftv());
+        }
+        if let Some(p) = env.parent_env() {
+            Self::collect_env_ftv_with_subst(p, sub, out);
+        }
+    }
+
+    fn apply_subst_to_env(env: &mut TypeEnv, sub: &Subst) {
+        env.map_local_mut(|scm| scm.apply_mut(sub));
+    }
+
+    fn generalize_type(
+        &self,
+        env_ftvs: &HashSet<Name>,
+        ty: Type,
+        wanted: &mut Vec<WantedConstraint>,
+        given: &[(Name, Name)],
+    ) -> Result<Scheme, TypeError> {
+        let mut residual = Vec::new();
+        for wc in wanted.drain(..) {
+            self.discharge_constraint(&wc, given, &mut residual, 0)?;
+        }
+
+        let mut gen_vars = Vec::new();
+        for fv in ty.ftv_ordered() {
+            if !env_ftvs.contains(&fv) && !gen_vars.contains(&fv) {
+                gen_vars.push(fv);
+            }
+        }
+
+        let mut local_constraints = Vec::new();
+        let mut outer_wanted = Vec::new();
+
+        for r in residual {
+            if let Type::Var(ref v) = r.ty {
+                if gen_vars.contains(v) {
+                    let sc = SchemeConstraint {
+                        concept: r.concept,
+                        type_arg: v.clone(),
+                    };
+                    if !local_constraints.contains(&sc) {
+                        local_constraints.push(sc);
+                    }
+                } else if env_ftvs.contains(v) {
+                    outer_wanted.push(r);
+                } else {
+                    // Ambiguous unquantified type variable (e.g. `eq(Nothing, Nothing)`)
+                    return Err(TypeError::NoInstance {
+                        concept: format!("{} (ambiguous type variable)", r.concept),
+                        ty: r.ty,
+                        span: r.span,
+                    });
+                }
+            }
+        }
+
+        *wanted = outer_wanted;
+
+        if gen_vars.is_empty() {
+            Ok(Scheme::Mono(ty))
+        } else if local_constraints.is_empty() {
+            Ok(Scheme::Poly(gen_vars, ty))
+        } else {
+            Ok(Scheme::PolyConstrained(gen_vars, local_constraints, ty))
+        }
+    }
+
+    fn infer<'a>(
+        &mut self,
+        e: &mut TypeEnv,
+        form: &'a mut Form,
+    ) -> Result<&'a Scheme, TypeError> {
         use self::Expr::*;
-        use self::Scheme::*;
-        use self::TypeError::*;
+
+        let span = form.tag.pos;
 
         match form.node {
-            // A Literal type is certain
-            Lit(ref mut lit) => {
-                let ty = lit.lit_type();
-                form.tag.ty = to_mono(ty);
+            Lit(ref lit) => {
+                form.tag.ty = to_mono(lit.lit_type());
             }
 
-            // Find the type of a variable from environment
             Var(ref n) => {
-                if let Some(ty) = e.lookup(n) {
-                    // Rust 的 lifetime 设计有点厉害
-                    // 一开始这里忘了把 type 赋值给 form，直接返回出去
-                    // 然后因为这个 ty 的生命周期和 env 相同
-                    // 然而 env 的生命周期比 'a 短
-                    // 所以报错
-                    form.tag.ty = (*ty).clone();
-                    // form.set_scheme();
+                if let Some(scm) = e.lookup(n).cloned() {
+                    let inst_ty = self.instantiate(&scm, span);
+                    form.tag.ty = to_mono(inst_ty);
                 } else {
-                    return Err(NotInScope(self.interner.trace(*n).to_owned(), form.tag.pos));
+                    return Err(TypeError::NotInScope(
+                        self.interner.trace(*n).to_owned(),
+                        span,
+                    ));
                 }
             }
 
-            // Qualified variable (module path like collections.list.length)
-            // Try multiple lookup strategies:
-            // 1. Full qualified path as a single interned name (e.g., "math.add")
-            // 2. Last segment only (for imports that bring names into scope)
             QualifiedVar(ref path) => {
-                // First, try the full qualified path
                 let path_str = path.to_string_with(self.interner);
                 let qualified_id = self.interner.intern(&path_str);
 
-                if let Some(ty) = e.lookup(&qualified_id) {
-                    form.tag.ty = (*ty).clone();
+                if let Some(scm) = e.lookup(&qualified_id).cloned() {
+                    let inst_ty = self.instantiate(&scm, span);
+                    form.tag.ty = to_mono(inst_ty);
                 } else if let Some(name) = path.name() {
-                    // Fall back to just the last segment
-                    if let Some(ty) = e.lookup(&name) {
-                        form.tag.ty = (*ty).clone();
+                    if let Some(scm) = e.lookup(&name).cloned() {
+                        let inst_ty = self.instantiate(&scm, span);
+                        form.tag.ty = to_mono(inst_ty);
                     } else {
-                        return Err(NotInScope(path_str, form.tag.pos));
+                        return Err(TypeError::NotInScope(path_str, span));
                     }
                 } else {
-                    return Err(NotInScope("(empty path)".to_string(), form.tag.pos));
+                    return Err(TypeError::NotInScope("(empty path)".to_string(), span));
                 }
             }
 
-            // Abstraction (function) should have a arrow type.
-            // Generate temporary type var
-            //   if parameter has no type annotation.
-            // Extend the environment with parameters type,
-            //   then infer function body.
+            Tuple(ref mut elems) => {
+                let mut elem_tys = Vec::with_capacity(elems.len());
+                for el in elems.iter_mut() {
+                    elem_tys.push(self.infer(e, el.deref_mut())?.body().clone());
+                }
+                form.tag.set_type(Type::Tuple(elem_tys));
+            }
+
+            StructInit(ref ctor_name, ref mut field_inits) => {
+                let adt_info = self
+                    .find_constructor_adt(ctor_name)
+                    .ok_or_else(|| TypeError::NotInScope(ctor_name.clone(), span))?;
+                let variant = adt_info
+                    .variants
+                    .iter()
+                    .find(|v| &v.name == ctor_name)
+                    .unwrap();
+                let decl_names = variant.field_names.as_ref().ok_or_else(|| {
+                    TypeError::PatternError(
+                        format!("Variant '{}' is not a struct variant", ctor_name),
+                        span,
+                    )
+                })?;
+
+                if field_inits.len() != decl_names.len() {
+                    return Err(TypeError::PatternError(
+                        format!(
+                            "Struct variant '{}' expects {} field(s), got {}",
+                            ctor_name,
+                            decl_names.len(),
+                            field_inits.len()
+                        ),
+                        span,
+                    ));
+                }
+
+                let ctor_ty = self.instantiate(&variant.scheme, span);
+                if let Type::Arr(expected_tys, ret_ty) = ctor_ty {
+                    let mut seen = HashSet::new();
+                    for (fname, fexpr) in field_inits.iter_mut() {
+                        if !seen.insert(fname.clone()) {
+                            return Err(TypeError::PatternError(
+                                format!("Duplicate field '{}' in '{}'", fname, ctor_name),
+                                span,
+                            ));
+                        }
+                        let idx = decl_names.iter().position(|n| n == fname).ok_or_else(|| {
+                            TypeError::PatternError(
+                                format!("Variant '{}' has no field '{}'", ctor_name, fname),
+                                span,
+                            )
+                        })?;
+                        let val_ty = self.infer(e, fexpr.deref_mut())?.body().clone();
+                        self.uni(&val_ty, &expected_tys[idx], fexpr.tag.pos);
+                    }
+                    form.tag.set_type(*ret_ty);
+                } else {
+                    return Err(TypeError::PatternError(
+                        format!("Variant '{}' has no fields", ctor_name),
+                        span,
+                    ));
+                }
+            }
+
             Abs(ref mut fun) => {
-                let mut extends = vec![];
-                let mut types: Vec<Type> = vec![];
+                let mut extends = Vec::with_capacity(fun.param.len());
+                let mut param_types = Vec::with_capacity(fun.param.len());
 
                 for p in fun.param.iter_mut() {
                     match p.1 {
-                        Slot => p.1 = Scheme::Mono(self.fresh()),
-                        _ => {}
+                        Scheme::Slot => p.1 = Scheme::Mono(self.fresh()),
+                        ref existing => p.1 = self.expand_scheme(existing, span)?,
                     }
-                    extends.push((p.0.to_owned(), p.1.clone()));
-                    types.push(p.1.body().clone());
+                    extends.push((p.0, p.1.clone()));
+                    param_types.push(p.1.body().clone());
                 }
-                let typaram = if types.is_empty() {
-                    Type::Void
-                } else {
-                    Type::product_n(types)
-                };
+
                 let mut new_env = e.extend_n(extends);
-                let tbody = self.infer(&mut new_env, fun.body.deref_mut())?;
-                form.tag.ty = Scheme::arrow(typaram, tbody.body().clone());
+                let tbody = self.infer(&mut new_env, fun.body.deref_mut())?.body().clone();
+
+                if let Some(ref mut ret_ann) = fun.ret_ty {
+                    let expanded_ret = self.expand_type(ret_ann, span)?;
+                    *ret_ann = expanded_ret.clone();
+                    self.uni(&tbody, &expanded_ret, fun.body.tag.pos);
+                }
+
+                form.tag.ty = Scheme::arrow(param_types, tbody);
             }
 
-            // A function apply.
-            // Types of arguments should be able to unify with callee.
-            // Infer the returned type.
             Apply(ref mut callee, ref mut args) => {
-                let callee = callee.as_mut();
-                let callee_pos = callee.tag.pos;
+                let callee_ty = self.infer(e, callee.as_mut())?.body().clone();
+                let mut ty_args = Vec::with_capacity(args.len());
+                for arg in args.iter_mut() {
+                    ty_args.push(self.infer(e, arg.as_mut())?.body().clone());
+                }
 
-                // Get the function name if this is a direct function call
-                let fn_name = match &callee.node {
-                    Expr::Var(id) => Some(self.interner.trace(*id).to_string()),
-                    Expr::QualifiedVar(path) => Some(path.to_string_with(self.interner)),
-                    _ => None,
+                let ret_var = self.fresh();
+                form.tag.set_type(ret_var.clone());
+
+                let expected_fn_ty = Type::Arr(ty_args, P(ret_var));
+                self.uni(&callee_ty, &expected_fn_ty, span);
+            }
+
+            Binary(op, ref mut left, ref mut right) => {
+                let ty_left = self.infer(e, left.as_mut())?.body().clone();
+                let ty_right = self.infer(e, right.as_mut())?.body().clone();
+
+                match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        let a = self.fresh();
+                        self.wanted_constraints.push(WantedConstraint {
+                            concept: "$Num".to_string(),
+                            ty: a.clone(),
+                            span,
+                        });
+                        self.uni(&ty_left, &a, left.tag.pos);
+                        self.uni(&ty_right, &a, right.tag.pos);
+                        form.tag.set_type(a);
+                    }
+                    BinOp::Rem => {
+                        let int_ty = Type::Con("Int".to_string());
+                        self.uni(&ty_left, &int_ty, left.tag.pos);
+                        self.uni(&ty_right, &int_ty, right.tag.pos);
+                        form.tag.set_type(int_ty);
+                    }
+                    BinOp::Eq | BinOp::Ne => {
+                        let a = self.fresh();
+                        self.wanted_constraints.push(WantedConstraint {
+                            concept: "$EqOp".to_string(),
+                            ty: a.clone(),
+                            span,
+                        });
+                        self.uni(&ty_left, &a, left.tag.pos);
+                        self.uni(&ty_right, &a, right.tag.pos);
+                        form.tag.set_type(Type::Con("Bool".to_string()));
+                    }
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        let a = self.fresh();
+                        self.wanted_constraints.push(WantedConstraint {
+                            concept: "$OrdOp".to_string(),
+                            ty: a.clone(),
+                            span,
+                        });
+                        self.uni(&ty_left, &a, left.tag.pos);
+                        self.uni(&ty_right, &a, right.tag.pos);
+                        form.tag.set_type(Type::Con("Bool".to_string()));
+                    }
+                    BinOp::And | BinOp::Or => {
+                        let bool_ty = Type::Con("Bool".to_string());
+                        self.uni(&ty_left, &bool_ty, left.tag.pos);
+                        self.uni(&ty_right, &bool_ty, right.tag.pos);
+                        form.tag.set_type(bool_ty);
+                    }
+                    _ => return Err(TypeError::UnknownOperator(op, span)),
+                }
+            }
+
+            Unary(op, ref mut operand) => {
+                let ty_op = self.infer(e, operand.as_mut())?.body().clone();
+                match op {
+                    UnOp::Not => {
+                        let bool_ty = Type::Con("Bool".to_string());
+                        self.uni(&ty_op, &bool_ty, operand.tag.pos);
+                        form.tag.set_type(bool_ty);
+                    }
+                    UnOp::Neg => {
+                        let a = self.fresh();
+                        self.wanted_constraints.push(WantedConstraint {
+                            concept: "$Num".to_string(),
+                            ty: a.clone(),
+                            span,
+                        });
+                        self.uni(&ty_op, &a, operand.tag.pos);
+                        form.tag.set_type(a);
+                    }
+                }
+            }
+
+            Let(VarDecl(ref name, ref mut var_scm), ref mut val, ref mut body) => {
+                let val_pos = val.tag.pos;
+                let has_explicit_annot = *var_scm != Scheme::Slot;
+                let placeholder_ty = if has_explicit_annot {
+                    let expanded = self.expand_scheme(var_scm, span)?;
+                    *var_scm = expanded.clone();
+                    self.instantiate(&expanded, span)
+                } else {
+                    let fv = self.fresh();
+                    *var_scm = to_mono(fv.clone());
+                    fv
                 };
 
-                let ty_callee = self.infer(e, callee)?;
+                if matches!(val.node, Expr::Abs(..)) {
+                    // Save outer wanted constraints so we only generalize constraints originating in `val`
+                    let saved_wanted = mem::take(&mut self.wanted_constraints);
 
-                // Use tracking instantiation if we have a function name
-                let callee_inst = self.instantiate_with_tracking(ty_callee, fn_name);
+                    let mut rec_env = e.extend(*name, to_mono(placeholder_ty.clone()));
+                    let inferred_val_ty = self.infer(&mut rec_env, val.as_mut())?.body().clone();
+                    self.uni(&placeholder_ty, &inferred_val_ty, val_pos);
 
-                let mut ty_args: Vec<Type> = vec![];
+                    // Solve current constraints to enable HM let-generalization for local lambdas
+                    let sub = self.solve()?;
+                    Self::apply_subst_to_env(e, &sub);
+                    val.apply_mut(&sub);
+                    var_scm.apply_mut(&sub);
+                    for wc in &mut self.wanted_constraints {
+                        wc.ty = wc.ty.clone().apply(&sub);
+                    }
+                    let mut outer_wanted: Vec<WantedConstraint> = saved_wanted
+                        .into_iter()
+                        .map(|mut w| {
+                            w.ty = w.ty.apply(&sub);
+                            w
+                        })
+                        .collect();
 
-                for arg in args.iter_mut() {
-                    ty_args.push(self.infer(e, arg)?
-                                     .body()
-                                     .clone());
-                }
+                    let resolved_val_ty = placeholder_ty.apply(&sub);
+                    let env_ftvs = Self::env_ftv_with_subst(e, &sub);
+                    let mut val_wanted = mem::take(&mut self.wanted_constraints);
+                    let generalized_scm = self.generalize_type(
+                        &env_ftvs,
+                        resolved_val_ty,
+                        &mut val_wanted,
+                        &[],
+                    )?;
+                    outer_wanted.append(&mut val_wanted);
+                    self.wanted_constraints = outer_wanted;
 
-                form.tag.set_type(self.fresh());
+                    *var_scm = generalized_scm.clone();
+                    val.tag.set_scheme(generalized_scm.clone());
 
-                let tyfun = Scheme::arrow(Type::product_n(ty_args), form.tag.clone_type());
-
-                self.uni((&callee_inst, callee_pos), (tyfun.body(), form.tag.pos));
-            }
-
-            // Type of binary ops should exist in environment.
-            Binary(ref op, ref mut left, ref mut right) => {
-                let ty_left = self.infer(e, left)?.body();
-                let ty_right = self.infer(e, right)?.body();
-                if let Some(ty_op) = e.lookup(&self.interner.intern(&op.as_str())) {
-                    let ty_lr = Type::product(ty_left.clone(), ty_right.clone());
-
-                    form.tag.ty = to_mono(self.fresh());
-
-                    let ty_fun = Scheme::arrow(ty_lr, form.tag.clone_type());
-                    self.uni((ty_op.body(), form.tag.pos), (ty_fun.body(), form.tag.pos));
+                    let mut body_env = e.extend(*name, generalized_scm);
+                    let ty_body = self.infer(&mut body_env, body.as_mut())?.clone();
+                    form.tag.ty = ty_body;
                 } else {
-                    return Err(TypeError::UnknownOperator(op.clone(), form.tag.pos.clone()));
+                    // Value restriction: non-function local bindings stay monomorphic so later uses refine `val`'s type
+                    let inferred_val_ty = self.infer(e, val.as_mut())?.body().clone();
+                    self.uni(&placeholder_ty, &inferred_val_ty, val_pos);
+                    let sub = self.solve()?;
+                    Self::apply_subst_to_env(e, &sub);
+                    val.apply_mut(&sub);
+                    let mono_ty = placeholder_ty.apply(&sub);
+                    *var_scm = to_mono(mono_ty.clone());
+
+                    let mut body_env = e.extend(*name, to_mono(mono_ty));
+                    let ty_body = self.infer(&mut body_env, body.as_mut())?.clone();
+                    form.tag.ty = ty_body;
                 }
             }
 
-            // Let bound
-            Let(VarDecl(ref name, ref mut ty), ref mut val, ref mut body) => {
-                let val = val.as_mut();
-                let body = body.as_mut();
-                let val_pos = val.tag.pos;
-                if *ty == Scheme::Slot {
-                    *ty = to_mono(self.fresh());
-                }
-                let tyval =
-                    if let Abs(..) = val.node {
-                        let old = e.insert(name.to_owned(), ty.to_owned());
-                        let ret = self.infer(e, val)?;
-                        if let Some(t) = old {
-                            e.insert(name.to_owned(), t);
-                        }
-                        ret
-                    } else {
-                        self.infer(e, val)?
-                    };
-                self.uni((ty.body(), body.tag.pos), (tyval.body(), val_pos));
-
-                let old = e.insert(name.to_owned(), tyval.to_owned());
-                let tyexp = self.infer(e, body)?;
-                if let Some(t) = old {
-                    e.insert(name.to_owned(), t);
-                }
-                form.tag.ty = tyexp.clone();
-            }
-
-            // If expression
-            // Condition should be `Bool`,
-            //   all branches should be unified.
             If(ref mut cond, ref mut tr, ref mut fl) => {
-                let cond = cond.as_mut();
-                let tr = tr.as_mut();
-                let fl = fl.as_mut();
                 let cond_pos = cond.tag.pos;
                 let tr_pos = tr.tag.pos;
-                let fl_pos = fl.tag.pos;
-                let tycond = self.infer(e, cond)?;
-                let tytr = self.infer(e, tr)?;
-                let tyfl = self.infer(e, fl)?;
+                let tycond = self.infer(e, cond.as_mut())?.body().clone();
+                let tytr = self.infer(e, tr.as_mut())?.body().clone();
+                let tyfl = self.infer(e, fl.as_mut())?.body().clone();
 
-                self.uni((tycond.body(), cond_pos), (&Type::Con("Bool".to_string()), cond_pos));
-                self.uni((tytr.body(), tr_pos), (tyfl.body(), fl_pos));
-                form.tag.set_scheme(tytr.clone());
+                self.uni(&tycond, &Type::Con("Bool".to_string()), cond_pos);
+                self.uni(&tytr, &tyfl, tr_pos);
+                form.tag.set_type(tytr);
             }
 
-            // Type of a block is the type of last expr
             Block(ref mut exps) => {
-                let mut ty = &Scheme::Mono(Type::Void);
+                let mut last_ty = Type::Void;
                 for f in exps.iter_mut() {
-                    ty = self.infer(e, f.deref_mut())?;
+                    last_ty = self.infer(e, f.deref_mut())?.body().clone();
                 }
-
-                form.tag.set_scheme(ty.clone());
+                form.tag.set_type(last_ty);
             }
 
-            // List should be mono
             List(ref mut exps) => {
-                let tyitem: Type = self.fresh();
+                let tyitem = self.fresh();
                 for f in exps.iter_mut() {
-                    let pos = f.tag.pos;
-                    let ty = self.infer(e, f)?;
-                    self.uni((ty.body(), form.tag.pos), (&tyitem, pos));
+                    let fpos = f.tag.pos;
+                    let ty = self.infer(e, f.as_mut())?.body().clone();
+                    self.uni(&ty, &tyitem, fpos);
                 }
+                form.tag.set_type(Type::compose(
+                    Type::Con("List".to_string()),
+                    tyitem,
+                ));
+            }
 
-                form.tag.set_scheme(to_mono(
-                    Type::compose(
-                        Type::Con("List".to_string()),
-                        tyitem)));
-            },
-
-            // Pattern matching expression
             Match(ref mut scrutinee, ref mut arms) => {
-                let scrutinee = scrutinee.as_mut();
                 let scrutinee_pos = scrutinee.tag.pos;
-                let ty_scrutinee = self.infer(e, scrutinee)?;
-                let scrutinee_type = ty_scrutinee.body().clone();
-
-                // Result type will be unified across all arms
+                let scrutinee_type = self.infer(e, scrutinee.as_mut())?.body().clone();
                 let result_type = self.fresh();
 
                 for arm in arms.iter_mut() {
-                    // Type check the pattern and get bindings
-                    let (pattern_type, bindings) = self.infer_pattern(&arm.pattern, e)?;
+                    let arm_pos = arm.body.tag.pos;
+                    let (pattern_type, bindings) = self.infer_pattern(&arm.pattern, arm_pos)?;
+                    self.uni(&pattern_type, &scrutinee_type, scrutinee_pos);
 
-                    // Unify pattern type with scrutinee type
-                    self.uni((&pattern_type, form.tag.pos), (&scrutinee_type, scrutinee_pos));
-
-                    // Extend environment with pattern bindings
                     let mut arm_env = e.extend_n(bindings);
-
-                    // Type check optional guard
                     if let Some(ref mut guard) = arm.guard {
-                        let guard_ty = self.infer(&mut arm_env, guard.as_mut())?;
-                        self.uni((guard_ty.body(), form.tag.pos), (&Type::Con("Bool".to_string()), form.tag.pos));
+                        let gpos = guard.tag.pos;
+                        let guard_ty = self.infer(&mut arm_env, guard.as_mut())?.body().clone();
+                        self.uni(&guard_ty, &Type::Con("Bool".to_string()), gpos);
                     }
 
-                    // Type check arm body
-                    let body_pos = arm.body.tag.pos;
-                    let body_ty = self.infer(&mut arm_env, arm.body.as_mut())?;
-
-                    // Unify body type with result type
-                    self.uni((body_ty.body(), body_pos), (&result_type, form.tag.pos));
+                    let body_ty = self.infer(&mut arm_env, arm.body.as_mut())?.body().clone();
+                    self.uni(&body_ty, &result_type, arm_pos);
                 }
 
                 form.tag.set_type(result_type);
-            },
-
-            _ => unimplemented!(),
+            }
         }
 
-        // If there is a type annotation, unify it with inferred type
-        if let Some(ref annot) = form.tag.annotate {
-            let anno_inst = self.instantiate(annot);
-            self.uni((&anno_inst, form.tag.pos), (form.tag.ref_type(), form.tag.pos));
+        if let Some(ref annot) = form.tag.annotate.clone() {
+            let expanded = self.expand_scheme(annot, span)?;
+            let anno_inst = self.instantiate(&expanded, span);
+            self.uni(&anno_inst, form.tag.ref_type(), span);
         }
 
         Ok(form.tag.ref_scheme())
-
     }
 
-    /// Do type inference over top level definitions
-    pub fn infer_defs<'a>(&mut self,
-                      _env: &'a TypeEnv<'a>,
-                      program: &'a mut Vec<Def>)
-                      -> Result<(), TypeError> {
-
-        // First pass: process ADT definitions and collect constructor types
-        let mut constructor_types: Vec<(Id, Scheme)> = Vec::new();
-        for d in program.iter() {
-            if let Item::Alg(ref type_params, ref variants) = d.node {
-                let adt_name = self.interner.trace(d.ident).to_string();
-                let ctors = self.process_adt(&adt_name, type_params, variants);
-                constructor_types.extend(ctors);
-            }
-        }
-
-        // Give each definitions a temporary type if no annotation
-        let mut env = {
-            let name_scms = program
-                .iter()
-                .filter(|ref v| v.is_form())
-                .map(|ref d| (d.name(), match d.form_annot() {
-                    Some(s) => s.clone(),
-                    _ => to_mono(self.fresh())
-                }));
-
-            // Add them into environment
-            _env.extend_n(name_scms)
-        };
-
-        // Add constructor types to environment
-        for (ctor_id, ctor_scheme) in constructor_types {
-            env.insert(ctor_id, ctor_scheme);
-        }
-
-        for d in program.iter_mut() {
-            if d.is_form() {
-                let sub = {
-                    self.infer(&mut env, d.form_body_mut())?;
-                    self.solve()?
-                };
-
-                // Note: we no longer collect instantiations here because the callee's
-                // polymorphic type may not be known yet. We do a second pass below.
-
-                d.form_body_mut().apply_mut(&sub);
-
-                let general = {
-                    let ty = d.form_type().body().to_owned();
-                    let fvs: Vec<_> = ty.ftv().into_iter().collect();
-                    if fvs.is_empty() {
-                        Scheme::Mono(ty)
-                    } else {
-                        Scheme::Poly(fvs, ty)
-                    }
-                };
-
-                d.form_body_mut().tag.set_scheme(general.clone());
-
-                // Register polymorphic functions for potential specialization
-                let fn_name = self.interner.trace(d.name()).to_string();
-                self.instantiation_registry.register_polymorphic(fn_name, general.clone());
-
-                env.insert(d.name().to_owned(), d.form_type().clone());
-            }
-        }
-
-        // Second pass: collect instantiations now that all types are known
-        // This handles the case where callers are defined before callees
-        for d in program.iter_mut() {
-            if d.is_form() {
-                self.collect_instantiations_from_body(d.form_body_mut(), &env);
-            }
-        }
-
-        Ok(())
+    pub fn infer_defs<'a>(
+        &mut self,
+        base_env: &'a TypeEnv<'a>,
+        program: &'a mut Vec<Def>,
+    ) -> Result<(), TypeError> {
+        self.infer_defs_with_imports(base_env, program, &[])
     }
 
-    /// Do type inference over top level definitions with import aliases.
-    ///
-    /// Import aliases are pairs of (local_name, qualified_name) that should be
-    /// added to the type environment so that local names can resolve to their
-    /// qualified counterparts.
     pub fn infer_defs_with_imports<'a>(
         &mut self,
-        _env: &'a TypeEnv<'a>,
+        base_env: &'a TypeEnv<'a>,
         program: &'a mut Vec<Def>,
         import_aliases: &[(Id, Id)],
     ) -> Result<(), TypeError> {
-        // First pass: process ADT definitions and collect constructor types
+        // Pass 1: Register all type aliases
+        for d in program.iter() {
+            if let Item::Alias(ref params, ref target_scm) = d.node {
+                let alias_name = self.interner.trace(d.ident).to_string();
+                let param_names: Vec<Name> = params
+                    .iter()
+                    .map(|id| self.interner.trace(*id).to_string())
+                    .collect();
+                self.alias_registry
+                    .insert(alias_name, (param_names, target_scm.body().clone()));
+            }
+        }
+        // Validate all aliases are non-cyclic
+        for (alias_name, (params, _)) in self.alias_registry.clone() {
+            let check_ty = if params.is_empty() {
+                Type::Con(alias_name)
+            } else {
+                Type::compose_n(
+                    std::iter::once(Type::Con(alias_name))
+                        .chain(params.into_iter().map(Type::Var)),
+                )
+            };
+            self.expand_type(&check_ty, Span::default())?;
+        }
+
+        // Pass 2: Process ADT definitions (plus default `List` constructors)
         let mut constructor_types: Vec<(Id, Scheme)> = Vec::new();
+        // Add default List constructors first (user `data List` will override them)
+        if let Some(default_list) = self.adt_registry.get("List").cloned() {
+            for v in default_list.variants {
+                let id = self.interner.intern(&v.name);
+                constructor_types.push((id, v.scheme));
+            }
+        }
         for d in program.iter() {
             if let Item::Alg(ref type_params, ref variants) = d.node {
                 let adt_name = self.interner.trace(d.ident).to_string();
-                let ctors = self.process_adt(&adt_name, type_params, variants);
+                let ctors = self.process_adt(&adt_name, type_params, variants, d.pos)?;
                 constructor_types.extend(ctors);
             }
         }
 
-        // Give each definition a temporary type if no annotation
-        let mut env = {
-            let name_scms = program
-                .iter()
-                .filter(|ref v| v.is_form())
-                .map(|ref d| (d.name(), match d.form_annot() {
-                    Some(s) => s.clone(),
-                    _ => to_mono(self.fresh())
-                }));
-
-            // Add them into environment
-            _env.extend_n(name_scms)
-        };
-
-        // Add constructor types to environment
-        for (ctor_id, ctor_scheme) in constructor_types {
-            env.insert(ctor_id, ctor_scheme);
-        }
-
-        // Add import aliases to the environment
-        // We'll add these after the first inference pass so we have types to refer to
-        let mut pending_imports: Vec<(Id, Id)> = import_aliases.to_vec();
-
-        for d in program.iter_mut() {
-            if d.is_form() {
-                let sub = {
-                    self.infer(&mut env, d.form_body_mut())?;
-                    self.solve()?
-                };
-
-                d.form_body_mut().apply_mut(&sub);
-
-                let general = {
-                    let ty = d.form_type().body().to_owned();
-                    let fvs: Vec<_> = ty.ftv().into_iter().collect();
-                    if fvs.is_empty() {
-                        Scheme::Mono(ty)
-                    } else {
-                        Scheme::Poly(fvs, ty)
-                    }
-                };
-
-                d.form_body_mut().tag.set_scheme(general.clone());
-
-                // Register polymorphic functions for potential specialization
-                let fn_name = self.interner.trace(d.name()).to_string();
-                self.instantiation_registry.register_polymorphic(fn_name.clone(), general.clone());
-
-                env.insert(d.name().to_owned(), d.form_type().clone());
-
-                // Check if this definition is the target of any import alias
-                // If so, add the alias to the environment now
-                pending_imports.retain(|(local_id, qualified_id)| {
-                    if *qualified_id == d.name() {
-                        // Add the alias with the same type
-                        env.insert(*local_id, d.form_type().clone());
-                        // Also register the alias as a polymorphic function if needed
-                        let alias_name = self.interner.trace(*local_id).to_string();
-                        self.instantiation_registry.register_polymorphic(alias_name, general.clone());
-                        false // Remove from pending
-                    } else {
-                        true // Keep in pending
-                    }
-                });
+        // Pass 3: Process Concept definitions
+        let mut concept_method_entries: Vec<(Id, Scheme)> = Vec::new();
+        for d in program.iter() {
+            if let Item::Concept {
+                ref type_params,
+                ref superclasses,
+                ref methods,
+            } = d.node
+            {
+                let cname = self.interner.trace(d.ident).to_string();
+                let entries =
+                    self.process_concept(&cname, type_params, superclasses, methods, d.pos)?;
+                concept_method_entries.extend(entries);
             }
         }
 
-        // Build import alias map for instantiation collection
-        let import_alias_map: HashMap<Id, Id> = import_aliases.iter().cloned().collect();
-
-        // Second pass: collect instantiations now that all types are known
-        for d in program.iter_mut() {
-            if d.is_form() {
-                self.collect_instantiations_from_body_with_imports(d.form_body_mut(), &env, &import_alias_map);
+        // Pass 4: Process Instance definitions and append synthesized method `Def`s to `program`
+        let mut synth_instance_defs = Vec::new();
+        for d in program.iter() {
+            if let Item::Instance {
+                ref concept_name,
+                ref type_args,
+                ref constraints,
+                ref methods,
+            } = d.node
+            {
+                let mut defs = self.process_instance(
+                    concept_name,
+                    type_args,
+                    constraints,
+                    methods,
+                    d.pos,
+                )?;
+                synth_instance_defs.append(&mut defs);
             }
+        }
+        program.extend(synth_instance_defs);
+
+        // Pass 5: Seed initial type environment for all top-level value/function definitions
+        let mut def_placeholders: HashMap<Id, Type> = HashMap::new();
+        let mut initial_bindings: Vec<(Id, Scheme)> = Vec::new();
+
+        for (ctor_id, ctor_scm) in constructor_types {
+            initial_bindings.push((ctor_id, ctor_scm));
+        }
+        for (m_id, m_scm) in concept_method_entries {
+            initial_bindings.push((m_id, m_scm));
+        }
+
+        for d in program.iter() {
+            if let Item::Form(ref f) = d.node {
+                if !matches!(f.node, Expr::Abs(..)) {
+                    self.global_values.insert(d.ident);
+                }
+                if let Some(annot) = d.form_annot() {
+                    let expanded = self.expand_scheme(annot, d.pos)?;
+                    initial_bindings.push((d.name(), expanded));
+                } else {
+                    let fv = self.fresh();
+                    def_placeholders.insert(d.name(), fv.clone());
+                    initial_bindings.push((d.name(), to_mono(fv)));
+                }
+            }
+        }
+
+        // Also seed import aliases pointing to placeholders/annotations
+        let initial_map: HashMap<Id, Scheme> = initial_bindings.iter().cloned().collect();
+        for (local_id, qualified_id) in import_aliases {
+            if let Some(scm) = initial_map.get(qualified_id) {
+                initial_bindings.push((*local_id, scm.clone()));
+            }
+        }
+
+        let mut env = base_env.extend_n(initial_bindings);
+        let mut inferred_indices = Vec::new();
+
+        // Pass 6: Infer each top-level `Form` definition
+        for (idx, d) in program.iter_mut().enumerate() {
+            if !d.is_form() {
+                continue;
+            }
+            inferred_indices.push(idx);
+            let def_pos = d.pos;
+            let explicit_annot = match d.form_annot().cloned() {
+                Some(a) => Some(self.expand_scheme(&a, def_pos)?),
+                None => None,
+            };
+
+            // If explicitly annotated with `Poly` or `PolyConstrained`, skolemize/keep given constraints
+            let given_constraints: Vec<(Name, Name)> = explicit_annot
+                .as_ref()
+                .map(|scm| {
+                    scm.constraints()
+                        .iter()
+                        .map(|c| (c.concept.clone(), c.type_arg.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Temporarily clear `form.tag.annotate` if polymorphic so `infer()` doesn't instantiate it with fresh vars
+            let saved_annot = d.form_body_mut().tag.annotate.take();
+            self.subst.clear();
+            self.wanted_constraints.clear();
+
+            self.infer(&mut env, d.form_body_mut())?;
+
+            let body_ty = d.form_body_mut().tag.ref_type().clone();
+            if let Some(ref ph) = def_placeholders.get(&d.name()) {
+                let current_ph = env
+                    .lookup(&d.name())
+                    .map(|s| s.body().clone())
+                    .unwrap_or_else(|| (*ph).clone());
+                self.uni(&current_ph, &body_ty, def_pos);
+            }
+
+            if let Some(ref exp_scm) = explicit_annot {
+                self.uni(exp_scm.body(), &body_ty, def_pos);
+            }
+
+            let sub = self.solve()?;
+            Self::apply_subst_to_env(&mut env, &sub);
+            d.form_body_mut().apply_mut(&sub);
+            for wc in &mut self.wanted_constraints {
+                wc.ty = wc.ty.clone().apply(&sub);
+            }
+
+            // Remove self from `env_ftvs` before generalizing so top-level recursion generalizes properly!
+            let mut env_ftvs = HashSet::new();
+            for (other_id, other_scm) in env.local_entries() {
+                if *other_id != d.name()
+                    && !import_aliases.iter().any(|(l, q)| *l == *other_id && *q == d.name())
+                {
+                    env_ftvs.extend(other_scm.ftv());
+                }
+            }
+            if let Some(p) = env.parent_env() {
+                Self::collect_env_ftv_with_subst(p, &sub, &mut env_ftvs);
+            }
+
+            let mut def_wanted = mem::take(&mut self.wanted_constraints);
+            let final_ty = d.form_type().body().clone();
+            let general = if let Some(exp_scm) = explicit_annot {
+                // Verify all wanted constraints are satisfied under `given_constraints`
+                let mut residual = Vec::new();
+                for wc in def_wanted.drain(..) {
+                    self.discharge_constraint(&wc, &given_constraints, &mut residual, 0)?;
+                }
+                if let Some(unmet) = residual.first() {
+                    return Err(TypeError::NoInstance {
+                        concept: unmet.concept.clone(),
+                        ty: unmet.ty.clone(),
+                        span: unmet.span,
+                    });
+                }
+                // Apply substitution to non-quantified vars if any, preserving explicit scheme
+                exp_scm.apply(&sub)
+            } else {
+                // Value restriction: only generalize functions (`Expr::Abs`), keep top-level value defs monomorphic unless annotated
+                if matches!(d.form_body_mut().node, Expr::Abs(..)) {
+                    self.generalize_type(
+                        &env_ftvs,
+                        final_ty,
+                        &mut def_wanted,
+                        &given_constraints,
+                    )?
+                } else {
+                    let mut residual = Vec::new();
+                    for wc in def_wanted.drain(..) {
+                        self.discharge_constraint(&wc, &given_constraints, &mut residual, 0)?;
+                    }
+                    if let Some(unmet) = residual.first() {
+                        return Err(TypeError::NoInstance {
+                            concept: unmet.concept.clone(),
+                            ty: unmet.ty.clone(),
+                            span: unmet.span,
+                        });
+                    }
+                    Scheme::Mono(final_ty)
+                }
+            };
+
+            d.form_body_mut().tag.annotate = saved_annot;
+            d.form_body_mut().tag.set_scheme(general.clone());
+
+            let fn_name = self.interner.trace(d.name()).to_string();
+            self.instantiation_registry
+                .register_polymorphic(fn_name, general.clone());
+
+            env.insert(d.name(), general.clone());
+            for (local_id, qualified_id) in import_aliases {
+                if *qualified_id == d.name() {
+                    env.insert(*local_id, general.clone());
+                    let alias_name = self.interner.trace(*local_id).to_string();
+                    self.instantiation_registry
+                        .register_polymorphic(alias_name, general.clone());
+                }
+            }
+        }
+
+        // Final pass: apply final environment substitutions across all earlier definitions
+        // (for mutual recursion where a later def refined an earlier def's placeholder)
+        // and check pattern exhaustiveness on every inferred definition!
+        for idx in inferred_indices {
+            let d = &mut program[idx];
+            self.check_exhaustiveness_in_form(d.form_body_mut())?;
         }
 
         Ok(())
     }
 
-    /// Solve constraints. This will move out the `Infer` struct.
-    fn solve<'a>(&mut self) -> Result<Subst, TypeError> {
-        let mut sub = HashMap::<Name, Type>::new();
-        // let mut constraints = self.constraints;
-        let mut constraints = mem::replace(&mut self.constraints, LinkedList::new());
-        // println!("Type constraints: ");
-        // println!("{:#?}", constraints);
-        let mut step: usize = 1;
-        while let Some(cons) = constraints.pop_front() {
-            // println!("Type solve step {:?}: ", step);
-            let new_sub = cons.unify()?;
-            // println!("current unify: ");
-            // println!("{:#?}", new_sub);
-            for ref mut c in constraints.iter_mut() {
-                c.apply_mut(&new_sub);
+    fn solve(&mut self) -> Result<Subst, TypeError> {
+        let mut constraints = mem::take(&mut self.constraints);
+        // Apply any previously accumulated substitutions first
+        if !self.subst.is_empty() {
+            for c in constraints.iter_mut() {
+                c.apply_mut(&self.subst);
             }
-            sub = sub.into_iter().map(|(k, v)| (k, v.apply(&new_sub))).collect();
-            sub.extend(new_sub);
-            // println!("Type substituation: ");
-            // println!("{:#?}", sub);
-            step = step + 1;
         }
-        Ok(sub)
+        while let Some(cons) = constraints.pop_front() {
+            let new_sub = cons.unify()?;
+            if !new_sub.is_empty() {
+                for c in constraints.iter_mut() {
+                    c.apply_mut(&new_sub);
+                }
+                self.subst = self
+                    .subst
+                    .drain()
+                    .map(|(k, v)| (k, v.apply(&new_sub)))
+                    .collect();
+                self.subst.extend(new_sub);
+            }
+        }
+        Ok(self.subst.clone())
     }
-    // pub fn 
 }
-
 
 #[cfg(test)]
 mod tests {
-    use crate::typeinfer::*;
-    use crate::typeinfer::subst::SubstMut;
-    use crate::syntax::form::*;
-    use crate::types::*;
     use crate::syntax::parser;
+    use crate::typeinfer::*;
+    use crate::types::*;
     use crate::utils::*;
-    use crate::internal::*;
-    use crate::internal;
-
-    fn parse_expr(inter: &mut Interner, src: &str) -> Form {
-        parser::parse_expr(src, inter).expect("Failed to parse expression")
-    }
-
-    fn s(src: &'static str) -> String {
-        String::from(src)
-    }
 
     #[test]
-    fn infer_lit() {
+    fn test_occurs_check_rejects_self_application() {
         let mut interner = Interner::new();
+        let mut program = parser::parse("def omega(x) = x(x)", &mut interner).unwrap();
+        let env = Infer::new_env();
         let mut inf = Infer::new(&mut interner);
-        let mut env = TypeEnv::new();
-
-        assert_eq!(inf.infer(&mut env,
-                             &mut Form::new(Span::new(0, 0), Expr::Lit(Lit::Int(123)))),
-                   Ok(&Scheme::Mono(Type::Con("Int".to_string()))));
+        let res = inf.infer_defs(&env, &mut program);
+        assert!(matches!(res, Err(TypeError::InfiniteType(..))));
     }
 
     #[test]
-    fn infer_fun() {
-        use self::Expr::*;
-        use self::Scheme::*;
-        use self::Type::*;
-        let mut interner = Interner::new();
-        let ty_op = Scheme::Poly(vec!["a".to_string()],
-                                 Type::Arr(Box::new(Type::Prod(Box::new(Type::Var("a".to_string())),
-                                                          Box::new(Type::Var("a".to_string())))),
-                                             Box::new(Type::Var("a".to_string()))));
-        let primitives: Vec<(&str, &Scheme)> = vec![("+", &ty_op)];
-        let mut syn: Form = parse_expr(&mut interner, "(a, b) -> let c = a in { c + b + 1 }");
-
-        let mut env = TypeEnv::from_iter(primitives.iter().map(|&(n, s)| (interner.intern(n), s.clone())));
-        let sub = {
-            let mut inf = Infer::new(&mut interner);
-            inf.infer(&mut env, &mut syn).expect("Type inference failed");
-            inf.solve().unwrap()
-        };
-        syn.apply_mut(&sub);
-
-        // Check that the inferred type is Int * Int -> Int
-        let expected_type = parser::parse_type("Int * Int -> Int", &mut Interner::new());
-        assert_eq!(syn.tag.ty, expected_type);
-    }
-
-    #[test]
-    fn infer_adt_constructors() {
-        // Test that ADT constructor types are correctly generated
+    fn test_polymorphic_binary_ops_in_same_function() {
         let mut interner = Interner::new();
         let src = "
-data Option a {
-    None,
-    Some(a)
+def both() = {
+    let a = 1 + 2;
+    let b = 1.5 + 2.5;
+    if (a == 3 && b == 4.0 && \"hi\" == \"hi\") 1 else 0
 }
-
-def test(x) = Some(x)
 ";
-        let mut program = parser::parse(src, &mut interner).expect("Parse failed");
-        let env = TypeEnv::new();
+        let mut program = parser::parse(src, &mut interner).unwrap();
+        let env = Infer::new_env();
         let mut inf = Infer::new(&mut interner);
-
-        // Check that ADT info is registered
-        inf.infer_defs(&env, &mut program).expect("Type inference failed");
-
-        // Verify Option ADT was registered
-        assert!(inf.adt_registry.contains_key("Option"));
-        let option_info = &inf.adt_registry["Option"];
-        assert_eq!(option_info.name, "Option");
-        assert_eq!(option_info.type_params, vec!["a".to_string()]);
-        assert_eq!(option_info.variants.len(), 2);
-
-        // Check None variant
-        assert_eq!(option_info.variants[0].name, "None");
-        assert_eq!(option_info.variants[0].tag, 0);
-        assert!(option_info.variants[0].field_types.is_empty());
-
-        // Check Some variant
-        assert_eq!(option_info.variants[1].name, "Some");
-        assert_eq!(option_info.variants[1].tag, 1);
-        assert_eq!(option_info.variants[1].field_types.len(), 1);
+        assert!(inf.infer_defs(&env, &mut program).is_ok());
     }
 
     #[test]
-    fn infer_pattern_matching() {
-        // Test type inference for pattern matching
+    fn test_string_addition_rejected_by_num_concept() {
         let mut interner = Interner::new();
-        let src = "
-data Option a {
-    None,
-    Some(a)
-}
-
-def unwrap(opt) = match opt {
-    None -> 0,
-    Some(x) -> x
-}
-";
-        let mut program = parser::parse(src, &mut interner).expect("Parse failed");
-
-        // Need to add prelude operators
-        let ty_op = Scheme::Poly(vec!["a".to_string()],
-                                 Type::Arr(Box::new(Type::Prod(Box::new(Type::Var("a".to_string())),
-                                                          Box::new(Type::Var("a".to_string())))),
-                                             Box::new(Type::Var("a".to_string()))));
-        let env = TypeEnv::from_iter([
-            (interner.intern("+"), ty_op.clone()),
-            (interner.intern("-"), ty_op.clone()),
-        ].into_iter());
-
+        let mut program = parser::parse("def bad() = \"a\" + \"b\"", &mut interner).unwrap();
+        let env = Infer::new_env();
         let mut inf = Infer::new(&mut interner);
-        let result = inf.infer_defs(&env, &mut program);
-
-        // Type inference should succeed
-        assert!(result.is_ok(), "Type inference failed: {:?}", result);
-
-        // Find the 'unwrap' function and verify its type
-        for d in &program {
-            if interner.trace(d.ident) == "unwrap" {
-                // unwrap should have type: Option Int -> Int
-                // (since None -> 0 constrains the result to Int, and Some(x) -> x constrains the input)
-                println!("unwrap type: {:?}", d.form_type());
-                assert!(d.form_type().is_fn());
-            }
-        }
+        let res = inf.infer_defs(&env, &mut program);
+        assert!(matches!(res, Err(TypeError::NoInstance { .. })));
     }
 
+    #[test]
+    fn test_local_let_polymorphism() {
+        let mut interner = Interner::new();
+        let src = "
+def test() =
+    let id = (x) -> x in
+    if (id(true)) id(42) else 0
+";
+        let mut program = parser::parse(src, &mut interner).unwrap();
+        let env = Infer::new_env();
+        let mut inf = Infer::new(&mut interner);
+        assert!(inf.infer_defs(&env, &mut program).is_ok());
+    }
+
+    #[test]
+    fn test_non_exhaustive_match_rejected() {
+        let mut interner = Interner::new();
+        let src = "
+data Maybe a { Nothing, Just(a) }
+def bad(m) = match m { Just(x) -> x }
+";
+        let mut program = parser::parse(src, &mut interner).unwrap();
+        let env = Infer::new_env();
+        let mut inf = Infer::new(&mut interner);
+        let res = inf.infer_defs(&env, &mut program);
+        assert!(matches!(res, Err(TypeError::NonExhaustiveMatch(..))));
+    }
 }

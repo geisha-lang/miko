@@ -138,6 +138,27 @@ impl<'a: 'b, 'b, K: 'a, T: 'a> SymTable<'a, K, T>
     pub fn unwrap(self) -> HashMap<K, T> {
         self.vars
     }
+
+    pub fn local_values(&self) -> impl Iterator<Item = &T> {
+        self.vars.values()
+    }
+
+    pub fn local_entries(&self) -> impl Iterator<Item = (&K, &T)> {
+        self.vars.iter()
+    }
+
+    pub fn parent_env(&self) -> Option<&SymTable<'a, K, T>> {
+        self.parent
+    }
+
+    pub fn map_local_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut T),
+    {
+        for v in self.vars.values_mut() {
+            f(v);
+        }
+    }
 }
 
 // ============================================================================

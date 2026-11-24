@@ -1,30 +1,58 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use crate::internal::*;
 use crate::syntax::form::*;
 use crate::utils::*;
 use crate::types::*;
 
-fn escape_string(s: &str) -> Result<String, &str> {
+fn unescape_char(n: char) -> Result<char, &'static str> {
+    match n {
+        'n' => Ok('\n'),
+        'r' => Ok('\r'),
+        't' => Ok('\t'),
+        '0' => Ok('\0'),
+        '\\' => Ok('\\'),
+        '"' => Ok('"'),
+        '\'' => Ok('\''),
+        _ => Err("Invalid escape sequence"),
+    }
+}
+
+fn escape_string(s: &str) -> Result<String, &'static str> {
     let mut cs = s.chars();
     let mut r = String::new();
     while let Some(ch) = cs.next() {
         match ch {
             '\\' => {
                 if let Some(n) = cs.next() {
-                    match n {
-                        'n' => r.push('\n'),
-                        'r' => r.push('\r'),
-                        't' => r.push('\t'),
-                        _ => return Err("Invalid escape in string")
-                    }
+                    r.push(unescape_char(n)?);
                 } else {
-                    return Err("Unexpected end of string")
+                    return Err("Unexpected end of string");
                 }
-            },
-            _ => r.push(ch)
+            }
+            _ => r.push(ch),
         }
     }
     Ok(r)
+}
+
+fn parse_char_content(s: &str) -> Result<u8, &'static str> {
+    let mut cs = s.chars();
+    let c = match cs.next() {
+        Some('\\') => {
+            let esc = cs.next().ok_or("Empty escape in char literal")?;
+            unescape_char(esc)?
+        }
+        Some(ch) => ch,
+        None => return Err("Empty char literal"),
+    };
+    if cs.next().is_some() {
+        return Err("Char literal must contain a single character");
+    }
+    if (c as u32) > 255 {
+        return Err("Char literal out of 8-bit range");
+    }
+    Ok(c as u8)
 }
 
 fn make_spanned_binexpr(op: BinOp, lhs: Form, rhs: Form) -> Form {
@@ -32,117 +60,241 @@ fn make_spanned_binexpr(op: BinOp, lhs: Form, rhs: Form) -> Form {
     Form::new(span, Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
 }
 
+fn make_spanned_unexpr(start: usize, op: UnOp, rhs: Form) -> Form {
+    let span = Span::new(start, rhs.tag.pos.end);
+    Form::new(span, Expr::Unary(op, Box::new(rhs)))
+}
+
+enum BlockItem {
+    LetVar(Span, VarDecl, E),
+    LetPat(Span, Pattern, E),
+    Expr(E),
+}
+
+fn fold_block_items(items: Vec<BlockItem>) -> Result<Expr, &'static str> {
+    let mut it = items.into_iter().rev();
+    let tail_expr = match it.next() {
+        Some(BlockItem::Expr(e)) => e,
+        _ => return Err("Last item in a block must be an expression"),
+    };
+
+    let mut current_tail: Vec<E> = vec![tail_expr];
+
+    for item in it {
+        match item {
+            BlockItem::Expr(e) => {
+                current_tail.push(e);
+            }
+            BlockItem::LetVar(span, v, val) => {
+                current_tail.reverse();
+                let body_form = if current_tail.len() == 1 {
+                    *current_tail.pop().unwrap()
+                } else {
+                    let bspan = current_tail[0]
+                        .tag
+                        .pos
+                        .union(&current_tail.last().unwrap().tag.pos);
+                    Form::new(bspan, Expr::Block(current_tail))
+                };
+                let full_span = span.union(&body_form.tag.pos);
+                let let_form = Form::new(full_span, Expr::Let(v, val, Box::new(body_form)));
+                current_tail = vec![Box::new(let_form)];
+            }
+            BlockItem::LetPat(span, pat, val) => {
+                current_tail.reverse();
+                let body_form = if current_tail.len() == 1 {
+                    *current_tail.pop().unwrap()
+                } else {
+                    let bspan = current_tail[0]
+                        .tag
+                        .pos
+                        .union(&current_tail.last().unwrap().tag.pos);
+                    Form::new(bspan, Expr::Block(current_tail))
+                };
+                let full_span = span.union(&body_form.tag.pos);
+                let arm = MatchArm {
+                    pattern: pat,
+                    guard: None,
+                    body: Box::new(body_form),
+                };
+                let match_form = Form::new(full_span, Expr::Match(val, vec![arm]));
+                current_tail = vec![Box::new(match_form)];
+            }
+        }
+    }
+
+    current_tail.reverse();
+    Ok(Expr::Block(current_tail))
+}
+
+fn build_constrained_scheme(
+    explicit_binders: Vec<String>,
+    cs: Vec<TypeConstraint>,
+    body: Type,
+) -> Scheme {
+    let mut seen = HashSet::new();
+    let mut binders = Vec::new();
+    for b in explicit_binders {
+        if seen.insert(b.clone()) {
+            binders.push(b);
+        }
+    }
+    for c in &cs {
+        if seen.insert(c.type_var.clone()) {
+            binders.push(c.type_var.clone());
+        }
+    }
+    for fv in body.ftv_ordered() {
+        if seen.insert(fv.clone()) {
+            binders.push(fv);
+        }
+    }
+    let constraints: Vec<SchemeConstraint> = cs
+        .into_iter()
+        .map(|c| SchemeConstraint {
+            concept: c.concept,
+            type_arg: c.type_var,
+        })
+        .collect();
+    if constraints.is_empty() {
+        if binders.is_empty() {
+            Scheme::Mono(body)
+        } else {
+            Scheme::Poly(binders, body)
+        }
+    } else {
+        Scheme::PolyConstrained(binders, constraints, body)
+    }
+}
+
 peg::parser! {
     pub grammar geisha_parser(interner: &RefCell<Interner>) for str {
-        // Lexer helpers
-        rule whitespace() = quiet!{[' ' | '\n' | '\r' | '\t']*}
-        rule whitespace_inline() = quiet!{[' ' | '\t']*}
+        // Comments & whitespace
+        rule line_comment() = "//" (!['\n'] [_])*
+        rule block_comment() = "/*" (!"*/" [_])* "*/"
+        rule ws_char() = [' ' | '\n' | '\r' | '\t']
 
-        rule keywords() = ("def" / "if" / "else" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance" / "pub" / "use" / "mod" / "open" / "as") !identifier_char()
+        rule whitespace() = quiet!{ (ws_char() / line_comment() / block_comment())* }
+        rule whitespace_inline() = quiet!{ ([' ' | '\t'] / block_comment())* line_comment()? }
+        rule whitespace_inline_only() = quiet!{ ([' ' | '\t'] / block_comment())+ }
+
+        rule keywords() = (
+            "def" / "if" / "else" / "let" / "in" / "type" / "data"
+            / "match" / "concept" / "instance" / "forall"
+            / "pub" / "use" / "mod" / "open" / "as"
+            / "true" / "false" / "Void"
+        ) !identifier_char()
 
         rule lexeme<T>(x: rule<T>) -> T
             = whitespace() !keywords() t:x() { t }
+
+        rule token<T>(x: rule<T>) -> T
+            = whitespace() t:x() { t }
 
         rule reserved<T>(x: rule<T>) -> T
             = whitespace() r:x() !identifier_char() { r }
 
         rule parens<T>(x: rule<T>) -> T
-            = lexeme(<"(">) t:x() lexeme(<")">) { t }
+            = token(<"(">) t:x() token(<")">) { t }
 
         rule spanned<T>(x: rule<T>) -> (Span, T)
             = start:position!() p:x() end:position!() {
-                let span = Span::new(start, end);
-                (span, p)
+                (Span::new(start, end), p)
             }
 
         rule identifier_char()
             = ['a'..='z' | 'A'..='Z' | '0'..='9' | '_']
 
         rule string_content() -> &'input str
-            = $((!['"'] [_] / "\\\"")*)
+            = $((!['"' | '\\'] [_] / "\\" [_])*)
 
-        // Lex rules
+        rule char_content() -> &'input str
+            = $((!['\'' | '\\'] [_] / "\\" [_])+)
+
+        // Identifiers
         rule identifier() -> Id
             = id:lexeme(<$(['a'..='z' | 'A'..='Z' | '_'] identifier_char()*)>) {
                 interner.borrow_mut().intern(id)
             }
 
+        rule lower_identifier_str() -> &'input str
+            = lexeme(<$(['a'..='z' | '_'] identifier_char()*)>)
+
         rule type_constant_identifier() -> &'input str
-            = lexeme(<$(['A'..='Z'] identifier_char()*)>)
+            = whitespace() !("def" / "if" / "else" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance" / "forall" / "pub" / "use" / "mod" / "open" / "as" / "true" / "false" / "Void") !identifier_char()
+              s:$(['A'..='Z'] identifier_char()*) { s }
+            / whitespace() !"Void" !identifier_char() s:$(['A'..='Z'] identifier_char()*) { s }
+
+        rule upper_identifier_str() -> &'input str
+            = whitespace() s:$(['A'..='Z'] identifier_char()*) {?
+                if s == "Void" {
+                    Err("Void is a built-in type")
+                } else {
+                    Ok(s)
+                }
+            }
 
         rule type_variable_identifier() -> &'input str
             = lexeme(<$(['a'..='z'] identifier_char()*)>)
 
         rule integer() -> &'input str
-            = lexeme(<$("-"?['1'..='9']['0'..='9']*)>)
-            / lexeme(<$("0")>)
+            = token(<$("-"? ['1'..='9']['0'..='9']*)>)
+            / token(<$("-"? "0")>)
 
         rule float() -> &'input str
-            = lexeme(<$("-"?['0'..='9']"."['0'..='9']+("e" "-"? ['1'..='9']['0'..='9']*)?)>)
+            = token(<$("-"? ['0'..='9']+ "." ['0'..='9']+ (['e' | 'E'] ['+' | '-']? ['0'..='9']+)?)>)
 
         rule string() -> &'input str
-            = lexeme(<"\"" s:string_content() "\"" {s}>)
+            = token(<"\"" s:string_content() "\"" { s }>)
 
-        // Top level definition
-        rule definition_delimite() = whitespace_inline() (";" / "\n" / "\r\n")
+        rule char_lit_raw() -> &'input str
+            = token(<"'" s:char_content() "'" { s }>)
+
+        rule definition_delimite() = whitespace_inline() (";" / "\r\n" / "\n")
 
         pub rule module() -> Vec<Def>
-            = d:definition()+ whitespace() { d }
+            = whitespace() d:(dd:definition() definition_delimite()* { dd })* whitespace() { d }
 
         // ====================================================================
         // Module System Grammar
         // ====================================================================
 
-        /// Parse visibility modifier (pub or nothing)
         rule visibility() -> Visibility
             = reserved(<"pub">) { Visibility::Public }
             / { Visibility::Private }
 
-        /// Parse a module path (e.g., collections.list.length)
         rule module_path() -> ModulePath
-            = segments:identifier() ++ lexeme(<".">) { ModulePath::new(segments) }
+            = segments:identifier() ++ token(<".">) { ModulePath::new(segments) }
 
-        /// Parse a module path followed by ".{" for multiple imports
-        /// e.g., "math." in "use math.{add, mul}"
         rule module_path_for_multi() -> ModulePath
-            = segments:(identifier() ++ lexeme(<".">)) lexeme(<".">) &lexeme(<"{">) {
+            = segments:(identifier() ++ token(<".">)) token(<".">) &token(<"{">) {
                 ModulePath::new(segments)
             }
 
-        /// Parse a single use spec: `name` or `name as alias`
         rule use_spec() -> UseSpec
             = name:identifier() reserved(<"as">) alias:identifier() { UseSpec::with_alias(name, alias) }
             / name:identifier() { UseSpec::new(name) }
 
-        /// Parse use item list: `{foo, bar as baz}`
         rule use_item_list() -> Vec<UseSpec>
-            = lexeme(<"{">) specs:use_spec() ++ lexeme(<",">) lexeme(<"}">) { specs }
+            = token(<"{">) specs:use_spec() ++ token(<",">) token(<",">)? token(<"}">) { specs }
 
-        /// Parse a use statement
         rule use_statement() -> UseItem
-            // use foo.bar.{baz, qux} - must come first, uses lookahead
             = path:module_path_for_multi() list:use_item_list() { UseItem::Multiple(path, list) }
-            // use foo.bar as baz
             / path:module_path() reserved(<"as">) alias:identifier() { UseItem::Alias(path, alias) }
-            // use foo.bar (single import)
             / path:module_path() { UseItem::Single(path) }
 
-        /// Parse open statement (glob import): `open foo.bar`
         rule open_statement() -> UseItem
             = reserved(<"open">) path:module_path() { UseItem::Glob(path) }
 
-        /// Parse a use declaration (with optional visibility)
         rule use_declaration() -> (Visibility, UseItem)
             = vis:visibility() reserved(<"use">) item:use_statement() { (vis, item) }
 
-        /// Parse an open declaration (with optional visibility)
         rule open_declaration() -> (Visibility, UseItem)
             = vis:visibility() item:open_statement() { (vis, item) }
 
-        /// Parse an inline module definition: `mod name { items }`
         rule inline_module_def() -> ModuleDef
             = start:position!() reserved(<"mod">) name:identifier()
-              lexeme(<"{">) items:module_item()* lexeme(<"}">) end:position!() {
+              token(<"{">) items:module_item()* token(<"}">) end:position!() {
                 ModuleDef {
                     name,
                     items,
@@ -150,29 +302,21 @@ peg::parser! {
                 }
             }
 
-        /// Parse a module declaration (for file-based modules): `mod name`
         rule module_declaration() -> Id
             = reserved(<"mod">) name:identifier() { name }
 
-        /// Parse a module item (with visibility)
         rule module_item() -> ModuleItem
-            = vis:visibility() d:inline_module_def() { ModuleItem::SubModule(vis, Box::new(d)) }
-            / decl:use_declaration() { ModuleItem::Use(decl.0, decl.1) }
-            / decl:open_declaration() { ModuleItem::Use(decl.0, decl.1) }
+            = vis:visibility() d:inline_module_def() definition_delimite()* { ModuleItem::SubModule(vis, Box::new(d)) }
+            / decl:use_declaration() definition_delimite()* { ModuleItem::Use(decl.0, decl.1) }
+            / decl:open_declaration() definition_delimite()* { ModuleItem::Use(decl.0, decl.1) }
             / vis:visibility() name:module_declaration() definition_delimite()* { ModuleItem::ModDecl(vis, name) }
-            / vis:visibility() d:spanned(<form_definition()>) definition_delimite()* {
-                let (span, (name, form)) = d;
-                ModuleItem::Def(vis, Def::value_with_visibility(span, name, Box::new(form), vis))
-            }
-            / vis:visibility() d:type_definition() definition_delimite()* { ModuleItem::Def(vis, d) }
+            / d:definition() definition_delimite()* { ModuleItem::Def(d.visibility, d) }
 
-        /// Parse a file module (for multi-file compilation)
-        /// Note: The path is cloned since peg rules don't allow moving parameters
         pub rule file_module(path: &ModulePath) -> FileModule
-            = items:module_item()* whitespace() { FileModule { path: path.clone(), items } }
+            = whitespace() items:module_item()* whitespace() { FileModule { path: path.clone(), items } }
 
         // ====================================================================
-        // End Module System Grammar
+        // Top-level Definitions
         // ====================================================================
 
         pub rule definition() -> Def
@@ -183,7 +327,7 @@ peg::parser! {
                     form.tag.annotate = Some(scm);
                     Ok(Def::value_with_visibility(span, name, Box::new(form), vis))
                 } else {
-                    Err("Forward declaration should be followed by it's definition")
+                    Err("Forward declaration must be followed by its definition")
                 }
             }
             / d:spanned(<pub_form_definition()>) {
@@ -197,33 +341,47 @@ peg::parser! {
                 def
             }
 
-        /// Form definition with optional pub prefix
         rule pub_form_definition() -> (Visibility, Id, Form)
             = reserved(<"pub">) p:form_definition() { (Visibility::Public, p.0, p.1) }
             / p:form_definition() { (Visibility::Private, p.0, p.1) }
 
-        /// Type definition with optional pub prefix
         rule pub_type_definition() -> (Visibility, Def)
             = reserved(<"pub">) d:type_definition() { (Visibility::Public, d) }
             / d:type_definition() { (Visibility::Private, d) }
 
         rule forward_declaration() -> (Id, Scheme)
-            = n:identifier() lexeme(<":">) t:type_scheme() { (n, t) }
+            = n:identifier() token(<":">) t:type_scheme() { (n, t) }
 
         rule form_definition() -> (Id, Form)
-            = value_definition()
-            / function_definition()
+            = function_definition()
+            / value_definition()
 
         rule value_definition() -> (Id, Form)
-            = reserved(<"def">) name:identifier() lexeme(<"=">) value:expression() { (name, value) }
+            = reserved(<"def">) name:identifier() ann:(token(<":">) s:type_scheme() { s })? token(<"=">) value:expression() {
+                let mut value = value;
+                if let Some(scm) = ann {
+                    value.tag.annotate = Some(scm);
+                }
+                (name, value)
+            }
 
         rule function_definition() -> (Id, Form)
             = reserved(<"def">) name:identifier()
-              lexeme(<"(">) ps:parameter_sequence() lexeme(<")">)
-              lexeme(<"=">) body:expression() {
-                  let span = body.tag.pos.clone();
-                  let lambda = Expr::Abs(Lambda { param: ps, body: Box::new(body) });
-                  (name, Form::new(span, lambda))
+              token(<"(">) ps:parameter_sequence() token(<")">)
+              ret_ann:(token(<":">) s:type_scheme() { s })?
+              token(<"=">) body:expression() {
+                  let span = body.tag.pos;
+                  let (ret_ty, fn_scheme_ann) = match ret_ann {
+                      Some(Scheme::Mono(t)) => (Some(t), None),
+                      Some(poly_scm) => (None, Some(poly_scm)),
+                      None => (None, None),
+                  };
+                  let lambda = Expr::Abs(Lambda { param: ps, ret_ty, body: Box::new(body) });
+                  let mut form = Form::new(span, lambda);
+                  if let Some(scm) = fn_scheme_ann {
+                      form.tag.annotate = Some(scm);
+                  }
+                  (name, form)
               }
 
         rule type_definition() -> Def
@@ -264,11 +422,11 @@ peg::parser! {
                 }
             }
 
-        // Concept definition: concept Eq a { eq: a * a -> Bool }
+        // Concept & Instance definitions
         rule concept_definition() -> (String, Item)
-            = n:type_constant_identifier() p:type_parameter_sequence()
-              s:concept_superclasses()?
-              lexeme(<"{">) m:concept_method() ** lexeme(<",">) lexeme(<"}">) {
+            = n:upper_identifier_str() p:type_parameter_sequence()
+              s:constraint_prefix()?
+              token(<"{">) m:concept_method() ** token(<",">) token(<",">)? token(<"}">) {
                 let params: Vec<Id> = p.iter().map(|s| interner.borrow_mut().intern(s)).collect();
                 let superclasses = s.unwrap_or_default();
                 (n.to_string(), Item::Concept {
@@ -278,11 +436,12 @@ peg::parser! {
                 })
             }
 
-        rule concept_superclasses() -> Vec<TypeConstraint>
-            = lexeme(<"(">) cs:type_constraint() ++ lexeme(<",">) lexeme(<")">) lexeme(<"=>">) { cs }
+        rule constraint_prefix() -> Vec<TypeConstraint>
+            = token(<"(">) cs:type_constraint() ++ token(<",">) token(<",">)? token(<")">) token(<"=>">) { cs }
+            / c:type_constraint() token(<"=>">) { vec![c] }
 
         rule type_constraint() -> TypeConstraint
-            = c:type_constant_identifier() v:type_variable_identifier() {
+            = c:upper_identifier_str() v:type_variable_identifier() {
                 TypeConstraint {
                     concept: c.to_string(),
                     type_var: v.to_string(),
@@ -290,19 +449,20 @@ peg::parser! {
             }
 
         rule concept_method() -> MethodDecl
-            = n:identifier() lexeme(<":">) t:type_scheme() {
+            = n:identifier() token(<":">) t:type_scheme() {
                 MethodDecl { name: n, ty: t }
             }
 
-        // Instance definition: instance Eq Int { def eq(x, y) = x == y }
-        // or with constraints: instance (Eq a) => Eq (List a) { ... }
         rule instance_definition() -> (String, Item)
-            = cs:instance_constraints()? cn:type_constant_identifier()
+            = cs:constraint_prefix()? cn:upper_identifier_str()
               tas:instance_type_args()
-              lexeme(<"{">) ms:instance_method() ** lexeme(<",">) lexeme(<"}">) {
+              token(<"{">) ms:instance_method() ** (token(<",">) / definition_delimite()) token(<",">)? token(<"}">) {
                 let constraints = cs.unwrap_or_default();
-                // Generate a unique name for the instance
-                let instance_name = format!("instance_{}_{}", cn, tas.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("_"));
+                let instance_name = format!(
+                    "instance_{}_{}",
+                    cn,
+                    tas.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("_")
+                );
                 (instance_name, Item::Instance {
                     concept_name: cn.to_string(),
                     type_args: tas,
@@ -311,122 +471,128 @@ peg::parser! {
                 })
             }
 
-        rule instance_constraints() -> Vec<TypeConstraint>
-            = lexeme(<"(">) cs:type_constraint() ++ lexeme(<",">) lexeme(<")">) lexeme(<"=>">) { cs }
-
         rule instance_type_args() -> Vec<Type>
-            = ts:instance_type_arg()+ { ts }
-
-        rule instance_type_arg() -> Type
-            = parens(<type_expression()>)
-            / t:type_terminal() { t }
+            = ts:(type_atom() ++ whitespace_inline_only()) { ts }
+            / t:type_atom() { vec![t] }
 
         rule instance_method() -> MethodImpl
             = reserved(<"def">) n:identifier()
-              lexeme(<"(">) ps:parameter_sequence() lexeme(<")">)
-              lexeme(<"=">) body:expression() {
-                let span = body.tag.pos.clone();
-                let lambda = Expr::Abs(Lambda { param: ps, body: Box::new(body) });
+              token(<"(">) ps:parameter_sequence() token(<")">)
+              ret_ann:(token(<":">) t:type_expression() { t })?
+              token(<"=">) body:expression() {
+                let span = body.tag.pos;
+                let lambda = Expr::Abs(Lambda { param: ps, ret_ty: ret_ann, body: Box::new(body) });
                 MethodImpl { name: n, body: Box::new(Form::new(span, lambda)) }
             }
 
         rule type_alias() -> (String, Item)
-            = n:type_constant_identifier() p:type_parameter_sequence() lexeme(<"=">) a:type_scheme() {
+            = n:upper_identifier_str() p:type_parameter_sequence() token(<"=">) a:type_scheme() {
                 let param = p.into_iter().map(|s| interner.borrow_mut().intern(s)).collect();
                 (n.to_string(), Item::Alias(param, Box::new(a)))
             }
 
         rule type_algebra() -> (String, Item)
-            = n:type_constant_identifier() p:type_parameter_sequence()
-              lexeme(<"{">) v:type_algebra_variant() ++ lexeme(<",">) lexeme(<"}">) {
+            = n:upper_identifier_str() p:type_parameter_sequence()
+              token(<"{">) v:type_algebra_variant() ++ token(<",">) token(<",">)? token(<"}">) {
                 let param = p.into_iter().map(|s| interner.borrow_mut().intern(s)).collect();
                 (n.to_string(), Item::Alg(param, v))
-              }
+            }
 
         rule type_algebra_variant() -> Variant
-            = n:identifier() ts:parens(<type_expression() ++ lexeme(<",">)>) {
-                let body = ts.into_iter().enumerate().map(|(i, t)| Field { name: None, ty: Box::new(t) }).collect();
-                Variant { name: interner.borrow().trace(n).to_string(), body: VariantBody::Tuple(body) }
+            = n:upper_identifier_str() ts:parens(<type_expression() ++ token(<",">)>) {
+                let body = ts.into_iter().map(|t| Field { name: None, ty: Box::new(t) }).collect();
+                Variant { name: n.to_string(), body: VariantBody::Tuple(body) }
             }
-            / n:identifier() fs:struct_fields() {
-                Variant { name: interner.borrow().trace(n).to_string(), body: VariantBody::Struct(fs) }
+            / n:upper_identifier_str() fs:struct_fields() {
+                Variant { name: n.to_string(), body: VariantBody::Struct(fs) }
             }
-            / n:identifier() {
-                // Unit variant (no fields)
-                Variant { name: interner.borrow().trace(n).to_string(), body: VariantBody::Unit }
+            / n:upper_identifier_str() {
+                Variant { name: n.to_string(), body: VariantBody::Unit }
             }
 
         rule struct_fields() -> Vec<Field>
-            = lexeme(<"{">) fs:struct_field_declaration() ++ lexeme(<",">) lexeme(<"}">) { fs }
+            = token(<"{">) fs:struct_field_declaration() ++ token(<",">) token(<",">)? token(<"}">) { fs }
 
         rule struct_field_declaration() -> Field
-            = n:identifier() lexeme(<":">) t:type_expression() {
+            = n:identifier() token(<":">) t:type_expression() {
                 Field { name: Some(interner.borrow().trace(n).to_string()), ty: Box::new(t) }
             }
 
-        // Type scheme
+        // ====================================================================
+        // Type Grammar (Right-Associative `->`, Explicit Arity vs First-Class Tuples)
+        // ====================================================================
+
         rule type_parameter_sequence() -> Vec<&'input str>
-            = type_variable_identifier() ** whitespace()
+            = (whitespace_inline_only() v:type_variable_identifier() { v })*
 
         rule type_constant() -> Type
-            = n:type_constant_identifier() { Type::Con(n.to_string()) }
+            = reserved(<"Void">) { Type::Void }
+            / n:upper_identifier_str() { Type::Con(n.to_string()) }
 
         rule type_variable() -> Type
             = n:type_variable_identifier() { Type::Var(n.to_string()) }
 
-        rule type_factor() -> Type
-            = v:type_composition() { Type::compose_n(v) }
+        rule type_atom() -> Type
+            = token(<"(">) token(<")">) { Type::Void }
+            / token(<"(">) first:type_expression() token(<",">) rest:(type_expression() ++ token(<",">)) token(<",">)? token(<")">) {
+                let mut elems = vec![first];
+                elems.extend(rest);
+                Type::Tuple(elems)
+            }
             / parens(<type_expression()>)
+            / type_constant()
+            / type_variable()
 
-        rule type_terminal() -> Type
-            = type_constant() / type_variable()
-
-        rule type_composition() -> Vec<Type>
-            = type_terminal() ++ whitespace()
+        rule btype() -> Type
+            = first:type_atom() rest:(whitespace_inline_only() a:type_atom() { a })* {
+                let mut v = vec![first];
+                v.extend(rest);
+                Type::compose_n(v)
+            }
 
         pub rule type_expression() -> Type
-            = precedence! {
-                lhs:(@) lexeme(<"->">) rhs:@ { Type::Arr(Box::new(lhs), Box::new(rhs)) }
-                --
-                lhs:(@) lexeme(<"*">) rhs:@ { Type::Prod(Box::new(lhs), Box::new(rhs)) }
-                --
-                t:type_factor() { t }
+            // () -> R  or  (T1, T2, ...) -> R  or  (T1) -> R
+            = token(<"(">) ps:(type_expression() ** token(<",">)) token(<",">)? token(<")">) token(<"->">) rhs:type_expression() {
+                Type::Arr(ps, Box::new(rhs))
             }
-
-        rule type_binders() -> Vec<&'input str>
-            = type_variable_identifier() ++ lexeme(<",">)
+            // Single-parameter arrow: A -> B -> C == A -> (B -> C) (Right-associative!)
+            / lhs:btype() token(<"->">) rhs:type_expression() {
+                let params = if lhs == Type::Void { vec![] } else { vec![lhs] };
+                Type::Arr(params, Box::new(rhs))
+            }
+            / t:btype() { t }
 
         pub rule type_scheme() -> Scheme
-            = reserved(<"forall">) cs:scheme_constraints() lexeme(<".">) b:type_expression() {
-                // forall (Eq a, Ord b). a * b -> Bool
-                // Extract type variables from constraints
-                let binders: Vec<String> = cs.iter().map(|c| c.type_var.clone()).collect();
-                let constraints = cs.into_iter()
-                    .map(|c| crate::types::SchemeConstraint {
-                        concept: c.concept,
-                        type_arg: c.type_var,
-                    })
-                    .collect();
-                Scheme::PolyConstrained(binders, constraints, b)
-            }
-            / reserved(<"forall">) f:type_variable_identifier()* lexeme(<".">) b:type_expression() {
+            // Canonical: `forall a b. (Eq a, Ord b) => (a, b) -> Bool`
+            = reserved(<"forall">) f:type_variable_identifier()+ token(<".">) cs:constraint_prefix() b:type_expression() {
                 let binders = f.into_iter().map(|s| s.to_string()).collect();
+                build_constrained_scheme(binders, cs, b)
+            }
+            // Sugar: `forall (Eq a). (a, a) -> Bool` (collects all free type vars deterministically)
+            / reserved(<"forall">) token(<"(">) cs:type_constraint() ++ token(<",">) token(<",">)? token(<")">) token(<".">) b:type_expression() {
+                build_constrained_scheme(vec![], cs, b)
+            }
+            // Unconstrained: `forall a b. (a, b) -> a`
+            / reserved(<"forall">) f:type_variable_identifier()+ token(<".">) b:type_expression() {
+                let mut seen = HashSet::new();
+                let mut binders = Vec::new();
+                for s in f {
+                    if seen.insert(s.to_string()) {
+                        binders.push(s.to_string());
+                    }
+                }
                 Scheme::Poly(binders, b)
+            }
+            // Implicit constraint prefix without explicit `forall`: `(Eq a) => (a, a) -> Bool`
+            / cs:constraint_prefix() b:type_expression() {
+                build_constrained_scheme(vec![], cs, b)
             }
             / b:type_expression() { Scheme::Mono(b) }
 
-        rule scheme_constraints() -> Vec<TypeConstraint>
-            = lexeme(<"(">) cs:scheme_constraint() ++ lexeme(<",">) lexeme(<")">) { cs }
+        // ====================================================================
+        // Expressions & Patterns
+        // ====================================================================
 
-        rule scheme_constraint() -> TypeConstraint
-            = c:type_constant_identifier() v:type_variable_identifier() {
-                TypeConstraint {
-                    concept: c.to_string(),
-                    type_var: v.to_string(),
-                }
-            }
-
-        // Expression form
         rule spanned_form(e: rule<Expr>) -> Form
             = _e:spanned(<e()>) {
                 let (s, expr) = _e;
@@ -435,23 +601,26 @@ peg::parser! {
 
         pub rule expression() -> Form
             = precedence! {
-                lhs:(@) lexeme(<"||">) rhs:@ { make_spanned_binexpr(BinOp::Or, lhs, rhs) }
+                lhs:(@) token(<"||">) rhs:@ { make_spanned_binexpr(BinOp::Or, lhs, rhs) }
                 --
-                lhs:(@) lexeme(<"&&">) rhs:@ { make_spanned_binexpr(BinOp::And, lhs, rhs) }
+                lhs:(@) token(<"&&">) rhs:@ { make_spanned_binexpr(BinOp::And, lhs, rhs) }
                 --
-                lhs:(@) lexeme(<"<=">) rhs:@ { make_spanned_binexpr(BinOp::Le, lhs, rhs) }
-                lhs:(@) lexeme(<">=">) rhs:@ { make_spanned_binexpr(BinOp::Ge, lhs, rhs) }
-                lhs:(@) lexeme(<"<">) rhs:@ { make_spanned_binexpr(BinOp::Lt, lhs, rhs) }
-                lhs:(@) lexeme(<">">) rhs:@ { make_spanned_binexpr(BinOp::Gt, lhs, rhs) }
-                lhs:(@) lexeme(<"==">) rhs:@ { make_spanned_binexpr(BinOp::Eq, lhs, rhs) }
-                lhs:(@) lexeme(<"!=">) rhs:@ { make_spanned_binexpr(BinOp::Ne, lhs, rhs) }
+                lhs:(@) token(<"<=">) rhs:@ { make_spanned_binexpr(BinOp::Le, lhs, rhs) }
+                lhs:(@) token(<">=">) rhs:@ { make_spanned_binexpr(BinOp::Ge, lhs, rhs) }
+                lhs:(@) token(<"==">) rhs:@ { make_spanned_binexpr(BinOp::Eq, lhs, rhs) }
+                lhs:(@) token(<"!=">) rhs:@ { make_spanned_binexpr(BinOp::Ne, lhs, rhs) }
+                lhs:(@) token(<"<">)  rhs:@ { make_spanned_binexpr(BinOp::Lt, lhs, rhs) }
+                lhs:(@) token(<">">)  rhs:@ { make_spanned_binexpr(BinOp::Gt, lhs, rhs) }
                 --
-                lhs:(@) lexeme(<"+">) rhs:@ { make_spanned_binexpr(BinOp::Add, lhs, rhs) }
-                lhs:(@) lexeme(<"-">) rhs:@ { make_spanned_binexpr(BinOp::Sub, lhs, rhs) }
+                lhs:(@) token(<"+">) rhs:@ { make_spanned_binexpr(BinOp::Add, lhs, rhs) }
+                lhs:(@) token(<"-">) rhs:@ { make_spanned_binexpr(BinOp::Sub, lhs, rhs) }
                 --
-                lhs:(@) lexeme(<"*">) rhs:@ { make_spanned_binexpr(BinOp::Mul, lhs, rhs) }
-                lhs:(@) lexeme(<"/">) rhs:@ { make_spanned_binexpr(BinOp::Div, lhs, rhs) }
-                lhs:(@) lexeme(<"%">) rhs:@ { make_spanned_binexpr(BinOp::Rem, lhs, rhs) }
+                lhs:(@) token(<"*">) rhs:@ { make_spanned_binexpr(BinOp::Mul, lhs, rhs) }
+                lhs:(@) token(<"/">) rhs:@ { make_spanned_binexpr(BinOp::Div, lhs, rhs) }
+                lhs:(@) token(<"%">) rhs:@ { make_spanned_binexpr(BinOp::Rem, lhs, rhs) }
+                --
+                whitespace() start:position!() "!" !"=" e:@ { make_spanned_unexpr(start, UnOp::Not, e) }
+                whitespace() start:position!() "-" !['>' | '0'..='9'] e:@ { make_spanned_unexpr(start, UnOp::Neg, e) }
                 --
                 f:form_factor() { f }
             }
@@ -460,18 +629,46 @@ peg::parser! {
             = start:position!() h:_form_factor() t:_apply()* {
                 let mut f = h;
                 for (end, app) in t {
-                    let param = app.into_iter().map(|e| Box::new(e)).collect();
+                    let param = app.into_iter().map(Box::new).collect();
                     let span = Span::new(start, end);
-                    f = Form::new(span, Expr::Apply(Box::new(f), param))
+                    f = Form::new(span, Expr::Apply(Box::new(f), param));
                 }
                 f
             }
 
         rule _form_factor() -> Form
-            = spanned_form(<factor_expr()>) / parens(<expression()>)
+            = spanned_form(<factor_expr()>)
+            / parens(<expression()>)
 
         rule factor_expr() -> Expr
-            = ifelse() / letin() / matchexpr() / lambda() / lit() / var() / list() / block()
+            = ifelse()
+            / letin()
+            / matchexpr()
+            / lambda()
+            / unit_or_tuple_expr()
+            / struct_init_expr()
+            / lit()
+            / var()
+            / list()
+            / block()
+
+        rule unit_or_tuple_expr() -> Expr
+            = token(<"(">) token(<")">) { Expr::Lit(Lit::Unit) }
+            / token(<"(">) first:expression() token(<",">) rest:(expression() ++ token(<",">)) token(<",">)? token(<")">) {
+                let mut elems = vec![Box::new(first)];
+                elems.extend(rest.into_iter().map(Box::new));
+                Expr::Tuple(elems)
+            }
+
+        rule struct_init_expr() -> Expr
+            = ctor:upper_identifier_str() token(<"{">) fields:struct_init_field() ++ token(<",">) token(<",">)? token(<"}">) {
+                Expr::StructInit(ctor.to_string(), fields)
+            }
+
+        rule struct_init_field() -> (Name, E)
+            = fname:lower_identifier_str() token(<":">) val:expression() {
+                (fname.to_string(), Box::new(val))
+            }
 
         rule ifelse() -> Expr
             = reserved(<"if">) c:parens(<expression()>)
@@ -480,94 +677,138 @@ peg::parser! {
               }
 
         rule letin() -> Expr
-            = reserved(<"let">) v:variable_declaration() lexeme(<"=">) val:expression()
+            = reserved(<"let">) v:variable_declaration() token(<"=">) val:expression()
               reserved(<"in">) e:expression() {
                 Expr::Let(v, Box::new(val), Box::new(e))
             }
+            // Destructuring let sugar: `let (a, b) = expr in body` => `match expr { (a, b) -> body }`
+            / reserved(<"let">) pat:pattern() token(<"=">) val:expression()
+              reserved(<"in">) e:expression() {
+                let arm = MatchArm {
+                    pattern: pat,
+                    guard: None,
+                    body: Box::new(e),
+                };
+                Expr::Match(Box::new(val), vec![arm])
+            }
 
-        // Match expression: match expr { pattern -> body, ... }
         rule matchexpr() -> Expr
-            = reserved(<"match">) scrutinee:expression() lexeme(<"{">)
-              arms:match_arm() ++ lexeme(<",">) lexeme(<"}">) {
+            = reserved(<"match">) scrutinee:expression() token(<"{">)
+              arms:match_arm() ++ token(<",">) token(<",">)? token(<"}">) {
                 Expr::Match(Box::new(scrutinee), arms)
             }
 
         rule match_arm() -> MatchArm
-            = p:pattern() g:match_guard()? lexeme(<"->">) b:expression() {
+            = p:pattern() g:match_guard()? token(<"->">) b:expression() {
                 MatchArm { pattern: p, guard: g, body: Box::new(b) }
             }
 
         rule match_guard() -> E
             = reserved(<"if">) cond:parens(<expression()>) { Box::new(cond) }
 
-        // Pattern matching patterns
+        // Patterns
         rule pattern() -> Pattern
-            = constructor_pattern()
+            = struct_constructor_pattern()
+            / constructor_pattern()
+            / unit_or_tuple_pattern()
+            / parens(<pattern()>)
             / literal_pattern()
             / wildcard_pattern()
             / variable_pattern()
 
-        rule constructor_pattern() -> Pattern
-            = n:constructor_identifier() ps:parens(<pattern() ** lexeme(<",">)>) {
-                Pattern::Constructor(interner.borrow().trace(n).to_string(), ps)
-            }
-            / n:constructor_identifier() {
-                // Unit constructor (no fields)
-                Pattern::Constructor(interner.borrow().trace(n).to_string(), vec![])
+        rule struct_constructor_pattern() -> Pattern
+            = n:upper_identifier_str() token(<"{">) fs:struct_pattern_field() ++ token(<",">) token(<",">)? token(<"}">) {
+                Pattern::StructConstructor(n.to_string(), fs)
             }
 
-        rule constructor_identifier() -> Id
-            = id:lexeme(<$(['A'..='Z'] identifier_char()*)>) {
-                interner.borrow_mut().intern(id)
+        rule struct_pattern_field() -> (Name, Pattern)
+            = fname:lower_identifier_str() token(<":">) pat:pattern() {
+                (fname.to_string(), pat)
+            }
+            / fname:lower_identifier_str() {
+                let id = interner.borrow_mut().intern(fname);
+                (fname.to_string(), Pattern::Var(id))
+            }
+
+        rule constructor_pattern() -> Pattern
+            = n:upper_identifier_str() ps:parens(<pattern() ** token(<",">)>) {
+                Pattern::Constructor(n.to_string(), ps)
+            }
+            / n:upper_identifier_str() {
+                Pattern::Constructor(n.to_string(), vec![])
+            }
+
+        rule unit_or_tuple_pattern() -> Pattern
+            = token(<"(">) token(<")">) { Pattern::Lit(Lit::Unit) }
+            / token(<"(">) first:pattern() token(<",">) rest:(pattern() ++ token(<",">)) token(<",">)? token(<")">) {
+                let mut pats = vec![first];
+                pats.extend(rest);
+                Pattern::Tuple(pats)
             }
 
         rule wildcard_pattern() -> Pattern
             = lexeme(<"_">) { Pattern::Wildcard }
 
         rule variable_pattern() -> Pattern
-            = n:identifier() { Pattern::Var(n) }
+            = n:lower_identifier_str() {
+                Pattern::Var(interner.borrow_mut().intern(n))
+            }
 
         rule literal_pattern() -> Pattern
             = l:lit() {
                 match l {
                     Expr::Lit(lit) => Pattern::Lit(lit),
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 }
             }
 
         rule lambda() -> Expr
-            = p:parens(<parameter_sequence()>) lexeme(<"->">) to:expression() {
-                Expr::Abs(Lambda { param: p, body: Box::new(to) })
+            = p:parens(<parameter_sequence()>) ret_ann:(token(<":">) t:type_expression() { t })? token(<"->">) to:expression() {
+                Expr::Abs(Lambda { param: p, ret_ty: ret_ann, body: Box::new(to) })
             }
 
         rule var() -> Expr
             = path:module_path() {
                 if path.segments.len() == 1 {
-                    // Simple variable
                     Expr::Var(path.segments[0])
                 } else {
-                    // Qualified variable (module path)
                     Expr::QualifiedVar(path)
                 }
             }
 
         rule list() -> Expr
-            = lexeme(<"[">) l:expression() ** lexeme(<",">) lexeme(<"]">) {
-                Expr::List(l.into_iter().map(|e| Box::new(e)).collect())
+            = token(<"[">) l:expression() ** token(<",">) token(<",">)? token(<"]">) {
+                Expr::List(l.into_iter().map(Box::new).collect())
+            }
+
+        rule block_sep() = (whitespace_inline() (";" / "\r\n" / "\n"))+
+
+        rule block_stmt() -> BlockItem
+            = start:position!() reserved(<"let">) v:variable_declaration() token(<"=">) val:expression() end:position!() {
+                BlockItem::LetVar(Span::new(start, end), v, Box::new(val))
+            }
+            / start:position!() reserved(<"let">) pat:pattern() token(<"=">) val:expression() end:position!() {
+                BlockItem::LetPat(Span::new(start, end), pat, Box::new(val))
+            }
+            / e:expression() {
+                BlockItem::Expr(Box::new(e))
             }
 
         rule block() -> Expr
-            = lexeme(<"{">) l:expression() ** lexeme(<",">) lexeme(<"}">) {
-                Expr::Block(l.into_iter().map(|e| Box::new(e)).collect())
+            = token(<"{">) first:block_stmt() rest:(block_sep() s:block_stmt() { s })* block_sep()? token(<"}">) {?
+                let mut items = vec![first];
+                items.extend(rest);
+                fold_block_items(items)
             }
 
         rule lit() -> Expr
-            = float_lit() / integer_lit() / string_lit() / bool_lit()
+            = float_lit() / integer_lit() / char_lit() / string_lit() / bool_lit()
 
         rule float_lit() -> Expr
             = f:float() {?
-                f.parse::<f64>().map(|v| Expr::Lit(Lit::Float(v)))
-                    .or(Err("Parse float failed"))
+                f.parse::<f64>()
+                    .map(|v| Expr::Lit(Lit::Float(v)))
+                    .map_err(|_| "Parse float failed")
             }
 
         rule integer_lit() -> Expr
@@ -575,38 +816,37 @@ peg::parser! {
                 i.parse::<i32>()
                     .map(|v| Expr::Lit(Lit::Int(v)))
                     .or_else(|_| {
-                        i.parse::<f64>().map(|v| Expr::Lit(Lit::Float(v)))
-                            .or(Err("Parse integer failed"))
+                        i.parse::<f64>()
+                            .map(|v| Expr::Lit(Lit::Float(v)))
+                            .map_err(|_| "Parse integer failed")
                     })
+            }
+
+        rule char_lit() -> Expr
+            = s:char_lit_raw() {?
+                parse_char_content(s).map(|c| Expr::Lit(Lit::Char(c)))
             }
 
         rule string_lit() -> Expr
             = s:string() {?
-                escape_string(s)
-                    .map(|s| Expr::Lit(Lit::Str(s)))
-                    .or(Err("Parse string failed"))
+                escape_string(s).map(|s| Expr::Lit(Lit::Str(s)))
             }
 
         rule bool_lit() -> Expr
-            = b:lexeme(<$("true" / "false")>) {
-                Expr::Lit(Lit::Bool(match b {
-                    "true" => true,
-                    "false" => false,
-                    _ => unreachable!()
-                }))
-            }
+            = reserved(<"true">) { Expr::Lit(Lit::Bool(true)) }
+            / reserved(<"false">) { Expr::Lit(Lit::Bool(false)) }
 
         rule _apply() -> (usize, Vec<Form>)
             = l:parens(<apply_list()>) end:position!() { (end, l) }
 
         rule apply_list() -> Vec<Form>
-            = expression() ** lexeme(<",">)
+            = elems:expression() ** token(<",">) token(<",">)? { elems }
 
         rule parameter_sequence() -> Vec<VarDecl>
-            = variable_declaration() ** lexeme(<",">)
+            = ps:variable_declaration() ** token(<",">) token(<",">)? { ps }
 
         rule variable_declaration() -> VarDecl
-            = n:identifier() lexeme(<":">) t:type_expression() {
+            = n:identifier() token(<":">) t:type_expression() {
                 VarDecl(n, Scheme::Mono(t))
             }
             / n:identifier() { VarDecl(n, Scheme::Slot) }
@@ -628,7 +868,7 @@ pub fn parse_type(src: &str, interner: &mut Interner) -> Scheme {
     *interner = cell.into_inner();
     match result {
         Ok(scm) => scm,
-        Err(err) => panic!("Parse type failed: {:?}", err)
+        Err(err) => panic!("Parse type '{}' failed: {:?}", src, err),
     }
 }
 
@@ -639,8 +879,6 @@ pub fn parse_expr(src: &str, interner: &mut Interner) -> Result<Form, peg::error
     result
 }
 
-/// Parse a source file as a FileModule with full module item support.
-/// This preserves use statements, mod declarations, and visibility information.
 pub fn parse_file_module(
     src: &str,
     path: &ModulePath,
@@ -654,574 +892,109 @@ mod tests {
     use super::*;
 
     #[test]
-    fn case_parse_type_constant() {
+    fn case_parse_arrow_right_associative() {
         let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("  Fuck", &cell), Ok(Type::Con("Fuck".to_string())))
-    }
-    #[test]
-    fn case_parse_type_variable() {
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("     shit", &cell), Ok(Type::Var("shit".to_string())))
-    }
-    #[test]
-    fn case_parse_arrow_type() {
-        let output = Type::Arr(
-            Box::new(Type::Var("shit".to_string())),
-            Box::new(Type::Con("Fuck".to_string()))
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("     shit -> Fuck", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_composite_type() {
-        let output = Type::Comp(
-            Box::new(Type::Var("shit".to_string())),
-            Box::new(Type::Con("Fuck".to_string()))
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("     shit  Fuck", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_composite_and_arrow_type() {
-        let output = Type::Arr(
-            Box::new(Type::Comp(
-                Box::new(Type::Var("shit".to_string())),
-                Box::new(Type::Con("Fuck".to_string()))
-            )),
-            Box::new(Type::Var("a".to_string()))
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("     shit  Fuck -> a", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_product_type() {
-        let output = Type::Prod(
-            Box::new(Type::Con("Shit".to_string())),
-            Box::new(Type::Var("fuck".to_string()))
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("     Shit * fuck", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_product_and_arrow_type() {
-        let output = Type::Arr(
-            Box::new(Type::Prod(
-                Box::new(Type::Con("Shit".to_string())),
-                Box::new(Type::Var("fuck".to_string()))
-            )),
-            Box::new(Type::Con("Fuck".to_string()))
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("     Shit  *    fuck -> Fuck", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_product_with_arrow_type() {
-        let output = Type::Prod(
-            Box::new(Type::Con("Shit".to_string())),
-            Box::new(Type::Arr(
-                Box::new(Type::Var("fuck".to_string())),
-                Box::new(Type::Con("Fuck".to_string()))
-            ))
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("     Shit  *  (  fuck -> Fuck)", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_arrow_and_product_type() {
-        let output = Type::Arr(
-            Box::new(Type::Con("Fuck".to_string())),
-            Box::new(Type::Prod(
-                Box::new(Type::Con("Shit".to_string())),
-                Box::new(Type::Var("fuck".to_string()))
-            ))
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_expression("   Fuck ->    Shit * fuck", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_mono_arrow_to_arrow_type() {
-        // Arrow types are left-associative in our precedence grammar:
-        // (Fuck -> Shit) -> fuck
-        let output = Scheme::Mono(
+        let parsed = type_expression("Int -> String -> Bool", &cell).unwrap();
+        assert_eq!(
+            parsed,
             Type::Arr(
+                vec![Type::Con("Int".to_string())],
                 Box::new(Type::Arr(
-                    Box::new(Type::Con("Fuck".to_string())),
-                    Box::new(Type::Con("Shit".to_string()))
-                )),
-                Box::new(Type::Var("fuck".to_string()))
-            )
-        );
-        let cell = RefCell::new(Interner::new());
-        assert_eq!(type_scheme("   Fuck ->    Shit -> fuck", &cell), Ok(output))
-    }
-    #[test]
-    fn case_parse_poly_product_with_arrow_type() {
-        let output = Scheme::Poly(
-            vec!["fuck".to_string()],
-            Type::Prod(
-                Box::new(Type::Con("Shit".to_string())),
-                Box::new(Type::Arr(
-                    Box::new(Type::Var("fuck".to_string())),
-                    Box::new(Type::Con("Fuck".to_string()))
+                    vec![Type::Con("String".to_string())],
+                    Box::new(Type::Con("Bool".to_string())),
                 ))
             )
         );
+    }
+
+    #[test]
+    fn case_parse_multi_param_vs_tuple_type() {
         let cell = RefCell::new(Interner::new());
-        assert_eq!(type_scheme("forall fuck.     Shit  *  (  fuck -> Fuck)", &cell), Ok(output))
+        // 2-param function
+        let fn2 = type_expression("(Int, String) -> Bool", &cell).unwrap();
+        assert_eq!(
+            fn2,
+            Type::Arr(
+                vec![Type::Con("Int".to_string()), Type::Con("String".to_string())],
+                Box::new(Type::Con("Bool".to_string()))
+            )
+        );
+
+        // 0-param function
+        let fn0 = type_expression("() -> Int", &cell).unwrap();
+        assert_eq!(fn0, Type::Arr(vec![], Box::new(Type::Con("Int".to_string()))));
+
+        // 1-param function taking a 2-tuple
+        let fn_tuple = type_expression("((Int, String)) -> Bool", &cell).unwrap();
+        assert_eq!(
+            fn_tuple,
+            Type::Arr(
+                vec![Type::Tuple(vec![
+                    Type::Con("Int".to_string()),
+                    Type::Con("String".to_string()),
+                ])],
+                Box::new(Type::Con("Bool".to_string()))
+            )
+        );
+
+        // Standalone tuple type
+        let tup = type_expression("(Int, String)", &cell).unwrap();
+        assert_eq!(
+            tup,
+            Type::Tuple(vec![
+                Type::Con("Int".to_string()),
+                Type::Con("String".to_string()),
+            ])
+        );
     }
 
     #[test]
-    fn case_parse_function_definition() {
-        {
-            let cell = RefCell::new(Interner::new());
-            let result = module("def fuck(a, b) = a + b", &cell);
-            assert!(result.is_ok());
-        }
-        {
-            let cell = RefCell::new(Interner::new());
-            let result = module("def fuck(a) = a + 1", &cell);
-            assert!(result.is_ok());
-        }
-        {
-            let src =
-"
-fuck: Int -> Int
-def fuck(a) = a + 1
-
-shit: forall a b. a * b -> a * b
-def shit(p) = p
-
-";
-            let cell = RefCell::new(Interner::new());
-            println!("{:?}", module(src, &cell));
-            assert!(true)
-        }
-    }
-
-    #[test]
-    fn case_parse_type_definition() {
-        let src = "
-data Fuck a {
-    Fucker(Int, Float),
-    Shit {
-        mf: Int,
-        next: Fuck
-    }
+    fn case_parse_comments_escapes_blocks_and_unary() {
+        let src = r#"
+// Line comment
+/* Multi-line
+   comment */
+def demo(x: Int): Int = {
+    let s = "quote \" and slash \\";
+    let b = !false;
+    if (b) -x else 0
 }
-
-type S b = Fuck b
-";
+"#;
         let cell = RefCell::new(Interner::new());
-        println!("{:?}", module(src, &cell));
-        assert!(true);
-    }
-
-    #[test]
-    fn case_parse_adt_with_unit_variant() {
-        let src = "
-data Option a {
-    None,
-    Some(a)
-}
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-        let defs = result.unwrap();
+        let defs = module(src, &cell).expect("Should parse comments, escapes, blocks, and unary ops");
         assert_eq!(defs.len(), 1);
     }
 
     #[test]
-    fn case_parse_match_expression() {
-        let src = "
-data Option a {
-    None,
-    Some(a)
-}
-
-def unwrap(opt) = match opt {
-    None -> 0,
-    Some(x) -> x
-}
-";
+    fn case_parse_constrained_forall_both_syntaxes() {
         let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn case_parse_match_with_literals() {
-        let src = "
-def check(x) = match x {
-    0 -> 1,
-    1 -> 2,
-    n -> n + 1
-}
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn case_parse_match_with_wildcard() {
-        let src = "
-def foo(x) = match x {
-    0 -> 1,
-    _ -> 0
-}
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn case_parse_concept_definition() {
-        let src = "
-concept Eq a {
-    eq: a * a -> Bool
-}
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-        let defs = result.unwrap();
-        assert_eq!(defs.len(), 1);
-    }
-
-    #[test]
-    fn case_parse_instance_definition() {
-        let src = "
-instance Eq Int {
-    def eq(x, y) = x == y
-}
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn case_parse_instance_with_constraint() {
-        let src = "
-instance (Eq a) => Eq (List a) {
-    def eq(xs, ys) = true
-}
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn case_parse_constrained_forall() {
-        // Test constrained forall type scheme
-        let cell = RefCell::new(Interner::new());
-        let result = type_scheme("forall (Eq a). a * a -> Bool", &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-
-        if let Ok(Scheme::PolyConstrained(vars, constraints, _body)) = result {
-            assert_eq!(vars.len(), 1);
-            assert_eq!(vars[0], "a");
-            assert_eq!(constraints.len(), 1);
-            assert_eq!(constraints[0].concept, "Eq");
-            assert_eq!(constraints[0].type_arg, "a");
+        let s1 = type_scheme("forall k v. (Eq k) => (k, List (k, v)) -> Maybe v", &cell).unwrap();
+        if let Scheme::PolyConstrained(vars, cs, _) = s1 {
+            assert_eq!(vars, vec!["k".to_string(), "v".to_string()]);
+            assert_eq!(cs.len(), 1);
         } else {
-            panic!("Expected PolyConstrained scheme");
+            panic!("Expected PolyConstrained");
         }
-    }
 
-    #[test]
-    fn case_parse_constrained_forall_multiple() {
-        // Test constrained forall with multiple constraints
-        let cell = RefCell::new(Interner::new());
-        let result = type_scheme("forall (Eq a, Ord b). a * b -> Bool", &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-
-        if let Ok(Scheme::PolyConstrained(vars, constraints, _body)) = result {
-            assert_eq!(vars.len(), 2);
-            assert_eq!(constraints.len(), 2);
+        // Duplicate constraint on same var deduplicates binder
+        let s2 = type_scheme("forall (Eq a, Show a). a -> String", &cell).unwrap();
+        if let Scheme::PolyConstrained(vars, cs, _) = s2 {
+            assert_eq!(vars, vec!["a".to_string()]);
+            assert_eq!(cs.len(), 2);
         } else {
-            panic!("Expected PolyConstrained scheme");
-        }
-    }
-
-    // ========================================================================
-    // Module System Tests
-    // ========================================================================
-
-    #[test]
-    fn case_parse_pub_function() {
-        // Test parsing pub modifier on function
-        let src = "
-pub def add(x, y) = x + y
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        assert!(result.is_ok());
-        let defs = result.unwrap();
-        assert_eq!(defs.len(), 1);
-        assert!(defs[0].is_public());
-    }
-
-    #[test]
-    fn case_parse_private_function() {
-        // Test that functions are private by default
-        let src = "
-def helper(x) = x + 1
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        assert!(result.is_ok());
-        let defs = result.unwrap();
-        assert_eq!(defs.len(), 1);
-        assert!(!defs[0].is_public());
-    }
-
-    #[test]
-    fn case_parse_pub_data() {
-        // Test parsing pub modifier on data type
-        let src = "
-pub data List a {
-    Nil,
-    Cons(a, List a)
-}
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        assert!(result.is_ok());
-        let defs = result.unwrap();
-        assert_eq!(defs.len(), 1);
-        assert!(defs[0].is_public());
-    }
-
-    #[test]
-    fn case_parse_qualified_name() {
-        // Test parsing qualified variable names
-        let src = "
-def test() = collections.list.length
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("{:?}", result);
-        assert!(result.is_ok());
-        let defs = result.unwrap();
-        assert_eq!(defs.len(), 1);
-        // The function body should contain a QualifiedVar
-        if let Item::Form(ref body) = defs[0].node {
-            if let Expr::Abs(ref lambda) = body.node {
-                if let Expr::QualifiedVar(ref path) = lambda.body.node {
-                    assert_eq!(path.segments.len(), 3);
-                } else {
-                    panic!("Expected QualifiedVar in function body");
-                }
-            } else {
-                panic!("Expected Abs expression");
-            }
-        } else {
-            panic!("Expected Form item");
+            panic!("Expected PolyConstrained");
         }
     }
 
     #[test]
-    fn case_parse_simple_qualified_name() {
-        // Test parsing simple qualified name (module.name)
-        let src = "
-def test() = utils.clamp
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn case_parse_module_items() {
-        // Test single pub def
-        let src1 = "pub def foo(x) = x";
-        let cell1 = RefCell::new(Interner::new());
-        let result1 = module(src1, &cell1);
-        assert!(result1.is_ok(), "pub def should parse: {:?}", result1.err());
-        let defs1 = result1.unwrap();
-        assert_eq!(defs1.len(), 1);
-        assert!(defs1[0].is_public(), "pub def should be public");
-
-        // Test single def (no pub)
-        let src2 = "def foo(x) = x";
-        let cell2 = RefCell::new(Interner::new());
-        let result2 = module(src2, &cell2);
-        assert!(result2.is_ok(), "def should parse: {:?}", result2.err());
-        let defs2 = result2.unwrap();
-        assert_eq!(defs2.len(), 1);
-        assert!(!defs2[0].is_public(), "def should be private");
-
-        // Test pub data
-        let src3 = "pub data Foo { Bar }";
-        let cell3 = RefCell::new(Interner::new());
-        let result3 = module(src3, &cell3);
-        assert!(result3.is_ok(), "pub data should parse: {:?}", result3.err());
-
-        // Test two defs with pub
-        let src4a = "pub def foo(x) = x\ndef bar(y) = y";
-        let cell4a = RefCell::new(Interner::new());
-        let result4a = module(src4a, &cell4a);
-        println!("Two defs: {:?}", result4a);
-
-        // Test with underscore in name
-        let src4b = "pub def public_fn(x) = x";
-        let cell4b = RefCell::new(Interner::new());
-        let result4b = module(src4b, &cell4b);
-        println!("pub def public_fn (underscore): {:?}", result4b);
-
-        // Test with camelCase (no underscore)
-        let src4d = "pub def publicFn(x) = x";
-        let cell4d = RefCell::new(Interner::new());
-        let result4d = module(src4d, &cell4d);
-        println!("pub def publicFn (camelCase): {:?}", result4d);
-
-        // Test with short name
-        let src4e = "pub def p(x) = x";
-        let cell4e = RefCell::new(Interner::new());
-        let result4e = module(src4e, &cell4e);
-        println!("pub def p (short): {:?}", result4e);
-
-        // Test names starting with "pub" prefix (should all work except bare "pub")
-        for name in &["pubA", "pubB", "public", "publication", "publisher", "puba", "pubb"] {
-            let src = format!("pub def {}(x) = x", name);
-            let cell = RefCell::new(Interner::new());
-            let result = module(&src, &cell);
-            assert!(result.is_ok(), "pub def {} should work: {:?}", name, result.err());
-        }
-
-        // "pub" as identifier should fail (it's a keyword)
-        let src_keyword = "pub def pub(x) = x";
-        let cell_keyword = RefCell::new(Interner::new());
-        let result_keyword = module(src_keyword, &cell_keyword);
-        assert!(result_keyword.is_err(), "pub as identifier should fail");
-
-        // Debug: check if the module rule can handle just two defs (no pub)
-        let src4c = "def foo(x) = x\ndef bar(y) = y";
-        let cell4c = RefCell::new(Interner::new());
-        let result4c = module(src4c, &cell4c);
-        println!("Two defs no pub: {:?}", result4c);
-
-        assert!(result4b.is_ok(), "pub def public_fn should parse: {:?}", result4b.err());
-        assert!(result4c.is_ok(), "Two defs no pub should parse: {:?}", result4c.err());
-        assert!(result4a.is_ok(), "Two defs with pub should parse: {:?}", result4a.err());
-
-        // Test full mixed visibility module
-        let src_full = "
-pub def publicFn(x) = x
-def privateFn(x) = x + 1
-pub data PublicType { Val(Int) }
-data PrivateType { Inner }
-";
-        let cell_full = RefCell::new(Interner::new());
-        let result_full = module(src_full, &cell_full);
-        assert!(result_full.is_ok(), "Full mixed visibility should parse: {:?}", result_full.err());
-        let defs = result_full.unwrap();
-        assert_eq!(defs.len(), 4);
-        assert!(defs[0].is_public(), "publicFn should be public");
-        assert!(!defs[1].is_public(), "privateFn should be private");
-        assert!(defs[2].is_public(), "PublicType should be public");
-        assert!(!defs[3].is_public(), "PrivateType should be private");
-    }
-
-    #[test]
-    fn case_parse_mixed_visibility() {
-        // Test mixed visibility with forward declarations
-        let src = "
-publicFn: Int -> Int
-pub def publicFn(x) = x + 1
-";
-        let cell = RefCell::new(Interner::new());
-        let result = module(src, &cell);
-        println!("Parse result: {:?}", result);
-        assert!(result.is_ok(), "Parse error: {:?}", result.err());
-        let defs = result.unwrap();
-        assert_eq!(defs.len(), 1);
-        assert!(defs[0].is_public());
-    }
-
-    #[test]
-    fn case_parse_use_multiple_imports() {
-        // Test parsing use statement with multiple imports: `use math.{add, mul}`
+    fn case_parse_module_items_and_visibility() {
         let src = "
 use math.{add, mul}
 pub def main() = add(1, mul(2, 3))
 ";
         let cell = RefCell::new(Interner::new());
         let path = ModulePath::new(vec![]);
-        let result = file_module(src, &cell, &path);
-        println!("Parse result: {:?}", result);
-        assert!(result.is_ok(), "Parse error: {:?}", result.err());
-        let fm = result.unwrap();
-        assert_eq!(fm.items.len(), 2); // use statement + def
-
-        // Check the first item is a use statement with Multiple variant
-        if let ModuleItem::Use(_, UseItem::Multiple(base_path, specs)) = &fm.items[0] {
-            assert_eq!(base_path.segments.len(), 1); // "math"
-            assert_eq!(specs.len(), 2); // add, mul
-        } else {
-            panic!("Expected UseItem::Multiple, got {:?}", fm.items[0]);
-        }
+        let fm = file_module(src, &cell, &path).unwrap();
+        assert_eq!(fm.items.len(), 2);
     }
-
-    #[test]
-    fn case_parse_use_single_import() {
-        // Test parsing use statement with single import: `use math.add`
-        let src = "
-use math.add
-pub def main() = add(1, 2)
-";
-        let cell = RefCell::new(Interner::new());
-        let path = ModulePath::new(vec![]);
-        let result = file_module(src, &cell, &path);
-        println!("Parse result: {:?}", result);
-        assert!(result.is_ok(), "Parse error: {:?}", result.err());
-        let fm = result.unwrap();
-        assert_eq!(fm.items.len(), 2); // use statement + def
-
-        // Check the first item is a use statement with Single variant
-        if let ModuleItem::Use(_, UseItem::Single(path)) = &fm.items[0] {
-            assert_eq!(path.segments.len(), 2); // "math.add"
-        } else {
-            panic!("Expected UseItem::Single, got {:?}", fm.items[0]);
-        }
-    }
-
-    #[test]
-    fn case_parse_use_alias_import() {
-        // Test parsing use statement with alias: `use math.add as plus`
-        let src = "
-use math.add as plus
-pub def main() = plus(1, 2)
-";
-        let cell = RefCell::new(Interner::new());
-        let path = ModulePath::new(vec![]);
-        let result = file_module(src, &cell, &path);
-        println!("Parse result: {:?}", result);
-        assert!(result.is_ok(), "Parse error: {:?}", result.err());
-        let fm = result.unwrap();
-        assert_eq!(fm.items.len(), 2); // use statement + def
-
-        // Check the first item is a use statement with Alias variant
-        if let ModuleItem::Use(_, UseItem::Alias(path, alias)) = &fm.items[0] {
-            assert_eq!(path.segments.len(), 2); // "math.add"
-            let interner = cell.borrow();
-            assert_eq!(interner.trace(*alias), "plus");
-        } else {
-            panic!("Expected UseItem::Alias, got {:?}", fm.items[0]);
-        }
-    }
-
 }

@@ -1,6 +1,4 @@
-use std::collections::HashSet;
-use std::collections::HashMap;
-
+use std::collections::{HashMap, HashSet};
 use std::ops::DerefMut;
 
 use crate::syntax::form::*;
@@ -9,9 +7,9 @@ use crate::utils::*;
 use crate::types::*;
 
 pub type Subst = HashMap<Name, Type>;
+
 pub trait Substituable {
     fn apply(self, sub: &Subst) -> Self;
-    // fn apply_mut(&mut self, sub: &Subst);
     fn ftv(&self) -> HashSet<Name>;
 }
 
@@ -22,7 +20,7 @@ pub trait SubstMut {
 impl SubstMut for Subst {
     fn apply_mut(&mut self, sub: &Subst) {
         for target in self.values_mut() {
-            *target = target.to_owned().apply(sub);
+            *target = target.clone().apply(sub);
         }
     }
 }
@@ -31,12 +29,15 @@ impl Substituable for Type {
     fn apply(self, sub: &Subst) -> Self {
         use self::Type::*;
         match self {
-            Arr(left, right) => Arr(P((*left).apply(sub)), P((*right).apply(sub))),
-            Prod(left, right) => Prod(P((*left).apply(sub)), P((*right).apply(sub))),
+            Arr(params, ret) => Arr(
+                params.into_iter().map(|p| p.apply(sub)).collect(),
+                P((*ret).apply(sub)),
+            ),
+            Tuple(elems) => Tuple(elems.into_iter().map(|e| e.apply(sub)).collect()),
             Comp(left, right) => Comp(P((*left).apply(sub)), P((*right).apply(sub))),
             Var(n) => {
-                if let Some(ref t) = sub.get(&n) {
-                    (*t).clone()
+                if let Some(t) = sub.get(&n) {
+                    t.clone()
                 } else {
                     Var(n)
                 }
@@ -44,29 +45,40 @@ impl Substituable for Type {
             t => t,
         }
     }
+
     fn ftv(&self) -> HashSet<Name> {
         use self::Type::*;
-        match *self {
-            Var(ref n) => {
+        match self {
+            Var(n) => {
                 let mut it = HashSet::new();
                 it.insert(n.clone());
                 it
             }
-            Arr(ref left, ref right) |
-            Comp(ref left, ref right) |
-            Prod(ref left, ref right) => {
+            Arr(params, ret) => {
+                let mut it = ret.ftv();
+                for p in params {
+                    it.extend(p.ftv());
+                }
+                it
+            }
+            Tuple(elems) => {
+                let mut it = HashSet::new();
+                for e in elems {
+                    it.extend(e.ftv());
+                }
+                it
+            }
+            Comp(left, right) => {
                 let mut it = left.ftv();
                 it.extend(right.ftv());
                 it
             }
-            _ => HashSet::new(),
+            Void | Con(_) => HashSet::new(),
         }
     }
 }
 
-
 impl Substituable for Scheme {
-    // fn apply_mut(&mut self, sub: &Subst) {}
     fn apply(self, sub: &Subst) -> Self {
         use self::Scheme::*;
         match self {
@@ -85,21 +97,20 @@ impl Substituable for Scheme {
                 }
                 PolyConstrained(bounds, constraints, ty.apply(&s_))
             }
-            t => t,
+            Slot => Slot,
         }
     }
 
     fn ftv(&self) -> HashSet<Name> {
         use self::Scheme::*;
-        match *self {
-            Mono(ref ty) => (*ty).ftv(),
-            Poly(ref bounds, ref ty) |
-            PolyConstrained(ref bounds, _, ref ty) => {
+        match self {
+            Mono(ty) => ty.ftv(),
+            Poly(bounds, ty) | PolyConstrained(bounds, _, ty) => {
                 let mut res = ty.ftv();
                 for n in bounds {
                     res.remove(n);
                 }
-                return res;
+                res
             }
             Slot => HashSet::new(),
         }
@@ -110,10 +121,15 @@ impl SubstMut for Scheme {
     fn apply_mut(&mut self, sub: &Subst) {
         use self::Scheme::*;
         match self {
-            &mut Mono(ref mut ty) |
-            &mut Poly(_, ref mut ty) |
-            &mut PolyConstrained(_, _, ref mut ty) => *ty = ty.clone().apply(sub),
-            _ => {}
+            Mono(ref mut ty) => *ty = ty.clone().apply(sub),
+            Poly(ref bounds, ref mut ty) | PolyConstrained(ref bounds, _, ref mut ty) => {
+                let mut filtered = sub.clone();
+                for b in bounds {
+                    filtered.remove(b);
+                }
+                *ty = ty.clone().apply(&filtered);
+            }
+            Slot => {}
         }
     }
 }
@@ -133,11 +149,11 @@ impl<T: SubstMut> SubstMut for Box<T> {
 }
 
 impl Substituable for Form {
-    // fn apply_mut(&mut self, sub: &Subst) {}
     fn apply(mut self, sub: &Subst) -> Self {
         self.tag.ty = self.tag.ty.apply(sub);
         self
     }
+
     fn ftv(&self) -> HashSet<Name> {
         self.tag.ty.ftv()
     }
@@ -148,9 +164,13 @@ impl SubstMut for Form {
         use self::Expr::*;
         self.tag.ty.apply_mut(sub);
         match self.node {
-            List(ref mut es) |
-            Block(ref mut es) => {
+            Tuple(ref mut es) | List(ref mut es) | Block(ref mut es) => {
                 es.apply_mut(sub);
+            }
+            StructInit(_, ref mut fields) => {
+                for (_, val) in fields.iter_mut() {
+                    val.apply_mut(sub);
+                }
             }
             Apply(ref mut callee, ref mut args) => {
                 callee.apply_mut(sub);
@@ -158,6 +178,9 @@ impl SubstMut for Form {
             }
             Abs(ref mut fun) => {
                 fun.param.apply_mut(sub);
+                if let Some(ref mut rt) = fun.ret_ty {
+                    *rt = rt.clone().apply(sub);
+                }
                 fun.body.apply_mut(sub);
             }
             Binary(_, ref mut l, ref mut r) => {
@@ -186,9 +209,7 @@ impl SubstMut for Form {
                     arm.body.apply_mut(sub);
                 }
             }
-            // Lit(Lit),
-            // Var(Name),
-            _ => {}
+            Lit(_) | Var(_) | QualifiedVar(_) => {}
         }
     }
 }

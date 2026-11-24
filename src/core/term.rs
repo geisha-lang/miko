@@ -1,32 +1,23 @@
-use std::string::*;
-use std::collections::HashMap;
-
 use std::ops::Deref;
-use std::ops::DerefMut;
-
-use std::iter::IntoIterator;
-use std::iter::DoubleEndedIterator;
 
 use crate::internal::*;
+use crate::syntax::form::Pattern;
 use crate::types::*;
 use crate::utils::*;
-use crate::syntax::form::{Pattern, Form};
 
-
-type Node = Box<TaggedTerm>;
-
+pub type Node = Box<TaggedTerm>;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct TypeDef {
-    name: Name,
-    params: Vec<Name>,
-    body: TypeKind
+    pub name: Name,
+    pub params: Vec<Name>,
+    pub body: TypeKind,
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum TypeKind {
     Alias(P<Scheme>),
-    Algebra(Vec<Variant>)
+    Algebra(Vec<Variant>),
 }
 
 impl TypeDef {
@@ -35,42 +26,54 @@ impl TypeDef {
     }
 }
 
+/// Top-level value definition (`def pi = 3.14`), evaluated once at startup
+#[derive(Clone, PartialEq, Debug)]
+pub struct GlobalValDef {
+    pub name: Id,
+    pub ty: Type,
+    pub init: TaggedTerm,
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct FunDef {
     name: Id,
     params: Vec<VarDecl>,
     freevars: Vec<VarDecl>,
     body: Node,
-    ty: Scheme, 
+    ty: Scheme,
 }
 
 impl FunDef {
-    pub fn new(name: Id,
-               ty: Scheme,
-               params: Vec<VarDecl>,
-               freevars: Vec<VarDecl>,
-               body: TaggedTerm)
-               -> FunDef {
+    pub fn new(
+        name: Id,
+        ty: Scheme,
+        params: Vec<VarDecl>,
+        freevars: Vec<VarDecl>,
+        body: TaggedTerm,
+    ) -> FunDef {
         FunDef {
             ty,
             name,
             params,
             freevars,
             body: Box::new(body),
-//            inst: None
         }
     }
 
-    pub fn name<'a>(&'a self) -> Id {
-        self.name.clone()
+    pub fn name(&self) -> Id {
+        self.name
     }
 
-    pub fn fv<'a>(&'a self) -> &'a Vec<VarDecl> {
+    pub fn fv(&self) -> &Vec<VarDecl> {
         &self.freevars
     }
 
     pub fn body(&self) -> &TaggedTerm {
         self.body.deref()
+    }
+
+    pub fn body_mut(&mut self) -> &mut TaggedTerm {
+        &mut self.body
     }
 
     pub fn ref_type(&self) -> &Type {
@@ -86,11 +89,11 @@ impl FunDef {
     }
 }
 
-/// Represents a expression term
+/// Expression term annotated with its `Scheme`
 #[derive(Clone, PartialEq, Debug)]
 pub struct TaggedTerm {
-    ty: Scheme,
-    node: Term,
+    pub ty: Scheme,
+    pub node: Term,
 }
 
 impl TaggedTerm {
@@ -101,92 +104,71 @@ impl TaggedTerm {
     pub fn ref_scheme(&self) -> &Scheme {
         &self.ty
     }
+
     pub fn body(&self) -> &Term {
         &self.node
     }
 }
 
-
-/// Represents a expression term
+/// Core intermediate representation after K-conversion
 #[derive(Clone, PartialEq, Debug)]
 pub enum Term {
-    /// Literal value
+    /// Primitive or unit literal
     Lit(Lit),
-    /// Identifier (binding/definition)
+    /// Local variable or function reference
     Var(Id),
-    /// List (array)
-    /// e.g. `[fuck, shit]`
-    List(Vec<Node>),
-    /// Block (statement sequence)
-    /// e.g. `{ print(fuck); print(shit); 1 }`
+    /// Reference to a top-level value global (`def x = ...`)
+    GlobalVar(Id),
+    /// First-class tuple construction (`(e1, e2)`)
+    Tuple(Vec<Node>),
+    /// Sequential block (`{ e1; e2 }`)
     Block(Vec<Node>),
-
-    /// Make closure with free variables
+    /// Create closure value with captured free variables
     MakeCls(VarDecl, P<Closure>, Node),
-
-    /// Apply a closure
+    /// Call first-class closure value
     ApplyCls(Node, Vec<Node>),
-    /// Apply function without free vars
+    /// Direct call to a known top-level/non-capturing function
     ApplyDir(VarDecl, Vec<Node>),
-
-    //** For now, all functions will represent as closure
-    /// Apply a global function directly
-    // ApplyDir(Name, Vec<Node>),
-    /// Binary operator expression
-    /// e.g. `fuck + shit`
+    /// Binary operator
     Binary(BinOp, Node, Node),
-    /// Unary operator expression
-    /// e.g. `!fuck`
-    /// e.g. `-shit`
+    /// Unary operator (`!e`, `-e`)
     Unary(UnOp, Node),
-
-    /// Let-in expression
-    /// e.g. `let fuck = shit in fuck + 1`
+    /// Local let binding
     Let(VarDecl, Node, Node),
-    /// Conditional expression
-    /// e.g. `if (fuck == shit) 1 else 0`
+    /// Conditional branch
     If(Node, Node, Node),
-
-    /// Pattern matching expression
-    /// Match(scrutinee, [(pattern, optional_guard, body)])
-    Match(Node, Vec<(Pattern, Option<P<Form>>, Node)>),
-
-    /// ADT Operations
-    /// Construct an ADT value with instantiated field types
+    /// Pattern match with optional transformed guard term
+    Match(Node, Vec<(Pattern, Option<Node>, Node)>),
+    /// Construct ADT variant value
     MakeData {
         type_name: Name,
         tag: usize,
         fields: Vec<Node>,
-        field_types: Vec<Type>,  // Instantiated concrete types for fields
-        type_args: Vec<Type>,    // Type arguments for the ADT (e.g., [Int] for List Int)
+        field_types: Vec<Type>,
+        type_args: Vec<Type>,
     },
-    /// Get the variant tag from an ADT value
+    /// Extract ADT tag
     GetTag(Node),
-    /// Get a field from an ADT value by index
+    /// Extract ADT field
     GetField(Node, usize),
 }
 
-/// Represents a closure, including a entry as
-///   global definition and a actual free variable list.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Closure {
     entry: Id,
-    actualFv: Vec<Id>,
+    actual_fv: Vec<Id>,
 }
 
 impl Closure {
-    pub fn new(entry: Id, actualFv: Vec<Id>) -> Closure {
-        Closure {
-            entry,
-            actualFv,
-        }
+    pub fn new(entry: Id, actual_fv: Vec<Id>) -> Closure {
+        Closure { entry, actual_fv }
     }
 
     pub fn fv(&self) -> Vec<Id> {
-        self.actualFv.clone()
+        self.actual_fv.clone()
     }
 
     pub fn entry(&self) -> Id {
-        self.entry.clone()
+        self.entry
     }
 }

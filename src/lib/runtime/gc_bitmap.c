@@ -535,31 +535,75 @@ static void bitmap_mark_stack_range(uintptr_t sp_low, uintptr_t sp_high)
     }
 }
 
-static bool bitmap_mark_obj(gc_heap_t *heap, uintptr_t hdr_addr)
-{
-    uintptr_t off = hdr_addr - heap->base;
-    size_t idx = OFFSET_TO_IDX(off);
-    bitmap_t mask = OFFSET_TO_MASK(off);
+typedef struct {
+    gc_heap_t *heap;
+    uintptr_t hdr_addr;
+} gc_mark_entry_t;
 
-    if (heap->mark_bits[idx] & mask) {
+static gc_mark_entry_t *_mark_stack = NULL;
+static size_t _mark_stack_cap = 0;
+
+static void mark_stack_push(gc_heap_t *heap, uintptr_t hdr_addr, size_t *sp)
+{
+    if (*sp >= _mark_stack_cap) {
+        size_t next_cap = _mark_stack_cap == 0 ? 4096 : _mark_stack_cap * 2;
+        gc_mark_entry_t *grown = (gc_mark_entry_t *)realloc(_mark_stack, next_cap * sizeof(gc_mark_entry_t));
+        if (grown == NULL) {
+            fprintf(stderr, "GC mark stack allocation failed\n");
+            abort();
+        }
+        _mark_stack = grown;
+        _mark_stack_cap = next_cap;
+    }
+    _mark_stack[*sp].heap = heap;
+    _mark_stack[*sp].hdr_addr = hdr_addr;
+    (*sp)++;
+}
+
+static bool bitmap_mark_obj(gc_heap_t *root_heap, uintptr_t root_hdr_addr)
+{
+    uintptr_t root_off = root_hdr_addr - root_heap->base;
+    size_t root_idx = OFFSET_TO_IDX(root_off);
+    bitmap_t root_mask = OFFSET_TO_MASK(root_off);
+
+    if (root_heap->mark_bits[root_idx] & root_mask) {
         return false;
     }
-    heap->mark_bits[idx] |= mask;
+    root_heap->mark_bits[root_idx] |= root_mask;
 
-    header_t hdr_val = *(const header_t *)hdr_addr;
-    /* Skip interior word scanning for `NOSCAN` leaf allocations (`String`, scalar `MutArray`, `AtomicInt`)! */
-    if (Is_noscan_hdr(hdr_val)) {
+    header_t root_hdr = *(const header_t *)root_hdr_addr;
+    if (Is_noscan_hdr(root_hdr)) {
         return true;
     }
 
-    size_t payload_words = Get_payload_words_hdr(hdr_val);
-    const uintptr_t *fields = (const uintptr_t *)(hdr_addr + Header_size);
+    size_t sp = 0;
+    mark_stack_push(root_heap, root_hdr_addr, &sp);
 
-    for (size_t i = 0; i < payload_words; i++) {
-        uintptr_t field_val = fields[i];
-        gc_heap_t *child_heap = find_allocated_object_heap(field_val);
-        if (child_heap != NULL) {
-            bitmap_mark_obj(child_heap, field_val - Header_size);
+    while (sp > 0) {
+        sp--;
+        uintptr_t hdr_addr = _mark_stack[sp].hdr_addr;
+        header_t hdr_val = *(const header_t *)hdr_addr;
+        if (Is_noscan_hdr(hdr_val)) {
+            continue;
+        }
+        size_t payload_words = Get_payload_words_hdr(hdr_val);
+        const uintptr_t *fields = (const uintptr_t *)(hdr_addr + Header_size);
+
+        for (size_t i = 0; i < payload_words; i++) {
+            uintptr_t field_val = fields[i];
+            gc_heap_t *child_heap = find_allocated_object_heap(field_val);
+            if (child_heap != NULL) {
+                uintptr_t child_hdr = field_val - Header_size;
+                uintptr_t coff = child_hdr - child_heap->base;
+                size_t cidx = OFFSET_TO_IDX(coff);
+                bitmap_t cmask = OFFSET_TO_MASK(coff);
+                if ((child_heap->mark_bits[cidx] & cmask) == 0) {
+                    child_heap->mark_bits[cidx] |= cmask;
+                    if (!Is_noscan_hdr(*(const header_t *)child_hdr)) {
+                        mark_stack_push(child_heap, child_hdr, &sp);
+                    }
+                }
+            }
         }
     }
     return true;

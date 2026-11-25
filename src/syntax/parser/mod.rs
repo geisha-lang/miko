@@ -179,7 +179,7 @@ peg::parser! {
         rule whitespace_inline_only() = quiet!{ ([' ' | '\t'] / block_comment())+ }
 
         rule keywords() = (
-            "def" / "if" / "else" / "while" / "let" / "in" / "type" / "data"
+            "def" / "extern" / "if" / "else" / "while" / "let" / "in" / "type" / "data"
             / "match" / "concept" / "instance" / "forall"
             / "pub" / "use" / "mod" / "open" / "as"
             / "true" / "false" / "Void"
@@ -221,7 +221,7 @@ peg::parser! {
             = lexeme(<$(['a'..='z' | '_'] identifier_char()*)>)
 
         rule type_constant_identifier() -> &'input str
-            = whitespace() !("def" / "if" / "else" / "while" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance" / "forall" / "pub" / "use" / "mod" / "open" / "as" / "true" / "false" / "Void") !identifier_char()
+            = whitespace() !("def" / "extern" / "if" / "else" / "while" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance" / "forall" / "pub" / "use" / "mod" / "open" / "as" / "true" / "false" / "Void") !identifier_char()
               s:$(['A'..='Z'] identifier_char()*) { s }
             / whitespace() !"Void" !identifier_char() s:$(['A'..='Z'] identifier_char()*) { s }
 
@@ -334,12 +334,45 @@ peg::parser! {
                 let (span, (vis, name, form)) = d;
                 Def::value_with_visibility(span, name, Box::new(form), vis)
             }
+            / d:spanned(<pub_extern_definition()>) {
+                let (span, mut def) = d;
+                def.pos = span;
+                def
+            }
             / d:spanned(<pub_type_definition()>) {
                 let (span, (vis, mut def)) = d;
                 def.pos = span;
                 def.visibility = vis;
                 def
             }
+
+        rule pub_extern_definition() -> Def
+            = vis:visibility() reserved(<"extern">) link_sym:string()? reserved(<"def">)
+              name:identifier() token(<"(">) ps:extern_param_list() token(<")">)
+              ret_ty:(token(<":">) t:type_expression() { t })? {?
+                let link_name = match link_sym {
+                    Some(raw) => escape_string(raw)?,
+                    None => interner.borrow().trace(name).to_string(),
+                };
+                let ret = ret_ty.unwrap_or(Type::Void);
+                let fn_ty = Type::Arr(ps, Box::new(ret));
+                Ok(Def {
+                    ident: name,
+                    pos: Span::default(),
+                    node: Item::Extern {
+                        link_name,
+                        ty: Scheme::Mono(fn_ty),
+                    },
+                    visibility: vis,
+                })
+            }
+
+        rule extern_param() -> Type
+            = _:identifier() token(<":">) t:type_expression() { t }
+            / t:type_expression() { t }
+
+        rule extern_param_list() -> Vec<Type>
+            = ps:extern_param() ** token(<",">) token(<",">)? { ps }
 
         rule pub_form_definition() -> (Visibility, Id, Form)
             = reserved(<"pub">) p:form_definition() { (Visibility::Public, p.0, p.1) }
@@ -525,8 +558,14 @@ peg::parser! {
         rule type_parameter_sequence() -> Vec<&'input str>
             = (whitespace_inline_only() v:type_variable_identifier() { v })*
 
+        rule qualified_type_name() -> String
+            = mods:(m:lower_identifier_str() token(<".">) { m })+ n:upper_identifier_str() {
+                format!("{}.{}", mods.join("."), n)
+            }
+
         rule type_constant() -> Type
             = reserved(<"Void">) { Type::Void }
+            / q:qualified_type_name() { Type::Con(q) }
             / n:upper_identifier_str() { Type::Con(n.to_string()) }
 
         rule type_variable() -> Type

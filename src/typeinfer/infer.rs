@@ -1660,18 +1660,25 @@ impl<'i> Infer<'i> {
         }
 
         for d in program.iter() {
-            if let Item::Form(ref f) = d.node {
-                if !matches!(f.node, Expr::Abs(..)) {
-                    self.global_values.insert(d.ident);
+            match d.node {
+                Item::Form(ref f) => {
+                    if !matches!(f.node, Expr::Abs(..)) {
+                        self.global_values.insert(d.ident);
+                    }
+                    if let Some(annot) = d.form_annot() {
+                        let expanded = self.expand_scheme(annot, d.pos)?;
+                        initial_bindings.push((d.name(), expanded));
+                    } else {
+                        let fv = self.fresh();
+                        def_placeholders.insert(d.name(), fv.clone());
+                        initial_bindings.push((d.name(), to_mono(fv)));
+                    }
                 }
-                if let Some(annot) = d.form_annot() {
-                    let expanded = self.expand_scheme(annot, d.pos)?;
+                Item::Extern { ref ty, .. } => {
+                    let expanded = self.expand_scheme(ty, d.pos)?;
                     initial_bindings.push((d.name(), expanded));
-                } else {
-                    let fv = self.fresh();
-                    def_placeholders.insert(d.name(), fv.clone());
-                    initial_bindings.push((d.name(), to_mono(fv)));
                 }
+                _ => {}
             }
         }
 

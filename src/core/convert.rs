@@ -182,6 +182,7 @@ fn match_instance_target(pattern: &Type, concrete: &Type, subst: &mut HashMap<Na
 pub struct KOutput {
     pub functions: HashMap<Id, P<FunDef>>,
     pub globals: Vec<GlobalValDef>,
+    pub externs: HashMap<Id, (Name, Type)>,
     pub typedefs: HashMap<Id, P<TypeDef>>,
 }
 
@@ -192,6 +193,7 @@ pub struct K<'i> {
     global: HashMap<Id, P<FunDef>>,
     global_vals: Vec<GlobalValDef>,
     global_val_ids: HashSet<Id>,
+    externs: HashMap<Id, (Name, Type)>,
     typedefs: HashMap<Id, P<TypeDef>>,
     current: Id,
     interner: &'i mut Interner,
@@ -298,6 +300,7 @@ impl<'i> K<'i> {
             global: HashMap::new(),
             global_vals: Vec::new(),
             global_val_ids,
+            externs: HashMap::new(),
             typedefs: HashMap::new(),
             current: current_tmp,
             direct: HashMap::new(),
@@ -315,6 +318,11 @@ impl<'i> K<'i> {
         for def in &defs_vec {
             if def.is_form() && !runner.global_val_ids.contains(&def.ident) {
                 runner.direct.insert(def.ident, def.ident);
+            } else if let Item::Extern { ref link_name, ref ty } = def.node {
+                runner.direct.insert(def.ident, def.ident);
+                runner
+                    .externs
+                    .insert(def.ident, (link_name.clone(), ty.body().clone()));
             }
         }
 
@@ -328,6 +336,7 @@ impl<'i> K<'i> {
         KOutput {
             functions: runner.global,
             globals: runner.global_vals,
+            externs: runner.externs,
             typedefs: runner.typedefs,
         }
     }
@@ -802,8 +811,8 @@ impl<'i> K<'i> {
                 let d = Box::new(TypeDef::new(name, params, TypeKind::Alias(t)));
                 self.typedefs.insert(ident, d);
             }
-            Item::Concept { .. } | Item::Instance { .. } => {
-                // Instance methods were already synthesized as top-level `Item::Form` definitions during `infer_defs`.
+            Item::Concept { .. } | Item::Instance { .. } | Item::Extern { .. } => {
+                // Instance methods were already synthesized; Extern declarations are tracked in `self.externs`.
             }
         }
     }

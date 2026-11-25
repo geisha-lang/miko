@@ -34,6 +34,8 @@ pub struct LLVMEmit<'i> {
     /// Set ONLY for the immediate RHS of a `Let` binding; consumed immediately via `.take()` so it never leaks to subexpressions!
     pending_let_binding: Option<Id>,
     global_slots: HashMap<Id, (VarSlot, Type)>,
+    extern_fns: HashMap<Id, (Name, Type)>,
+    cli_globals: Option<(LLVMValue, LLVMValue)>,
 }
 
 impl<'i> LLVMEmit<'i> {
@@ -50,7 +52,25 @@ impl<'i> LLVMEmit<'i> {
             current_func: None,
             pending_let_binding: None,
             global_slots: HashMap::new(),
+            extern_fns: HashMap::new(),
+            cli_globals: None,
         }
+    }
+
+    pub fn register_externs(&mut self, externs: &HashMap<Id, (Name, Type)>) {
+        self.extern_fns = externs.clone();
+    }
+
+    fn get_or_declare_cli_globals(&mut self) -> (LLVMValue, LLVMValue) {
+        if let Some(pair) = self.cli_globals {
+            return pair;
+        }
+        let i32_ty = self.context().get_int32_type();
+        let ptr_ty = self.context().get_ptr_type();
+        let argc_g = self.generator.module.add_global(&i32_ty, "__gs_argc");
+        let argv_g = self.generator.module.add_global(&ptr_ty, "__gs_argv");
+        self.cli_globals = Some((argc_g, argv_g));
+        (argc_g, argv_g)
     }
 
     fn get_allocation_strategy(&self, binding_id: &Id) -> AllocationStrategy {
@@ -218,11 +238,17 @@ impl<'i> LLVMEmit<'i> {
 
         self.current_func = None;
 
-        // 2. Emit 4-line C entry trampoline `@main` with zero GC pointers of its own
+        // 2. Emit C entry trampoline `@main(i32 %argc, ptr %argv)` with zero GC pointers of its own
+        let (argc_global, argv_global) = self.get_or_declare_cli_globals();
         let main_ty = self.generator.get_main_type();
         let fun = self.module().add_function("main", &main_ty);
         let block = self.context().append_basic_block(&fun, "entry");
         self.builder().set_position_at_end(&block);
+
+        let argc_param = fun.get_param(0);
+        let argv_param = fun.get_param(1);
+        self.builder().store(&argc_param, &argc_global);
+        self.builder().store(&argv_param, &argv_global);
 
         let i64_ty = self.context().get_int64_type();
         let stack_anchor = self.builder().alloca(&i64_ty, "gc.stack.anchor");
@@ -432,6 +458,20 @@ impl<'i> LLVMEmit<'i> {
                     self.try_emit_container_intrinsic(&callee_name, args, term.ref_scheme().body(), symbols)
                 {
                     return intrinsic_val;
+                }
+
+                // Platform C ABI `extern` call (NO trailing `ptr %fvs` closure argument!)
+                if let Some((c_sym, c_fty)) = self.extern_fns.get(&fun_id).cloned() {
+                    let c_callee = self.generator.get_or_add_c_function(&c_sym, &c_fty);
+                    let c_llvm_fty = c_callee.get_function_type();
+                    let mut argsv: Vec<LLVMValue> =
+                        args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+                    let call_val = self.builder().call(&c_callee, &mut argsv, "callc");
+                    return if c_llvm_fty.get_return_type().is_void() {
+                        self.context().get_uint8_const(0)
+                    } else {
+                        call_val
+                    };
                 }
 
                 let callee = self.generator.get_or_add_function(&callee_name, fun_ty.body());
@@ -957,6 +997,369 @@ impl<'i> LLVMEmit<'i> {
                         .gep(&elem_llvm_ty, &elems_base, &mut idx_arr, "arr.slot");
                 self.builder().store(&new_val, &slot_ptr);
                 Some(self.context().get_uint8_const(0))
+            }
+            "bitAnd" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b = self.gen_expr(&args[1], symbols);
+                Some(self.builder().and(&a, &b, "bit.and"))
+            }
+            "bitOr" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b = self.gen_expr(&args[1], symbols);
+                Some(self.builder().or(&a, &b, "bit.or"))
+            }
+            "bitXor" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b = self.gen_expr(&args[1], symbols);
+                Some(self.builder().xor(&a, &b, "bit.xor"))
+            }
+            "bitShl" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b = self.gen_expr(&args[1], symbols);
+                Some(self.builder().shl(&a, &b, "bit.shl"))
+            }
+            "bitShr" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b = self.gen_expr(&args[1], symbols);
+                Some(self.builder().lshr(&a, &b, "bit.shr"))
+            }
+            "charToInt" => {
+                let c = self.gen_expr(&args[0], symbols);
+                let i32_ty = self.context().get_int32_type();
+                Some(self.builder().zext(&c, &i32_ty, "char.i32"))
+            }
+            "intToChar" => {
+                let n = self.gen_expr(&args[0], symbols);
+                let i8_ty = self.context().get_int8_type();
+                Some(self.builder().trunc(&n, &i8_ty, "i32.char"))
+            }
+            "intToI64" => {
+                let n = self.gen_expr(&args[0], symbols);
+                let i64_ty = self.context().get_int64_type();
+                Some(self.builder().sext(&n, &i64_ty, "i32.i64"))
+            }
+            "i64ToInt" => {
+                let n = self.gen_expr(&args[0], symbols);
+                let i32_ty = self.context().get_int32_type();
+                Some(self.builder().trunc(&n, &i32_ty, "i64.i32"))
+            }
+            "ptrNull" => Some(self.context().get_ptr_type().get_null()),
+            "ptrIsNull" => {
+                let p = self.gen_expr(&args[0], symbols);
+                let null_p = self.context().get_ptr_type().get_null();
+                Some(self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntEQ,
+                    &p,
+                    &null_p,
+                    "ptr.is_null",
+                ))
+            }
+            "ptrAllocBytes" => {
+                let n32 = self.gen_expr(&args[0], symbols);
+                let i64_ty = self.context().get_int64_type();
+                let n64 = self.builder().sext(&n32, &i64_ty, "alloc.n64");
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                Some(self.builder().call(&gc_alloc_fn, &mut [n64], "raw.ptr"))
+            }
+            "ptrByteAt" => {
+                let p = self.gen_expr(&args[0], symbols);
+                let idx32 = self.gen_expr(&args[1], symbols);
+                let i64_ty = self.context().get_int64_type();
+                let i8_ty = self.context().get_int8_type();
+                let i32_ty = self.context().get_int32_type();
+                let idx64 = self.builder().sext(&idx32, &i64_ty, "ptr.idx64");
+                let mut idx_arr = [idx64];
+                let bp = self.builder().gep(&i8_ty, &p, &mut idx_arr, "ptr.byte_ptr");
+                let b8 = self.builder().load(&i8_ty, &bp, "ptr.b8");
+                Some(self.builder().zext(&b8, &i32_ty, "ptr.b32"))
+            }
+            "ptrSetByte" => {
+                let p = self.gen_expr(&args[0], symbols);
+                let idx32 = self.gen_expr(&args[1], symbols);
+                let val32 = self.gen_expr(&args[2], symbols);
+                let i64_ty = self.context().get_int64_type();
+                let i8_ty = self.context().get_int8_type();
+                let idx64 = self.builder().sext(&idx32, &i64_ty, "ptr.idx64");
+                let val8 = self.builder().trunc(&val32, &i8_ty, "ptr.val8");
+                let mut idx_arr = [idx64];
+                let bp = self.builder().gep(&i8_ty, &p, &mut idx_arr, "ptr.byte_ptr");
+                self.builder().store(&val8, &bp);
+                Some(self.context().get_uint8_const(0))
+            }
+            "ptrToString" => {
+                let p = self.gen_expr(&args[0], symbols);
+                let strlen_fn = self.generator.declare_libc_strlen();
+                let memcpy_fn = self.generator.declare_libc_memcpy();
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let i8_ty = self.context().get_int8_type();
+                let one64 = self.context().get_int64_const(1);
+                let zero8 = self.context().get_uint8_const(0);
+
+                let len64 = self.builder().call(&strlen_fn, &mut [p], "cstr.len");
+                let alloc64 = self.builder().add(&len64, &one64, "cstr.alloc");
+                let dst = self.builder().call(&gc_alloc_fn, &mut [alloc64], "cstr.dst");
+                self.builder().call(&memcpy_fn, &mut [dst, p, len64], "");
+                let mut end_idx = [len64];
+                let term_ptr = self.builder().gep(&i8_ty, &dst, &mut end_idx, "cstr.term");
+                self.builder().store(&zero8, &term_ptr);
+                Some(dst)
+            }
+            "strLen" => {
+                let s = self.gen_expr(&args[0], symbols);
+                let strlen_fn = self.generator.declare_libc_strlen();
+                let i32_ty = self.context().get_int32_type();
+                let len64 = self.builder().call(&strlen_fn, &mut [s], "str.len64");
+                Some(self.builder().trunc(&len64, &i32_ty, "str.len"))
+            }
+            "strByteAt" => {
+                let s = self.gen_expr(&args[0], symbols);
+                let idx32 = self.gen_expr(&args[1], symbols);
+                let strlen_fn = self.generator.declare_libc_strlen();
+                let i64_ty = self.context().get_int64_type();
+                let i32_ty = self.context().get_int32_type();
+                let i8_ty = self.context().get_int8_type();
+
+                let len64 = self.builder().call(&strlen_fn, &mut [s], "str.len64");
+                let len32 = self.builder().trunc(&len64, &i32_ty, "str.len32");
+                let oob = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntUGE,
+                    &idx32,
+                    &len32,
+                    "str.oob",
+                );
+
+                let parent = self.builder().get_insert_block().get_parent();
+                let oob_blk = self.context().append_basic_block(&parent, "str.oob_trap");
+                let ok_blk = self.context().append_basic_block(&parent, "str.ok");
+                self.builder().cond_br(&oob, &oob_blk, &ok_blk);
+
+                self.builder().set_position_at_end(&oob_blk);
+                let fail_fn = self.generator.declare_gs_bounds_fail();
+                self.builder().call(&fail_fn, &mut [idx32, len32], "");
+                self.builder().unreachable();
+
+                self.builder().set_position_at_end(&ok_blk);
+                let idx64 = self.builder().sext(&idx32, &i64_ty, "str.idx64");
+                let mut idx_arr = [idx64];
+                let bp = self.builder().gep(&i8_ty, &s, &mut idx_arr, "str.bp");
+                let b8 = self.builder().load(&i8_ty, &bp, "str.b8");
+                Some(self.builder().zext(&b8, &i32_ty, "str.b32"))
+            }
+            "strSlice" => {
+                let s = self.gen_expr(&args[0], symbols);
+                let start32 = self.gen_expr(&args[1], symbols);
+                let end32 = self.gen_expr(&args[2], symbols);
+
+                let strlen_fn = self.generator.declare_libc_strlen();
+                let memcpy_fn = self.generator.declare_libc_memcpy();
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let i64_ty = self.context().get_int64_type();
+                let i32_ty = self.context().get_int32_type();
+                let i8_ty = self.context().get_int8_type();
+
+                let len64 = self.builder().call(&strlen_fn, &mut [s], "sl.len64");
+                let len32 = self.builder().trunc(&len64, &i32_ty, "sl.len32");
+                let zero32 = self.context().get_int32_const(0);
+
+                let bad1 = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSLT,
+                    &start32,
+                    &zero32,
+                    "sl.bad1",
+                );
+                let bad2 = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSLT,
+                    &end32,
+                    &start32,
+                    "sl.bad2",
+                );
+                let bad3 = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSGT,
+                    &end32,
+                    &len32,
+                    "sl.bad3",
+                );
+                let bad12 = self.builder().or(&bad1, &bad2, "sl.bad12");
+                let bad = self.builder().or(&bad12, &bad3, "sl.bad");
+
+                let parent = self.builder().get_insert_block().get_parent();
+                let oob_blk = self.context().append_basic_block(&parent, "sl.oob");
+                let ok_blk = self.context().append_basic_block(&parent, "sl.ok");
+                self.builder().cond_br(&bad, &oob_blk, &ok_blk);
+
+                self.builder().set_position_at_end(&oob_blk);
+                let fail_fn = self.generator.declare_gs_bounds_fail();
+                self.builder().call(&fail_fn, &mut [end32, len32], "");
+                self.builder().unreachable();
+
+                self.builder().set_position_at_end(&ok_blk);
+                let start64 = self.builder().sext(&start32, &i64_ty, "sl.start64");
+                let end64 = self.builder().sext(&end32, &i64_ty, "sl.end64");
+                let sub_len = self.builder().sub(&end64, &start64, "sl.sublen");
+                let one64 = self.context().get_int64_const(1);
+                let alloc_sz = self.builder().add(&sub_len, &one64, "sl.alloc");
+
+                let dst = self.builder().call(&gc_alloc_fn, &mut [alloc_sz], "sl.dst");
+                let mut src_off = [start64];
+                let src_ptr = self.builder().gep(&i8_ty, &s, &mut src_off, "sl.src");
+                self.builder()
+                    .call(&memcpy_fn, &mut [dst, src_ptr, sub_len], "");
+                let mut term_off = [sub_len];
+                let term_ptr = self.builder().gep(&i8_ty, &dst, &mut term_off, "sl.term");
+                let zero8 = self.context().get_uint8_const(0);
+                self.builder().store(&zero8, &term_ptr);
+                Some(dst)
+            }
+            "strConcat" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b = self.gen_expr(&args[1], symbols);
+                let strlen_fn = self.generator.declare_libc_strlen();
+                let memcpy_fn = self.generator.declare_libc_memcpy();
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let i8_ty = self.context().get_int8_type();
+                let one64 = self.context().get_int64_const(1);
+                let zero8 = self.context().get_uint8_const(0);
+
+                let la = self.builder().call(&strlen_fn, &mut [a], "cat.la");
+                let lb = self.builder().call(&strlen_fn, &mut [b], "cat.lb");
+                let lab = self.builder().add(&la, &lb, "cat.lab");
+                let alloc_sz = self.builder().add(&lab, &one64, "cat.alloc");
+
+                let dst = self.builder().call(&gc_alloc_fn, &mut [alloc_sz], "cat.dst");
+                self.builder().call(&memcpy_fn, &mut [dst, a, la], "");
+                let mut off_a = [la];
+                let dst_b = self.builder().gep(&i8_ty, &dst, &mut off_a, "cat.dst_b");
+                self.builder().call(&memcpy_fn, &mut [dst_b, b, lb], "");
+                let mut off_end = [lab];
+                let term_ptr = self.builder().gep(&i8_ty, &dst, &mut off_end, "cat.term");
+                self.builder().store(&zero8, &term_ptr);
+                Some(dst)
+            }
+            "strFromBytes" => {
+                let arr_ptr = self.gen_expr(&args[0], symbols);
+                let count32 = self.gen_expr(&args[1], symbols);
+
+                let i64_ty = self.context().get_int64_type();
+                let i32_ty = self.context().get_int32_type();
+                let i8_ty = self.context().get_int8_type();
+
+                let cap64 = self.builder().load(&i64_ty, &arr_ptr, "sfb.cap64");
+                let cap32 = self.builder().trunc(&cap64, &i32_ty, "sfb.cap32");
+                let zero32 = self.context().get_int32_const(0);
+
+                let neg = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSLT,
+                    &count32,
+                    &zero32,
+                    "sfb.neg",
+                );
+                let gt = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSGT,
+                    &count32,
+                    &cap32,
+                    "sfb.gt",
+                );
+                let bad = self.builder().or(&neg, &gt, "sfb.bad");
+
+                let parent = self.builder().get_insert_block().get_parent();
+                let oob_blk = self.context().append_basic_block(&parent, "sfb.oob");
+                let alloc_blk = self.context().append_basic_block(&parent, "sfb.alloc");
+                let cond_blk = self.context().append_basic_block(&parent, "sfb.cond");
+                let body_blk = self.context().append_basic_block(&parent, "sfb.body");
+                let done_blk = self.context().append_basic_block(&parent, "sfb.done");
+                self.builder().cond_br(&bad, &oob_blk, &alloc_blk);
+
+                self.builder().set_position_at_end(&oob_blk);
+                let fail_fn = self.generator.declare_gs_bounds_fail();
+                self.builder().call(&fail_fn, &mut [count32, cap32], "");
+                self.builder().unreachable();
+
+                self.builder().set_position_at_end(&alloc_blk);
+                let count64 = self.builder().sext(&count32, &i64_ty, "sfb.cnt64");
+                let one64 = self.context().get_int64_const(1);
+                let alloc_sz = self.builder().add(&count64, &one64, "sfb.alloc_sz");
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let dst = self.builder().call(&gc_alloc_fn, &mut [alloc_sz], "sfb.dst");
+
+                let mut off8 = [self.context().get_int64_const(8)];
+                let elems_base = self
+                    .builder()
+                    .gep(&i8_ty, &arr_ptr, &mut off8, "sfb.elems");
+
+                let idx_slot =
+                    self.generator
+                        .create_entry_block_alloca(&parent, "sfb.idx", &i64_ty);
+                self.builder()
+                    .store(&self.context().get_int64_const(0), &idx_slot);
+                self.builder().br(&cond_blk);
+
+                self.builder().set_position_at_end(&cond_blk);
+                let cur = self.builder().load(&i64_ty, &idx_slot, "sfb.cur");
+                let more = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSLT,
+                    &cur,
+                    &count64,
+                    "sfb.more",
+                );
+                self.builder().cond_br(&more, &body_blk, &done_blk);
+
+                self.builder().set_position_at_end(&body_blk);
+                let mut i_arr1 = [cur];
+                let src_p = self
+                    .builder()
+                    .gep(&i32_ty, &elems_base, &mut i_arr1, "sfb.src_p");
+                let v32 = self.builder().load(&i32_ty, &src_p, "sfb.v32");
+                let v8 = self.builder().trunc(&v32, &i8_ty, "sfb.v8");
+                let mut i_arr2 = [cur];
+                let dst_p = self.builder().gep(&i8_ty, &dst, &mut i_arr2, "sfb.dst_p");
+                self.builder().store(&v8, &dst_p);
+                let next = self.builder().add(&cur, &one64, "sfb.next");
+                self.builder().store(&next, &idx_slot);
+                self.builder().br(&cond_blk);
+
+                self.builder().set_position_at_end(&done_blk);
+                let mut end_arr = [count64];
+                let term_p = self.builder().gep(&i8_ty, &dst, &mut end_arr, "sfb.term");
+                self.builder()
+                    .store(&self.context().get_uint8_const(0), &term_p);
+                Some(dst)
+            }
+            "sysArgc" => {
+                let (argc_g, _) = self.get_or_declare_cli_globals();
+                let i32_ty = self.context().get_int32_type();
+                Some(self.builder().load(&i32_ty, &argc_g, "cli.argc"))
+            }
+            "sysArgv" => {
+                let idx32 = self.gen_expr(&args[0], symbols);
+                let (argc_g, argv_g) = self.get_or_declare_cli_globals();
+                let i32_ty = self.context().get_int32_type();
+                let i64_ty = self.context().get_int64_type();
+                let ptr_ty = self.context().get_ptr_type();
+
+                let argc = self.builder().load(&i32_ty, &argc_g, "cli.argc");
+                let oob = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntUGE,
+                    &idx32,
+                    &argc,
+                    "cli.oob",
+                );
+
+                let parent = self.builder().get_insert_block().get_parent();
+                let oob_blk = self.context().append_basic_block(&parent, "cli.oob_trap");
+                let ok_blk = self.context().append_basic_block(&parent, "cli.ok");
+                self.builder().cond_br(&oob, &oob_blk, &ok_blk);
+
+                self.builder().set_position_at_end(&oob_blk);
+                let fail_fn = self.generator.declare_gs_bounds_fail();
+                self.builder().call(&fail_fn, &mut [idx32, argc], "");
+                self.builder().unreachable();
+
+                self.builder().set_position_at_end(&ok_blk);
+                let argv = self.builder().load(&ptr_ty, &argv_g, "cli.argv");
+                let idx64 = self.builder().sext(&idx32, &i64_ty, "cli.idx64");
+                let mut idx_arr = [idx64];
+                let elem_p = self.builder().gep(&ptr_ty, &argv, &mut idx_arr, "cli.argp");
+                Some(self.builder().load(&ptr_ty, &elem_p, "cli.arg"))
             }
             _ => None,
         }

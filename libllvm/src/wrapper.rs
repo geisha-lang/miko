@@ -456,6 +456,78 @@ impl LLVMBuilder {
         }
     }
 
+    pub fn zext(&self, val: &LLVMValue, dest_ty: &LLVMType, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildZExt(
+                self.raw_ptr(),
+                val.raw_ptr(),
+                dest_ty.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn sub(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildSub(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn and(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildAnd(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn or(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildOr(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn shl(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildShl(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn lshr(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildLShr(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
     pub fn ret(&self, val: &LLVMValue) -> LLVMValue {
         unsafe { LLVMValue::from_ref(LLVMBuildRet(self.raw_ptr(), val.raw_ptr())) }
     }

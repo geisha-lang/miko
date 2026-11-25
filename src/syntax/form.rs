@@ -250,6 +250,10 @@ impl Def {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Item {
     Form(E),
+    Extern {
+        link_name: Name,
+        ty: Scheme,
+    },
     Alias(Vec<Id>, P<Scheme>),
     Alg(Vec<Id>, Vec<Variant>),
     Concept {

@@ -10,6 +10,37 @@ use crate::syntax::form::{Def, FileModule, ModuleDef, ModuleItem, ModulePath, Us
 use crate::syntax::parser;
 use crate::utils::{Id, Interner};
 
+/// Built-in standard library (`std.*`) and system library (`sys.*`) modules embedded in `miko`.
+pub fn builtin_module_source(module_key: &str) -> Option<&'static str> {
+    match module_key {
+        "std.option" => Some(include_str!("../../stdlib/std/option.gs")),
+        "std.result" => Some(include_str!("../../stdlib/std/result.gs")),
+        "std.list" => Some(include_str!("../../stdlib/std/list.gs")),
+        "std.char" => Some(include_str!("../../stdlib/std/char.gs")),
+        "std.buf" => Some(include_str!("../../stdlib/std/buf.gs")),
+        "std.str" => Some(include_str!("../../stdlib/std/str.gs")),
+        "std.vec" => Some(include_str!("../../stdlib/std/vec.gs")),
+        "std.map" => Some(include_str!("../../stdlib/std/map.gs")),
+        "sys.io" => Some(include_str!("../../stdlib/sys/io.gs")),
+        "sys.fs" => Some(include_str!("../../stdlib/sys/fs.gs")),
+        "sys.env" => Some(include_str!("../../stdlib/sys/env.gs")),
+        "sys.proc" => Some(include_str!("../../stdlib/sys/proc.gs")),
+        _ => None,
+    }
+}
+
+fn import_target_module_key(use_item: &UseItem, interner: &Interner) -> String {
+    match use_item {
+        UseItem::Single(p) | UseItem::Alias(p, _) => p
+            .module_path()
+            .iter()
+            .map(|id| interner.trace(*id))
+            .collect::<Vec<_>>()
+            .join("."),
+        UseItem::Multiple(p, _) | UseItem::Glob(p) => p.to_string_with(interner),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ModuleError {
     ModuleNotFound {
@@ -223,6 +254,7 @@ impl ModuleLoader {
             let key = inline_mod.path.to_string_with(&interner.borrow());
             self.cache.insert(key, inline_mod);
         }
+        self.load_builtin_imports(interner)?;
         Ok(())
     }
 
@@ -233,7 +265,68 @@ impl ModuleLoader {
     ) -> Result<(), ModuleError> {
         let module_segments = self.path_to_segments(file_path)?;
         let segments_refs: Vec<&str> = module_segments.iter().map(|s| s.as_str()).collect();
-        self.load(&segments_refs, interner)
+        self.load(&segments_refs, interner)?;
+        self.load_builtin_imports(interner)?;
+        Ok(())
+    }
+
+    /// Transitively load any embedded `std.*` / `sys.*` modules referenced by `use` or `open` statements.
+    pub fn load_builtin_imports(
+        &mut self,
+        interner: &RefCell<Interner>,
+    ) -> Result<(), ModuleError> {
+        loop {
+            let mut needed: Vec<String> = Vec::new();
+            {
+                let inter = interner.borrow();
+                for m in self.cache.values() {
+                    for (_, use_item) in &m.imports {
+                        let target = import_target_module_key(use_item, &inter);
+                        if !target.is_empty()
+                            && !self.cache.contains_key(&target)
+                            && builtin_module_source(&target).is_some()
+                            && !needed.contains(&target)
+                        {
+                            needed.push(target);
+                        }
+                    }
+                }
+            }
+
+            if needed.is_empty() {
+                break;
+            }
+
+            needed.sort();
+            for key in needed {
+                let src = builtin_module_source(&key).unwrap();
+                let virt_path = PathBuf::from(format!("<stdlib>/{}.gs", key.replace('.', "/")));
+                let mod_path = {
+                    let mut inter = interner.borrow_mut();
+                    let segs: Vec<Id> = key.split('.').map(|s| inter.intern(s)).collect();
+                    ModulePath::new(segs)
+                };
+                let fm = self.parse_file_module(&virt_path, src, &mod_path, interner)?;
+                let mut inline_mods = Vec::new();
+                let (defs, imports, submodules) =
+                    self.extract_items(&fm, &virt_path, interner, &mut inline_mods);
+                self.cache.insert(
+                    key,
+                    LoadedModule {
+                        path: mod_path,
+                        file_path: virt_path,
+                        defs,
+                        imports,
+                        submodules,
+                    },
+                );
+                for im in inline_mods {
+                    let ikey = im.path.to_string_with(&interner.borrow());
+                    self.cache.insert(ikey, im);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn get(&self, path_key: &str) -> Option<&LoadedModule> {

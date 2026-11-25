@@ -40,7 +40,8 @@ Source (.gs) → [Module Loader / DependencyGraph] → Parse → Type Infer (HM 
 - **`typeinfer/`** — Hindley-Milner inference with occurs check, let-generalization, type aliases, concept constraint checking, and pattern exhaustiveness
 - **`core/`** — K-conversion, demand-driven transitive monomorphization, static concept dispatch (`convert.rs`), and fixed-point escape analysis (`escape.rs`)
 - **`codegen/`** — LLVM 20 opaque-pointer IR emission (`emit.rs`, `llvm.rs`, `target.rs`)
-- **`modules/`** — Multi-file & inline module loader, topological `DependencyGraph`, per-module `use`/`open`/`pub use` resolution, and visibility checking
+- **`modules/`** — Multi-file & inline module loader (with auto-resolved embedded `std.*` & `sys.*` libraries), topological `DependencyGraph`, per-module `use`/`open`/`pub use` resolution, and visibility checking
+- **`stdlib/`** — Embedded Geisha standard library (`std.{option,result,list,char,buf,str,vec,map}`) and C-ABI system library (`sys.{io,fs,env,proc}`)
 - **`src/lib/`** — C runtime (`base.c`) and mark-and-sweep bitmap GC (`runtime/gc_bitmap.c`)
 
 ## Geisha Language Quick Syntax

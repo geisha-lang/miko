@@ -566,3 +566,172 @@ def main() = {
     assert!(!run.status.success());
     assert!(String::from_utf8_lossy(&run.stderr).contains("out of bounds"));
 }
+
+#[test]
+fn e2e_extern_c_ffi_stdlib_syslib_and_mini_compiler_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let input_gs = dir.path().join("sample_input.gs");
+    let output_ir = dir.path().join("emitted_out.ll");
+    let compiler_src = dir.path().join("mini_driver.gs");
+    let compiler_bin = dir.path().join("mini_driver_bin");
+
+    fs::write(&input_gs, "def answer = 42 + answer\n").unwrap();
+
+    // Mini compiler driver exercising:
+    // - Direct `extern` C FFI (`abs`) + first-class `extern` eta-wrapping
+    // - `sys.env` (`args`, `getEnv`)
+    // - `sys.fs` (`readFile`, `writeFile`, `fileExists`, `removeFile`)
+    // - `sys.io` (`print`)
+    // - `std.char` + `std.str` + `std.buf` + `std.vec` + `std.map.{Interner, StrMap, IntMap}` + `std.list`
+    let driver_code = r#"
+use std.option.{Option, Some, None, unwrapOr}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen, listNth}
+use std.char.{isIdentStartByte, isIdentContByte, isDigitByte, isSpaceByte}
+use std.buf.{bufNew, bufPushStr, bufPushInt, bufPushLine, bufToString}
+use std.str.{intToStr, strTrim, strSplitChar, strJoin}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr}
+use std.map.{
+    Interner, internerNew, intern, internerResolve, internerCount,
+    strMapNew, strMapInsert, strMapGet,
+    intMapNew, intMapInsert, intMapGet
+}
+use sys.io.print
+use sys.fs.{readFile, writeFile, fileExists}
+use sys.env.{args, getEnv}
+
+extern "abs" def c_abs(n: Int): Int
+
+data Token {
+    TokIdent(Int),
+    TokInt(Int),
+    TokSym(Int),
+}
+
+def applyIntFn(f: Int -> Int, x: Int): Int = f(x)
+
+def tokenize(src: String, pool: std.map.Interner): Vec Token = {
+    let toks = vecNew();
+    let n = strLen(src);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let pos = cellGet(i);
+        let b = strByteAt(src, pos);
+        if (isSpaceByte(b)) {
+            cellSet(i, pos + 1)
+        } else if (isIdentStartByte(b)) {
+            let end = cellNew(pos + 1);
+            while (cellGet(end) < n && isIdentContByte(strByteAt(src, cellGet(end)))) {
+                cellSet(end, cellGet(end) + 1)
+            };
+            let word = strSlice(src, pos, cellGet(end));
+            let symId = intern(pool, word);
+            vecPush(toks, TokIdent(symId));
+            cellSet(i, cellGet(end))
+        } else if (isDigitByte(b)) {
+            let val = cellNew(0);
+            let end = cellNew(pos);
+            while (cellGet(end) < n && isDigitByte(strByteAt(src, cellGet(end)))) {
+                let d = strByteAt(src, cellGet(end)) - 48;
+                cellSet(val, cellGet(val) * 10 + d);
+                cellSet(end, cellGet(end) + 1)
+            };
+            vecPush(toks, TokInt(cellGet(val)));
+            cellSet(i, cellGet(end))
+        } else {
+            vecPush(toks, TokSym(b));
+            cellSet(i, pos + 1)
+        }
+    };
+    toks
+}
+
+def main() = {
+    let cli = args();
+    let inPath = unwrapOr(listNth(cli, 1), "");
+    let outPath = unwrapOr(listNth(cli, 2), "");
+    let tagEnv = unwrapOr(getEnv("GEISHA_TEST_TAG"), "missing");
+
+    // Test both direct extern call and higher-order extern function value
+    let absCheck = c_abs(-7) + applyIntFn(c_abs, -35); // 42
+
+    // Stress StrMap rehashing (> 20 keys) and IntMap lookup
+    let sm = strMapNew();
+    let k = cellNew(0);
+    while (cellGet(k) < 25) {
+        let cur = cellGet(k);
+        strMapInsert(sm, strConcat("key_", intToStr(cur)), cur * 2);
+        cellSet(k, cur + 1)
+    };
+    let mapVal = unwrapOr(strMapGet(sm, "key_21"), 0); // 42
+
+    let im = intMapNew();
+    intMapInsert(im, 100, "ok");
+    let imVal = unwrapOr(intMapGet(im, 100), "bad");
+
+    let joined = strJoin(strSplitChar(strTrim("  alpha,beta,gamma  "), ','), "|");
+
+    match readFile(inPath) {
+        Err(msg) -> print(msg),
+        Ok(src) -> {
+            let pool = internerNew();
+            let toks = tokenize(src, pool);
+            // Expect tokens: `def`(id 0), `answer`(id 1), `=`, `42`, `+`, `answer`(reused id 1!)
+            // Unique interned symbols == 2 (`def`, `answer`), total tokens == 6!
+            let outBuf = bufNew();
+            bufPushLine(outBuf, strConcat("; tag=", tagEnv));
+            bufPushStr(outBuf, "tokens=");
+            bufPushInt(outBuf, vecLen(toks));
+            bufPushStr(outBuf, ",symbols=");
+            bufPushInt(outBuf, internerCount(pool));
+            bufPushStr(outBuf, ",sym1=");
+            bufPushStr(outBuf, internerResolve(pool, 1));
+            bufPushStr(outBuf, ",check=");
+            bufPushInt(outBuf, absCheck + mapVal + listLen(cli));
+            bufPushStr(outBuf, ",");
+            bufPushStr(outBuf, imVal);
+            bufPushStr(outBuf, ",");
+            bufPushStr(outBuf, joined);
+
+            match writeFile(outPath, bufToString(outBuf)) {
+                Err(e) -> print(e),
+                Ok(_) -> if (fileExists(outPath)) print("DONE") else print("MISSING"),
+            }
+        },
+    }
+}
+"#;
+
+    fs::write(&compiler_src, driver_code).unwrap();
+    let comp = Command::new(miko_bin())
+        .arg("-o")
+        .arg(&compiler_bin)
+        .arg(&compiler_src)
+        .output()
+        .unwrap();
+    assert!(
+        comp.status.success(),
+        "failed compiling mini_driver.gs:\nstderr: {}",
+        String::from_utf8_lossy(&comp.stderr)
+    );
+
+    let run = Command::new(&compiler_bin)
+        .arg(&input_gs)
+        .arg(&output_ir)
+        .env("GEISHA_TEST_TAG", "stage1")
+        .env("GEISHA_GC_HEAP_WORDS", "128")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "mini_driver_bin crashed:\nstderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "DONE");
+
+    let emitted = fs::read_to_string(&output_ir).unwrap();
+    assert_eq!(
+        emitted,
+        "; tag=stage1\ntokens=6,symbols=2,sym1=answer,check=87,ok,alpha|beta|gamma"
+    );
+}

@@ -21,6 +21,27 @@
 - **`arrayGet : forall a. (MutArray a, Int) -> a`** — Bounds-checked read at `0 <= idx < len`.
 - **`arraySet : forall a. (MutArray a, Int, a) -> Void`** — Bounds-checked write at `0 <= idx < len`.
 
+## Low-Level `PrimOp` Intrinsics (Used by `stdlib` & `syslib`)
+
+- **Bitwise & Conversions**: `bitAnd`, `bitOr`, `bitXor`, `bitShl`, `bitShr` (`(Int, Int) -> Int`), `charToInt` (`Char -> Int`), `intToChar` (`Int -> Char`), `intToI64` (`Int -> Int64`), `i64ToInt` (`Int64 -> Int`).
+- **Strings**: `strLen` (`String -> Int`), `strByteAt` (`(String, Int) -> Int`), `strSlice` (`(String, Int, Int) -> String`), `strConcat` (`(String, String) -> String`), `strFromBytes` (`(MutArray Int, Int) -> String`).
+- **Opaque Pointers & CLI**: `Ptr`, `ptrNull` (`() -> Ptr`), `ptrIsNull` (`Ptr -> Bool`), `ptrAllocBytes` (`Int -> Ptr`), `ptrByteAt` (`(Ptr, Int) -> Int`), `ptrSetByte` (`(Ptr, Int, Int) -> Void`), `ptrToString` (`Ptr -> String`), `sysArgc` (`() -> Int`), `sysArgv` (`Int -> String`).
+
+## Embedded Standard (`std.*`) & System (`sys.*`) Libraries
+
+- **`std.option`** — `Option a { None, Some(a) }`, `isSome`, `isNone`, `unwrapOr`, `mapOption`, `andThenOption`
+- **`std.result`** — `Result a e { Ok(a), Err(e) }`, `isOk`, `isErr`, `unwrapResultOr`, `mapResult`, `mapErr`, `andThenResult`
+- **`std.list`** — `listLen`, `listIsEmpty`, `listRev`, `listAppend`, `listMap`, `listFilter`, `listFold`, `listAny`, `listAll`, `listNth`
+- **`std.char`** — Lexer character/byte predicates (`isDigitByte`, `isAlphaByte`, `isIdentStartByte`, `isIdentContByte`, `isSpaceByte`, etc.)
+- **`std.buf`** — Amortized $O(1)$ `StringBuf` (`bufNew`, `bufPushByte`, `bufPushChar`, `bufPushStr`, `bufPushLine`, `bufPushInt`, `bufToString`)
+- **`std.str`** — `intToStr`, `boolToStr`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, `strTrim`, `strSplitChar`, `strJoin`, `strHash`
+- **`std.vec`** — Dynamic growable `Vec a` (`vecNew`, `vecLen`, `vecPush`, `vecPop`, `vecGet`, `vecGetOr`, `vecSet`, `vecClear`, `vecToList`)
+- **`std.map`** — Resizable `StrMap v`, `IntMap v`, and bidirectional compiler symbol `Interner` (`internerNew`, `intern`, `internerResolve`, `internerCount`)
+- **`sys.io`** — Stream output (`print`, `eprint`, `eprintLn` via POSIX `write`)
+- **`sys.fs`** — File I/O (`fileExists`, `readFile`, `writeFile`, `removeFile` via ANSI C / POSIX FFI)
+- **`sys.env`** — CLI & environment (`argCount`, `argAt`, `args`, `getEnv`)
+- **`sys.proc`** — Process control (`exit`, `shell`)
+
 ## Built-in Prelude Types & Operators
 
 - Primitive types: `Int`, `Float`, `Char`, `String`, `Bool`, `Void` (`()`)

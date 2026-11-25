@@ -79,6 +79,28 @@ pub fn load_prelude<'a, 'b: 'a>(interner: &mut Interner, env: &'b TypeEnv) -> Ty
         ("arrayLen", "forall a. MutArray a -> Int"),
         ("arrayGet", "forall a. (MutArray a, Int) -> a"),
         ("arraySet", "forall a. (MutArray a, Int, a) -> Void"),
+        ("bitAnd", "(Int, Int) -> Int"),
+        ("bitOr", "(Int, Int) -> Int"),
+        ("bitXor", "(Int, Int) -> Int"),
+        ("bitShl", "(Int, Int) -> Int"),
+        ("bitShr", "(Int, Int) -> Int"),
+        ("charToInt", "Char -> Int"),
+        ("intToChar", "Int -> Char"),
+        ("intToI64", "Int -> Int64"),
+        ("i64ToInt", "Int64 -> Int"),
+        ("strLen", "String -> Int"),
+        ("strByteAt", "(String, Int) -> Int"),
+        ("strSlice", "(String, Int, Int) -> String"),
+        ("strConcat", "(String, String) -> String"),
+        ("strFromBytes", "(MutArray Int, Int) -> String"),
+        ("ptrNull", "() -> Ptr"),
+        ("ptrIsNull", "Ptr -> Bool"),
+        ("ptrAllocBytes", "Int -> Ptr"),
+        ("ptrByteAt", "(Ptr, Int) -> Int"),
+        ("ptrSetByte", "(Ptr, Int, Int) -> Void"),
+        ("ptrToString", "Ptr -> String"),
+        ("sysArgc", "() -> Int"),
+        ("sysArgv", "Int -> String"),
     ];
     let mut v = Vec::with_capacity(builtins.len());
     for (name, sig) in builtins {
@@ -515,6 +537,7 @@ fn compile_loaded_modules(
         entry_key
     };
     let mut emitter = LLVMEmit::new(mod_name, &mut inter, adt_registry, escape_info);
+    emitter.register_externs(&k_out.externs);
     emitter.declare_globals(&k_out.globals);
 
     let env = VarEnv::new();
@@ -548,6 +571,9 @@ impl<'a> ModuleAstRewriter<'a> {
             Item::Form(form) => {
                 let mut bound = HashSet::new();
                 self.rewrite_form(form, &mut bound);
+            }
+            Item::Extern { ty, .. } => {
+                *ty = self.rewrite_scheme(ty);
             }
             Item::Alias(_, scm) => {
                 *scm = Box::new(self.rewrite_scheme(scm));

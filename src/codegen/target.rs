@@ -73,7 +73,7 @@ pub fn optimize_module(modu: &LLVMModule) -> Result<(), String> {
         let tm = create_host_target_machine(modu)?;
         let opts = LLVMCreatePassBuilderOptions();
         let passes = to_cstring(
-            "function(mem2reg,instcombine,reassociate,gvn,simplifycfg,tailcallelim)",
+            "function(mem2reg,instcombine<no-verify-fixpoint>,reassociate,gvn,simplifycfg,tailcallelim)",
         );
         let err = LLVMRunPasses(modu.raw_ptr(), passes.as_ptr(), tm, opts);
         LLVMDisposePassBuilderOptions(opts);

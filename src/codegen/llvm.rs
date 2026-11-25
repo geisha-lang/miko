@@ -183,8 +183,9 @@ impl LLVMCodegen {
     }
 
     pub fn get_main_type(&self) -> LLVMType {
-        let retty = self.context.get_int32_type();
-        LLVMContext::get_function_type(&retty, &[], false)
+        let i32_ty = self.context.get_int32_type();
+        let ptr_ty = self.context.get_ptr_type();
+        LLVMContext::get_function_type(&i32_ty, &[i32_ty, ptr_ty], false)
     }
 
     /// Runtime value representation of a Geisha `Type` (in registers, allocas, tuples, parameters, struct fields).
@@ -193,6 +194,7 @@ impl LLVMCodegen {
         match ty {
             Type::Con(n) => match n.as_str() {
                 "Int" => self.context.get_int32_type(),
+                "Int64" => self.context.get_int64_type(),
                 "Float" => self.context.get_double_type(),
                 "Char" => self.context.get_int8_type(),
                 "Bool" => self.context.get_int1_type(),
@@ -232,6 +234,36 @@ impl LLVMCodegen {
                 LLVMContext::get_function_type(&ret_llvm, &llvm_params, false)
             }
             _ => panic!("Expected function type in get_fn_llvm_type, got {}", fn_ty),
+        }
+    }
+
+    /// Build `LLVMFunctionType` for a standard platform C ABI `extern` function `(P0, P1, ...) -> R`
+    /// (NO trailing `ptr %fvs` closure environment parameter!).
+    pub fn get_c_fn_llvm_type(&self, fn_ty: &Type) -> LLVMType {
+        match fn_ty {
+            Type::Arr(params, ret) => {
+                let llvm_params: Vec<LLVMType> =
+                    params.iter().map(|p| self.get_val_llvm_type(p)).collect();
+                let ret_llvm = if matches!(ret.as_ref(), Type::Void)
+                    || matches!(ret.as_ref(), Type::Con(n) if n == "Void")
+                {
+                    self.context.get_void_type()
+                } else {
+                    self.get_val_llvm_type(ret)
+                };
+                LLVMContext::get_function_type(&ret_llvm, &llvm_params, false)
+            }
+            _ => panic!("Expected function type in get_c_fn_llvm_type, got {}", fn_ty),
+        }
+    }
+
+    pub fn get_or_add_c_function(&self, c_symbol: &str, fty: &Type) -> LLVMFunction {
+        match self.module.get_function(c_symbol) {
+            Some(f) => f,
+            None => {
+                let ty = self.get_c_fn_llvm_type(fty);
+                self.module.add_function(c_symbol, &ty)
+            }
         }
     }
 
@@ -400,6 +432,26 @@ impl LLVMCodegen {
         let i32_ty = self.context.get_int32_type();
         let fn_ty = LLVMContext::get_function_type(&void_ty, &[i32_ty, i32_ty], false);
         self.module.add_function("gs_bounds_fail", &fn_ty)
+    }
+
+    pub fn declare_libc_strlen(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("strlen") {
+            return f;
+        }
+        let i64_ty = self.context.get_int64_type();
+        let ptr_ty = self.context.get_ptr_type();
+        let fn_ty = LLVMContext::get_function_type(&i64_ty, &[ptr_ty], false);
+        self.module.add_function("strlen", &fn_ty)
+    }
+
+    pub fn declare_libc_memcpy(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("memcpy") {
+            return f;
+        }
+        let ptr_ty = self.context.get_ptr_type();
+        let i64_ty = self.context.get_int64_type();
+        let fn_ty = LLVMContext::get_function_type(&ptr_ty, &[ptr_ty, ptr_ty, i64_ty], false);
+        self.module.add_function("memcpy", &fn_ty)
     }
 
     pub fn get_type_size(&self, ty: &LLVMType) -> u64 {

@@ -97,6 +97,10 @@ pub fn load_prelude<'a, 'b: 'a>(interner: &mut Interner, env: &'b TypeEnv) -> Ty
         ("intToChar", "Int -> Char"),
         ("intToI64", "Int -> Int64"),
         ("i64ToInt", "Int64 -> Int"),
+        ("floatToBits64", "Float -> Int64"),
+        ("bits64ToFloat", "Int64 -> Float"),
+        ("intToFloat", "Int -> Float"),
+        ("floatToInt", "Float -> Int"),
         ("strLen", "String -> Int"),
         ("strByteAt", "(String, Int) -> Int"),
         ("strSlice", "(String, Int, Int) -> String"),
@@ -221,6 +225,13 @@ fn compile_loaded_modules(
         let m_key = m.path.to_string_with(&interner.borrow());
         let m_prefix = relative_module_prefix(&m_key, entry_key);
         let mut deps = Vec::new();
+
+        if known_keys.contains("std.result")
+            && m_key != "std.result"
+            && m.defs.iter().any(|(_, d)| def_contains_try(d))
+        {
+            deps.push("std.result".to_string());
+        }
 
         for (_, _, child_key) in &m.submodules {
             if known_keys.contains(child_key) && child_key != &m_key && !deps.contains(child_key) {
@@ -521,6 +532,39 @@ fn compile_loaded_modules(
             }
         }
 
+        let ok_ctor = combined_ctor_map
+            .get("Ok")
+            .cloned()
+            .unwrap_or_else(|| {
+                if available_names.contains_key("std.result.Ok")
+                    && !available_names.contains_key("Ok")
+                {
+                    "std.result.Ok".to_string()
+                } else {
+                    "Ok".to_string()
+                }
+            });
+        let err_ctor = combined_ctor_map
+            .get("Err")
+            .cloned()
+            .unwrap_or_else(|| {
+                if available_names.contains_key("std.result.Err")
+                    && !available_names.contains_key("Err")
+                {
+                    "std.result.Err".to_string()
+                } else {
+                    "Err".to_string()
+                }
+            });
+
+        let mut module_defs: Vec<Def> = m.defs.iter().map(|(_, d)| d.clone()).collect();
+        {
+            let mut inter_mut = interner.borrow_mut();
+            for d in &mut module_defs {
+                desugar_try_in_def(d, &ok_ctor, &err_ctor, &mut inter_mut);
+            }
+        }
+
         let mut rewriter = ModuleAstRewriter {
             current_prefix: &prefix,
             val_map: &combined_val_map,
@@ -531,8 +575,8 @@ fn compile_loaded_modules(
             errors: &mut import_errors,
         };
 
-        for (_, def) in &m.defs {
-            let rewritten = rewriter.rewrite_def(def.clone());
+        for def in module_defs {
+            let rewritten = rewriter.rewrite_def(def);
             all_defs.push(rewritten);
         }
     }
@@ -1300,6 +1344,86 @@ impl<'a> ModuleAstRewriter<'a> {
                 self.rewrite_form(r, bound);
             }
             Expr::Unary(_, e) => self.rewrite_form(e, bound),
+            Expr::Field(ref mut base, ref fname) => {
+                // Check if `root.f1.f2...` (or a prefix of it) refers to a module-qualified item!
+                fn flatten_chain(f: &Form) -> Option<(Id, Vec<(Span, String)>)> {
+                    match &f.node {
+                        Expr::Var(id) => Some((*id, vec![])),
+                        Expr::Field(inner, name) => {
+                            let (root, mut segs) = flatten_chain(inner)?;
+                            segs.push((f.tag.pos, name.clone()));
+                            Some((root, segs))
+                        }
+                        _ => None,
+                    }
+                }
+
+                if let Some((root_id, mut segs)) = flatten_chain(base) {
+                    segs.push((form.tag.pos, fname.clone()));
+                    if !bound.contains(&root_id) && !self.val_map.contains_key(&root_id) {
+                        let root_str = self.interner.borrow().trace(root_id).to_string();
+                        if !self.available_names.contains_key(&root_str) {
+                            // Try longest prefix `root.s0...sk` in `available_names`
+                            let mut matched_k: Option<(usize, NameInfo)> = None;
+                            for k in (0..segs.len()).rev() {
+                                let suffix: Vec<&str> =
+                                    segs[..=k].iter().map(|(_, s)| s.as_str()).collect();
+                                let raw_str = format!("{}.{}", root_str, suffix.join("."));
+                                let rel_cand = if self.current_prefix.is_empty() {
+                                    raw_str.clone()
+                                } else {
+                                    format!("{}.{}", self.current_prefix, raw_str)
+                                };
+                                if let Some(info) = self
+                                    .available_names
+                                    .get(&rel_cand)
+                                    .or_else(|| self.available_names.get(&raw_str))
+                                    .cloned()
+                                {
+                                    matched_k = Some((k, info));
+                                    break;
+                                }
+                            }
+
+                            if let Some((k, info)) = matched_k {
+                                if !info.is_public && info.defined_in_module != self.current_prefix
+                                {
+                                    self.errors.push(format!(
+                                        "cannot access private item '{}' from module '{}'",
+                                        segs[k].1, info.defined_in_module
+                                    ));
+                                }
+                                let mut rebuilt =
+                                    Form::new(segs[k].0, Expr::Var(info.qualified_id));
+                                for (sp, rem_field) in segs.into_iter().skip(k + 1) {
+                                    rebuilt =
+                                        Form::new(sp, Expr::Field(Box::new(rebuilt), rem_field));
+                                }
+                                form.node = rebuilt.node;
+                                return;
+                            }
+
+                            // Check if `root.s0...s_{last-1}` is a known module prefix (missing item error)
+                            let mod_parts: Vec<&str> = std::iter::once(root_str.as_str())
+                                .chain(segs[..segs.len() - 1].iter().map(|(_, s)| s.as_str()))
+                                .collect();
+                            let mod_cand = mod_parts.join(".");
+                            let mod_dot = format!("{}.", mod_cand);
+                            if self.available_names.keys().any(|k| k.starts_with(&mod_dot)) {
+                                self.errors.push(format!(
+                                    "item '{}' not found in module '{}'",
+                                    segs.last().unwrap().1,
+                                    mod_cand
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                self.rewrite_form(base, bound);
+            }
+            Expr::Try(e) => self.rewrite_form(e, bound),
             Expr::If(c, t, f) => {
                 self.rewrite_form(c, bound);
                 self.rewrite_form(t, bound);

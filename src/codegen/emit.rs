@@ -1095,6 +1095,26 @@ impl<'i> LLVMEmit<'i> {
                 let i32_ty = self.context().get_int32_type();
                 Some(self.builder().trunc(&n, &i32_ty, "i64.i32"))
             }
+            "floatToBits64" => {
+                let f = self.gen_expr(&args[0], symbols);
+                let i64_ty = self.context().get_int64_type();
+                Some(self.builder().bitcast(&f, &i64_ty, "f64.bits"))
+            }
+            "bits64ToFloat" => {
+                let b = self.gen_expr(&args[0], symbols);
+                let f64_ty = self.context().get_double_type();
+                Some(self.builder().bitcast(&b, &f64_ty, "bits.f64"))
+            }
+            "intToFloat" => {
+                let n = self.gen_expr(&args[0], symbols);
+                let f64_ty = self.context().get_double_type();
+                Some(self.builder().sitofp(&n, &f64_ty, "i32.f64"))
+            }
+            "floatToInt" => {
+                let f = self.gen_expr(&args[0], symbols);
+                let i32_ty = self.context().get_int32_type();
+                Some(self.builder().fptosi(&f, &i32_ty, "f64.i32"))
+            }
             "ptrNull" => Some(self.context().get_ptr_type().get_null()),
             "ptrIsNull" => {
                 let p = self.gen_expr(&args[0], symbols);

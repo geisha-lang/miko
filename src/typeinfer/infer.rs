@@ -1411,7 +1411,9 @@ impl<'i> Infer<'i> {
                 self.check_exhaustiveness_in_form(l)?;
                 self.check_exhaustiveness_in_form(r)
             }
-            Expr::Unary(_, e) => self.check_exhaustiveness_in_form(e),
+            Expr::Unary(_, e) | Expr::Field(e, _) | Expr::Try(e) => {
+                self.check_exhaustiveness_in_form(e)
+            }
             Expr::Let(_, v, b) => {
                 self.check_exhaustiveness_in_form(v)?;
                 self.check_exhaustiveness_in_form(b)
@@ -1765,6 +1767,104 @@ impl<'i> Infer<'i> {
                 }
             }
 
+            Field(ref mut base, ref field_name) => {
+                let raw_base_ty = self.infer(e, base.as_mut())?.body().clone();
+                let sub = self.solve()?;
+                Self::apply_subst_to_env(e, &sub);
+                base.apply_mut(&sub);
+                for wc in &mut self.wanted_constraints {
+                    wc.ty = wc.ty.clone().apply(&sub);
+                }
+                let resolved_base_ty = raw_base_ty.apply(&sub);
+
+                if let Some((adt_name, type_args)) = self.decompose_adt_type(&resolved_base_ty) {
+                    let adt_info = self.adt_registry.get(&adt_name).cloned().unwrap();
+                    if adt_info.variants.len() != 1 {
+                        return Err(TypeError::PatternError(
+                            format!(
+                                "Dot field access '.{}' requires a single-variant struct type, got multi-variant '{}'",
+                                field_name, adt_name
+                            ),
+                            span,
+                        ));
+                    }
+                    let variant = &adt_info.variants[0];
+                    let decl_names = variant.field_names.as_ref().ok_or_else(|| {
+                        TypeError::PatternError(
+                            format!("Type '{}' is not a struct variant", adt_name),
+                            span,
+                        )
+                    })?;
+                    let idx = decl_names.iter().position(|n| n == field_name).ok_or_else(|| {
+                        TypeError::PatternError(
+                            format!("Struct '{}' has no field '{}'", adt_name, field_name),
+                            span,
+                        )
+                    })?;
+                    let param_sub: Subst = adt_info
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(type_args.into_iter())
+                        .collect();
+                    let field_ty = variant.field_types[idx].clone().apply(&param_sub);
+                    form.tag.set_type(field_ty);
+                } else if matches!(resolved_base_ty, Type::Var(_)) {
+                    let mut candidates: Vec<(AdtInfo, usize)> = Vec::new();
+                    for adt_info in self.adt_registry.values() {
+                        if adt_info.variants.len() == 1 {
+                            if let Some(ref fnames) = adt_info.variants[0].field_names {
+                                if let Some(idx) = fnames.iter().position(|n| n == field_name) {
+                                    candidates.push((adt_info.clone(), idx));
+                                }
+                            }
+                        }
+                    }
+                    if candidates.len() == 1 {
+                        let (adt_info, idx) = candidates.pop().unwrap();
+                        let fresh_args: Vec<Type> =
+                            adt_info.type_params.iter().map(|_| self.fresh()).collect();
+                        let param_sub: Subst = adt_info
+                            .type_params
+                            .iter()
+                            .cloned()
+                            .zip(fresh_args.iter().cloned())
+                            .collect();
+                        let target_adt_ty = Type::compose_n(
+                            std::iter::once(Type::Con(adt_info.name.clone())).chain(fresh_args),
+                        );
+                        self.uni(&resolved_base_ty, &target_adt_ty, base.tag.pos);
+                        let field_ty = adt_info.variants[0].field_types[idx]
+                            .clone()
+                            .apply(&param_sub);
+                        form.tag.set_type(field_ty);
+                    } else {
+                        return Err(TypeError::PatternError(
+                            format!(
+                                "Cannot infer struct type for field '.{}'; add a type annotation",
+                                field_name
+                            ),
+                            span,
+                        ));
+                    }
+                } else {
+                    return Err(TypeError::PatternError(
+                        format!(
+                            "Cannot access field '.{}' on non-struct type '{}'",
+                            field_name, resolved_base_ty
+                        ),
+                        span,
+                    ));
+                }
+            }
+
+            Try(_) => {
+                return Err(TypeError::PatternError(
+                    "'?' operator is only valid inside a Result-returning expression".to_string(),
+                    span,
+                ));
+            }
+
             Let(VarDecl(ref name, ref mut var_scm), ref mut val, ref mut body) => {
                 let val_pos = val.tag.pos;
                 let has_explicit_annot = *var_scm != Scheme::Slot;
@@ -1961,6 +2061,11 @@ impl<'i> Infer<'i> {
             self.expand_type(&check_ty, Span::default())?;
         }
 
+        // Desugar any remaining `?` nodes (e.g. when `infer_defs` is invoked directly in unit tests)
+        for d in program.iter_mut() {
+            crate::syntax::parser::desugar_try_in_def(d, "Ok", "Err", self.interner);
+        }
+
         // Pass 2: Process ADT definitions (plus default `List` constructors)
         let mut constructor_types: Vec<(Id, Scheme)> = Vec::new();
         // Add default List constructors first (user `data List` will override them)
@@ -2067,6 +2172,7 @@ impl<'i> Infer<'i> {
 
         let mut env = base_env.extend_n(initial_bindings);
         let mut inferred_indices = Vec::new();
+        let mut global_subst: Subst = HashMap::new();
 
         // Pass 6: Infer each top-level `Form` definition
         for (idx, d) in program.iter_mut().enumerate() {
@@ -2112,6 +2218,8 @@ impl<'i> Infer<'i> {
             }
 
             let sub = self.solve()?;
+            global_subst.apply_mut(&sub);
+            global_subst.extend(sub.clone());
             Self::apply_subst_to_env(&mut env, &sub);
             d.form_body_mut().apply_mut(&sub);
             for wc in &mut self.wanted_constraints {
@@ -2196,6 +2304,9 @@ impl<'i> Infer<'i> {
         // and check pattern exhaustiveness on every inferred definition!
         for idx in inferred_indices {
             let d = &mut program[idx];
+            if !global_subst.is_empty() {
+                d.form_body_mut().apply_mut(&global_subst);
+            }
             self.check_exhaustiveness_in_form(d.form_body_mut())?;
         }
 

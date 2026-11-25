@@ -17,6 +17,7 @@ pub fn builtin_module_source(module_key: &str) -> Option<&'static str> {
         "std.result" => Some(include_str!("../../stdlib/std/result.gs")),
         "std.list" => Some(include_str!("../../stdlib/std/list.gs")),
         "std.bits" => Some(include_str!("../../stdlib/std/bits.gs")),
+        "std.path" => Some(include_str!("../../stdlib/std/path.gs")),
         "std.char" => Some(include_str!("../../stdlib/std/char.gs")),
         "std.buf" => Some(include_str!("../../stdlib/std/buf.gs")),
         "std.str" => Some(include_str!("../../stdlib/std/str.gs")),
@@ -284,6 +285,12 @@ impl ModuleLoader {
             {
                 let inter = interner.borrow();
                 for m in self.cache.values() {
+                    if !self.cache.contains_key("std.result")
+                        && !needed.contains(&"std.result".to_string())
+                        && m.defs.iter().any(|(_, d)| parser::def_contains_try(d))
+                    {
+                        needed.push("std.result".to_string());
+                    }
                     for (_, use_item) in &m.imports {
                         let target = import_target_module_key(use_item, &inter);
                         if !target.is_empty()

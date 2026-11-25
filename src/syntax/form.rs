@@ -432,6 +432,10 @@ pub enum Expr {
     While(E, E),
     /// Pattern match (`match e { pat -> body, ... }`)
     Match(E, Vec<MatchArm>),
+    /// Struct field access (`rec.field`) or module item chain prior to module rewriting
+    Field(E, Name),
+    /// Fallible `Result` unwrap / early-return sugar (`expr?`)
+    Try(E),
 }
 
 #[derive(Debug, PartialEq, Clone)]

@@ -492,6 +492,42 @@ impl LLVMBuilder {
         }
     }
 
+    pub fn bitcast(&self, val: &LLVMValue, dest_ty: &LLVMType, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildBitCast(
+                self.raw_ptr(),
+                val.raw_ptr(),
+                dest_ty.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn sitofp(&self, val: &LLVMValue, dest_ty: &LLVMType, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildSIToFP(
+                self.raw_ptr(),
+                val.raw_ptr(),
+                dest_ty.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn fptosi(&self, val: &LLVMValue, dest_ty: &LLVMType, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildFPToSI(
+                self.raw_ptr(),
+                val.raw_ptr(),
+                dest_ty.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
     pub fn sub(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
         let c = to_cstring(name);
         unsafe {

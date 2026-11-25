@@ -1556,6 +1556,46 @@ impl<'i> K<'i> {
 
             Block(e) => Term::Block(self.transform_list(e)),
             Unary(op, e) => Term::Unary(op, Box::new(self.transform(*e))),
+            Field(base, field_name) => {
+                let base_ty = base.tag.ref_type().clone();
+                let mut curr = &base_ty;
+                while let Type::Comp(b, _) = curr {
+                    curr = b.as_ref();
+                }
+                let adt_name = match curr {
+                    Type::Con(n) => n.clone(),
+                    _ => panic!("Expected struct ADT in Field projection, got {}", base_ty),
+                };
+                let adt_info = self
+                    .adt_registry
+                    .get(&adt_name)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("Unknown struct ADT '{}'", adt_name));
+                let variant = &adt_info.variants[0];
+                let decl_names = variant
+                    .field_names
+                    .as_ref()
+                    .expect("Struct variant must have field_names");
+                let idx = decl_names
+                    .iter()
+                    .position(|n| n == &field_name)
+                    .expect("Struct field checked by typeinfer");
+
+                let base_term = self.transform(*base);
+                let fr = self.fresh();
+                let res_id = self.interner.intern(&fr);
+                let mut pats = vec![Pattern::Wildcard; decl_names.len()];
+                pats[idx] = Pattern::Var(res_id);
+                Term::Match(
+                    Box::new(base_term),
+                    vec![(
+                        Pattern::Constructor(variant.name.clone(), pats),
+                        None,
+                        Box::new(TaggedTerm::new(tform.clone(), Term::Var(res_id))),
+                    )],
+                )
+            }
+            Try(_) => unreachable!("Expr::Try is desugared prior to K-conversion"),
             If(cond, tr, fl) => Term::If(
                 Box::new(self.transform(*cond)),
                 Box::new(self.transform(*tr)),

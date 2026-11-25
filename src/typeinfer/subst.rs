@@ -213,6 +213,9 @@ impl SubstMut for Form {
                     arm.body.apply_mut(sub);
                 }
             }
+            Field(ref mut base, _) | Try(ref mut base) => {
+                base.apply_mut(sub);
+            }
             Lit(_) | Var(_) | QualifiedVar(_) => {}
         }
     }

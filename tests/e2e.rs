@@ -1223,3 +1223,99 @@ def main() = {
 "#;
     assert_eq!(compile_and_run_src(src), "80");
 }
+
+#[test]
+fn e2e_self_hosting_prereqs_try_sugar_dot_field_path_num_parse_and_mutual_rec() {
+    let src = r#"
+use std.result.{Result, Ok, Err, isErr}
+use std.str.{parseInt, parseInt64, parseFloat, i64ToStr, floatToHex16, floatToStr}
+use std.path.{pathJoin, pathDirname, pathBasename, pathStem, pathWithExt, isAbsPath}
+
+data Span {
+    MkSpan { start: Int, end: Int },
+}
+
+data Token a {
+    MkToken { span: Span, payload: a },
+}
+
+// Unannotated struct parameter inferred via unique field `.end` / `.start`!
+def spanLen(s) = s.end - s.start
+
+// Unannotated top-level mutual recursion (`isEven` <-> `isOdd`) with zero type annotations!
+def isEven(n) = if (n == 0) true else isOdd(n - 1)
+def isOdd(n) = if (n == 0) false else isEven(n - 1)
+
+def requireNonNeg(n: Int): Result Void String =
+    if (n >= 0) Ok(()) else Err("negative")
+
+def parseAndCompute(aStr: String, bStr: String): Result Int String = {
+    let a = parseInt(aStr)?;
+    requireNonNeg(a)?;
+    let b = parseInt(bStr)?;
+    Ok(a * 10 + b)
+}
+
+def makeTok(lo: Int, hi: Int, s: String): Result (Token Int) String =
+    Ok(MkToken {
+        span: MkSpan { start: lo, end: hi },
+        payload: parseInt(s)? + 1,
+    })
+
+def chainedTryField(s: String): Result Int String = {
+    let tokLen = makeTok(3, 9, s)?.span |> spanLen;
+    let payload = makeTok(3, 9, s)?.payload;
+    Ok(tokLen + payload)
+}
+
+def (|>)(x: a, f: a -> b): b = f(x)
+
+def main() = {
+    // 1. `?` Result sugar (success & early-return error propagation) + chained `?.span` + `.field`
+    let rOk = parseAndCompute("4", "2");
+    let rBad1 = parseAndCompute("-1", "2");
+    let rBad2 = parseAndCompute("4", "oops");
+    let rChain = chainedTryField("19"); // spanLen(3..9)=6, payload=20 -> 26
+
+    let tryOk = match (rOk, rChain) {
+        (Ok(42), Ok(26)) -> isErr(rBad1) && isErr(rBad2),
+        _ -> false,
+    };
+
+    // 2. Numeric parsing, 64-bit formatting, and lossless IEEE-754 hex (`0x4009000000000000` for `3.125`)
+    let fRes = parseFloat("3.125");
+    let eRes = parseFloat("1.5e2");
+    let i64Res = parseInt64("-9000000000000");
+    let numOk = match (fRes, eRes, i64Res) {
+        (Ok(f1), Ok(f2), Ok(big)) ->
+            floatToHex16(f1) == "0x4009000000000000"
+            && bits64ToFloat(floatToBits64(f1)) == 3.125
+            && floatToInt(f2) == 150
+            && floatToStr(f1) == "3.125"
+            && i64ToStr(big) == "-9000000000000",
+        _ -> false,
+    };
+
+    // 3. `std.path` helpers
+    let p = pathJoin("src/compiler", "codegen.gs");
+    let pathOk =
+        p == "src/compiler/codegen.gs"
+        && pathDirname(p) == "src/compiler"
+        && pathBasename(p) == "codegen.gs"
+        && pathStem(p) == "codegen"
+        && pathWithExt(p, "ll") == "src/compiler/codegen.ll"
+        && !isAbsPath(p)
+        && isAbsPath("/usr/bin/cc");
+
+    // 4. Unannotated mutual recursion + module-qualified call (`std.str.intToStr`) coexisting with `.field`
+    let mutRecOk = isEven(10) && !isEven(11) && isOdd(11) && std.str.intToStr(77) == "77";
+
+    if (tryOk && numOk && pathOk && mutRecOk) {
+        putNumber(100)
+    } else {
+        putNumber(0)
+    }
+}
+"#;
+    assert_eq!(compile_and_run_src(src), "100");
+}

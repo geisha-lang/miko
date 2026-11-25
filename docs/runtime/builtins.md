@@ -23,7 +23,7 @@
 
 ## Low-Level `PrimOp` Intrinsics (Used by `stdlib` & `syslib`)
 
-- **Bitwise & Conversions**: `bitAnd`, `bitOr`, `bitXor`, `bitShl`, `bitShr`, `bitUshr` (`(Int, Int) -> Int`), `bitNot` (`Int -> Int`), `bitAnd64`, `bitOr64`, `bitXor64` (`(Int64, Int64) -> Int64`), `bitNot64` (`Int64 -> Int64`), `bitShl64`, `bitShr64`, `bitUshr64` (`(Int64, Int) -> Int64`), `charToInt` (`Char -> Int`), `intToChar` (`Int -> Char`), `intToI64` (`Int -> Int64`), `i64ToInt` (`Int64 -> Int`).
+- **Bitwise & Conversions**: `bitAnd`, `bitOr`, `bitXor`, `bitShl`, `bitShr`, `bitUshr` (`(Int, Int) -> Int`), `bitNot` (`Int -> Int`), `bitAnd64`, `bitOr64`, `bitXor64` (`(Int64, Int64) -> Int64`), `bitNot64` (`Int64 -> Int64`), `bitShl64`, `bitShr64`, `bitUshr64` (`(Int64, Int) -> Int64`), `charToInt` (`Char -> Int`), `intToChar` (`Int -> Char`), `intToI64` (`Int -> Int64`), `i64ToInt` (`Int64 -> Int`), `floatToBits64` (`Float -> Int64`), `bits64ToFloat` (`Int64 -> Float`), `intToFloat` (`Int -> Float`), `floatToInt` (`Float -> Int`).
 - **Strings**: `strLen` (`String -> Int`), `strByteAt` (`(String, Int) -> Int`), `strSlice` (`(String, Int, Int) -> String`), `strConcat` (`(String, String) -> String`), `strFromBytes` (`(MutArray Int, Int) -> String`).
 - **Opaque Pointers & CLI**: `Ptr`, `ptrNull` (`() -> Ptr`), `ptrIsNull` (`Ptr -> Bool`), `ptrAllocBytes` (`Int -> Ptr`), `ptrByteAt` (`(Ptr, Int) -> Int`), `ptrSetByte` (`(Ptr, Int, Int) -> Void`), `ptrToString` (`Ptr -> String`), `sysArgc` (`() -> Int`), `sysArgv` (`Int -> String`).
 
@@ -33,9 +33,10 @@
 - **`std.result`** — `Result a e { Ok(a), Err(e) }`, `isOk`, `isErr`, `unwrapResultOr`, `mapResult`, `mapErr`, `andThenResult`
 - **`std.list`** — `listLen`, `listIsEmpty`, `listRev`, `listAppend`, `listMap`, `listFilter`, `listFold`, `listAny`, `listAll`, `listNth`
 - **`std.bits`** — Bit manipulation helpers (`hasFlag`, `setFlag`, `clearFlag`, `toggleFlag`, `popCount`, `popCount64`, `trailingZeros`)
+- **`std.path`** — Portable POSIX path helpers (`isAbsPath`, `pathJoin`, `pathDirname`, `pathBasename`, `pathStem`, `pathWithExt`)
 - **`std.char`** — Lexer character/byte predicates (`isDigitByte`, `isAlphaByte`, `isIdentStartByte`, `isIdentContByte`, `isSpaceByte`, etc.)
 - **`std.buf`** — Amortized $O(1)$ `StringBuf` (`bufNew`, `bufPushByte`, `bufPushChar`, `bufPushStr`, `bufPushLine`, `bufPushInt`, `bufToString`)
-- **`std.str`** — `intToStr`, `boolToStr`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, `strTrim`, `strSplitChar`, `strJoin`, `strHash`
+- **`std.str`** — `intToStr`, `i64ToStr`, `i64ToHex16`, `floatToHex16`, `floatToStr`, `boolToStr`, `parseInt`, `parseInt64`, `parseFloat`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, `strTrim`, `strSplitChar`, `strJoin`, `strHash`
 - **`std.vec`** — Dynamic growable `Vec a` (`vecNew`, `vecLen`, `vecPush`, `vecPop`, `vecGet`, `vecGetOr`, `vecSet`, `vecClear`, `vecToList`)
 - **`std.map`** — Resizable `StrMap v`, `IntMap v`, and bidirectional compiler symbol `Interner` (`internerNew`, `intern`, `internerResolve`, `internerCount`)
 - **`std.sync`** — Shared-memory synchronization (`AtomicInt`, `MVar a`, bounded/unbounded `Chan a`)

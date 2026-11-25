@@ -97,7 +97,7 @@ pub fn encode_op_name(op: &str) -> String {
 }
 
 fn is_reserved_non_op(s: &str) -> bool {
-    matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!" | "~")
+    matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!" | "~" | "?")
 }
 
 fn builtin_binop_from_str(s: &str) -> Option<BinOp> {
@@ -178,6 +178,12 @@ fn make_infix_expr(op_str: &str, lhs: Form, rhs: Form, interner: &RefCell<Intern
             Expr::Apply(Box::new(callee), vec![Box::new(lhs), Box::new(rhs)]),
         )
     }
+}
+
+enum PostfixOp {
+    Call(usize, Vec<Form>),
+    Field(usize, String),
+    Try(usize),
 }
 
 enum BlockItem {
@@ -335,7 +341,7 @@ peg::parser! {
 
         rule definable_op_str() -> &'input str
             = s:raw_op_str() {?
-                if matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!") {
+                if matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!" | "?") {
                     Err("Reserved syntax punctuation cannot be redefined as an operator")
                 } else {
                     Ok(s)
@@ -852,12 +858,24 @@ peg::parser! {
             }
 
         rule form_factor() -> Form
-            = start:position!() h:_form_factor() t:_apply()* {
+            = start:position!() h:_form_factor() t:postfix_op()* {
                 let mut f = h;
-                for (end, app) in t {
-                    let param = app.into_iter().map(Box::new).collect();
-                    let span = Span::new(start, end);
-                    f = Form::new(span, Expr::Apply(Box::new(f), param));
+                for op in t {
+                    match op {
+                        PostfixOp::Call(end, app) => {
+                            let param = app.into_iter().map(Box::new).collect();
+                            let span = Span::new(start, end);
+                            f = Form::new(span, Expr::Apply(Box::new(f), param));
+                        }
+                        PostfixOp::Field(end, fname) => {
+                            let span = Span::new(start, end);
+                            f = Form::new(span, Expr::Field(Box::new(f), fname));
+                        }
+                        PostfixOp::Try(end) => {
+                            let span = Span::new(start, end);
+                            f = Form::new(span, Expr::Try(Box::new(f)));
+                        }
+                    }
                 }
                 f
             }
@@ -1037,13 +1055,7 @@ peg::parser! {
             }
 
         rule var() -> Expr
-            = path:module_path() {
-                if path.segments.len() == 1 {
-                    Expr::Var(path.segments[0])
-                } else {
-                    Expr::QualifiedVar(path)
-                }
-            }
+            = id:identifier() { Expr::Var(id) }
 
         rule list() -> Expr
             = token(<"[">) l:expression() ** token(<",">) token(<",">)? token(<"]">) {
@@ -1105,8 +1117,12 @@ peg::parser! {
             = reserved(<"true">) { Expr::Lit(Lit::Bool(true)) }
             / reserved(<"false">) { Expr::Lit(Lit::Bool(false)) }
 
-        rule _apply() -> (usize, Vec<Form>)
-            = l:parens(<apply_list()>) end:position!() { (end, l) }
+        rule postfix_op() -> PostfixOp
+            = l:parens(<apply_list()>) end:position!() { PostfixOp::Call(end, l) }
+            / token(<".">) fname:identifier() end:position!() {
+                PostfixOp::Field(end, interner.borrow().trace(fname).to_string())
+            }
+            / token(<"?">) !['?' | '>' | '=' | ':'] end:position!() { PostfixOp::Try(end) }
 
         rule apply_list() -> Vec<Form>
             = elems:expression() ** token(<",">) token(<",">)? { elems }
@@ -1123,6 +1139,338 @@ peg::parser! {
 }
 
 pub use self::geisha_parser::*;
+
+pub fn form_contains_try(form: &Form) -> bool {
+    match &form.node {
+        Expr::Try(_) => true,
+        Expr::Lit(_) | Expr::Var(_) | Expr::QualifiedVar(_) => false,
+        Expr::Field(e, _) | Expr::Unary(_, e) => form_contains_try(e),
+        Expr::Tuple(es) | Expr::List(es) | Expr::Block(es) => es.iter().any(|e| form_contains_try(e)),
+        Expr::StructInit(_, fs) => fs.iter().any(|(_, v)| form_contains_try(v)),
+        Expr::Apply(c, args) => form_contains_try(c) || args.iter().any(|a| form_contains_try(a)),
+        Expr::Abs(lam) => form_contains_try(&lam.body),
+        Expr::Binary(_, l, r) | Expr::While(l, r) => form_contains_try(l) || form_contains_try(r),
+        Expr::Let(_, v, b) => form_contains_try(v) || form_contains_try(b),
+        Expr::If(c, t, f) => form_contains_try(c) || form_contains_try(t) || form_contains_try(f),
+        Expr::Match(s, arms) => {
+            form_contains_try(s)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().map_or(false, |g| form_contains_try(g))
+                        || form_contains_try(&a.body)
+                })
+        }
+    }
+}
+
+pub fn def_contains_try(def: &Def) -> bool {
+    match &def.node {
+        Item::Form(f) => form_contains_try(f),
+        Item::Instance { methods, .. } => methods.iter().any(|m| form_contains_try(&m.body)),
+        _ => false,
+    }
+}
+
+struct TryDesugarer<'a> {
+    interner: &'a mut Interner,
+    ok_ctor: String,
+    err_ctor: String,
+    err_fn_id: Id,
+    counter: usize,
+}
+
+impl<'a> TryDesugarer<'a> {
+    fn fresh_ids(&mut self) -> (Id, Id) {
+        self.counter += 1;
+        let ok_id = self.interner.intern(&format!(".try_ok_{}", self.counter));
+        let err_id = self.interner.intern(&format!(".try_err_{}", self.counter));
+        (ok_id, err_id)
+    }
+
+    fn wrap_tries(&mut self, binds: Vec<(Id, Span, Form)>, mut cont: Form) -> Form {
+        for (ok_id, span, scrutinee) in binds.into_iter().rev() {
+            let (_, err_id) = self.fresh_ids();
+            let err_arm = MatchArm {
+                pattern: Pattern::Constructor(self.err_ctor.clone(), vec![Pattern::Var(err_id)]),
+                guard: None,
+                body: Box::new(Form::new(
+                    span,
+                    Expr::Apply(
+                        Box::new(Form::new(span, Expr::Var(self.err_fn_id))),
+                        vec![Box::new(Form::new(span, Expr::Var(err_id)))],
+                    ),
+                )),
+            };
+            let ok_arm = MatchArm {
+                pattern: Pattern::Constructor(self.ok_ctor.clone(), vec![Pattern::Var(ok_id)]),
+                guard: None,
+                body: Box::new(cont),
+            };
+            let full_span = span.union(&ok_arm.body.tag.pos);
+            cont = Form::new(full_span, Expr::Match(Box::new(scrutinee), vec![err_arm, ok_arm]));
+        }
+        cont
+    }
+
+    /// Extract unguarded `Expr::Try` nodes in left-to-right evaluation order within a single value expression
+    /// (stopping at nested `Abs`, `Block`, `Let`, `If` branches, `Match` arms, `While`, and short-circuit `&&`/`||` RHS).
+    fn extract_value_tries(&mut self, form: Form, binds: &mut Vec<(Id, Span, Form)>) -> Form {
+        let Form { node, tag } = form;
+        let span = tag.pos;
+        let new_node = match node {
+            Expr::Try(inner) => {
+                let clean_inner = self.extract_value_tries(*inner, binds);
+                let (ok_id, _) = self.fresh_ids();
+                binds.push((ok_id, span, clean_inner));
+                return Form {
+                    node: Expr::Var(ok_id),
+                    tag,
+                };
+            }
+            Expr::Lit(_) | Expr::Var(_) | Expr::QualifiedVar(_) => node,
+            Expr::Field(base, fname) => {
+                let b = self.extract_value_tries(*base, binds);
+                Expr::Field(Box::new(b), fname)
+            }
+            Expr::Unary(op, operand) => {
+                let o = self.extract_value_tries(*operand, binds);
+                Expr::Unary(op, Box::new(o))
+            }
+            Expr::Binary(op @ (BinOp::And | BinOp::Or), lhs, rhs) => {
+                let l = self.extract_value_tries(*lhs, binds);
+                // Short-circuit RHS only desugars nested lambdas
+                let r = self.desugar_non_result_expr(*rhs);
+                Expr::Binary(op, Box::new(l), Box::new(r))
+            }
+            Expr::Binary(op, lhs, rhs) => {
+                let l = self.extract_value_tries(*lhs, binds);
+                let r = self.extract_value_tries(*rhs, binds);
+                Expr::Binary(op, Box::new(l), Box::new(r))
+            }
+            Expr::Apply(callee, args) => {
+                let c = self.extract_value_tries(*callee, binds);
+                let new_args = args
+                    .into_iter()
+                    .map(|a| Box::new(self.extract_value_tries(*a, binds)))
+                    .collect();
+                Expr::Apply(Box::new(c), new_args)
+            }
+            Expr::Tuple(es) => Expr::Tuple(
+                es.into_iter()
+                    .map(|e| Box::new(self.extract_value_tries(*e, binds)))
+                    .collect(),
+            ),
+            Expr::List(es) => Expr::List(
+                es.into_iter()
+                    .map(|e| Box::new(self.extract_value_tries(*e, binds)))
+                    .collect(),
+            ),
+            Expr::StructInit(cname, fs) => Expr::StructInit(
+                cname,
+                fs.into_iter()
+                    .map(|(k, v)| (k, Box::new(self.extract_value_tries(*v, binds))))
+                    .collect(),
+            ),
+            Expr::Abs(mut lam) => {
+                lam.body = Box::new(self.desugar_result_scope(*lam.body));
+                Expr::Abs(lam)
+            }
+            other => self.desugar_non_result_expr(Form { node: other, tag: tag.clone() }).node,
+        };
+        Form { node: new_node, tag }
+    }
+
+    fn desugar_non_result_expr(&mut self, form: Form) -> Form {
+        let Form { node, tag } = form;
+        let new_node = match node {
+            Expr::Abs(mut lam) => {
+                lam.body = Box::new(self.desugar_result_scope(*lam.body));
+                Expr::Abs(lam)
+            }
+            Expr::While(c, b) => Expr::While(
+                Box::new(self.desugar_non_result_expr(*c)),
+                Box::new(self.desugar_non_result_expr(*b)),
+            ),
+            Expr::If(c, t, f) => Expr::If(
+                Box::new(self.desugar_non_result_expr(*c)),
+                Box::new(self.desugar_non_result_expr(*t)),
+                Box::new(self.desugar_non_result_expr(*f)),
+            ),
+            Expr::Let(v, val, body) => Expr::Let(
+                v,
+                Box::new(self.desugar_non_result_expr(*val)),
+                Box::new(self.desugar_non_result_expr(*body)),
+            ),
+            Expr::Match(s, arms) => Expr::Match(
+                Box::new(self.desugar_non_result_expr(*s)),
+                arms.into_iter()
+                    .map(|mut a| {
+                        a.guard = a.guard.map(|g| Box::new(self.desugar_non_result_expr(*g)));
+                        a.body = Box::new(self.desugar_non_result_expr(*a.body));
+                        a
+                    })
+                    .collect(),
+            ),
+            Expr::Block(es) => Expr::Block(
+                es.into_iter()
+                    .map(|e| Box::new(self.desugar_non_result_expr(*e)))
+                    .collect(),
+            ),
+            Expr::Tuple(es) => Expr::Tuple(
+                es.into_iter()
+                    .map(|e| Box::new(self.desugar_non_result_expr(*e)))
+                    .collect(),
+            ),
+            Expr::List(es) => Expr::List(
+                es.into_iter()
+                    .map(|e| Box::new(self.desugar_non_result_expr(*e)))
+                    .collect(),
+            ),
+            Expr::StructInit(c, fs) => Expr::StructInit(
+                c,
+                fs.into_iter()
+                    .map(|(k, v)| (k, Box::new(self.desugar_non_result_expr(*v))))
+                    .collect(),
+            ),
+            Expr::Apply(c, args) => Expr::Apply(
+                Box::new(self.desugar_non_result_expr(*c)),
+                args.into_iter()
+                    .map(|a| Box::new(self.desugar_non_result_expr(*a)))
+                    .collect(),
+            ),
+            Expr::Binary(op, l, r) => Expr::Binary(
+                op,
+                Box::new(self.desugar_non_result_expr(*l)),
+                Box::new(self.desugar_non_result_expr(*r)),
+            ),
+            Expr::Unary(op, e) => Expr::Unary(op, Box::new(self.desugar_non_result_expr(*e))),
+            Expr::Field(e, n) => Expr::Field(Box::new(self.desugar_non_result_expr(*e)), n),
+            other => other,
+        };
+        Form { node: new_node, tag }
+    }
+
+    /// Desugar an expression in a `Result`-producing tail position (function body, block tail, `if` branch, `match` arm).
+    fn desugar_result_scope(&mut self, form: Form) -> Form {
+        if !form_contains_try(&form) {
+            return form;
+        }
+        let Form { node, tag } = form;
+        match node {
+            Expr::Abs(mut lam) => {
+                lam.body = Box::new(self.desugar_result_scope(*lam.body));
+                Form {
+                    node: Expr::Abs(lam),
+                    tag,
+                }
+            }
+            Expr::Let(v, val, body) => {
+                let mut binds = Vec::new();
+                let clean_val = self.extract_value_tries(*val, &mut binds);
+                let clean_body = self.desugar_result_scope(*body);
+                let rebuilt = Form {
+                    node: Expr::Let(v, Box::new(clean_val), Box::new(clean_body)),
+                    tag,
+                };
+                self.wrap_tries(binds, rebuilt)
+            }
+            Expr::Block(mut items) => {
+                if items.is_empty() {
+                    return Form {
+                        node: Expr::Block(items),
+                        tag,
+                    };
+                }
+                let last = *items.pop().unwrap();
+                let mut acc = self.desugar_result_scope(last);
+                while let Some(stmt) = items.pop() {
+                    let mut binds = Vec::new();
+                    let clean_stmt = self.extract_value_tries(*stmt, &mut binds);
+                    let bspan = clean_stmt.tag.pos.union(&acc.tag.pos);
+                    let seq = match acc.node {
+                        Expr::Block(mut tail_items) => {
+                            let mut combined = vec![Box::new(clean_stmt)];
+                            combined.append(&mut tail_items);
+                            Form::new(bspan, Expr::Block(combined))
+                        }
+                        _ => Form::new(bspan, Expr::Block(vec![Box::new(clean_stmt), Box::new(acc)])),
+                    };
+                    acc = self.wrap_tries(binds, seq);
+                }
+                acc.tag.annotate = tag.annotate;
+                acc
+            }
+            Expr::If(cond, then_e, else_e) => {
+                let mut binds = Vec::new();
+                let clean_cond = self.extract_value_tries(*cond, &mut binds);
+                let clean_then = self.desugar_result_scope(*then_e);
+                let clean_else = self.desugar_result_scope(*else_e);
+                let rebuilt = Form {
+                    node: Expr::If(
+                        Box::new(clean_cond),
+                        Box::new(clean_then),
+                        Box::new(clean_else),
+                    ),
+                    tag,
+                };
+                self.wrap_tries(binds, rebuilt)
+            }
+            Expr::Match(scrut, arms) => {
+                let mut binds = Vec::new();
+                let clean_scrut = self.extract_value_tries(*scrut, &mut binds);
+                let clean_arms = arms
+                    .into_iter()
+                    .map(|mut arm| {
+                        arm.guard = arm.guard.map(|g| Box::new(self.desugar_non_result_expr(*g)));
+                        arm.body = Box::new(self.desugar_result_scope(*arm.body));
+                        arm
+                    })
+                    .collect();
+                let rebuilt = Form {
+                    node: Expr::Match(Box::new(clean_scrut), clean_arms),
+                    tag,
+                };
+                self.wrap_tries(binds, rebuilt)
+            }
+            other => {
+                let mut binds = Vec::new();
+                let clean = self.extract_value_tries(Form { node: other, tag }, &mut binds);
+                self.wrap_tries(binds, clean)
+            }
+        }
+    }
+}
+
+pub fn desugar_try_in_def(
+    def: &mut Def,
+    ok_ctor: &str,
+    err_ctor: &str,
+    interner: &mut Interner,
+) {
+    if !def_contains_try(def) {
+        return;
+    }
+    let err_fn_id = interner.intern(err_ctor);
+    let mut d = TryDesugarer {
+        interner,
+        ok_ctor: ok_ctor.to_string(),
+        err_ctor: err_ctor.to_string(),
+        err_fn_id,
+        counter: 0,
+    };
+    match &mut def.node {
+        Item::Form(ref mut f) => {
+            let taken = (**f).clone();
+            **f = d.desugar_result_scope(taken);
+        }
+        Item::Instance { ref mut methods, .. } => {
+            for m in methods {
+                let taken = (*m.body).clone();
+                *m.body = d.desugar_result_scope(taken);
+            }
+        }
+        _ => {}
+    }
+}
 
 pub fn parse(src: &str, interner: &mut Interner) -> Result<Vec<Def>, peg::error::ParseError<peg::str::LineCol>> {
     let cell = RefCell::new(std::mem::take(interner));

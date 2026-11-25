@@ -828,3 +828,280 @@ def main() = {
 "#;
     assert_eq!(compile_and_run_src(src), "67");
 }
+
+#[test]
+fn e2e_concurrency_tasks_work_helping_wait_any_and_par_combinators() {
+    let src = r#"
+use std.list.{listLen, listFold}
+use std.sync.{atomicNew, atomicAdd, atomicLoad, atomicCas}
+use std.task.{spawn, await, par, parMap, parFor, parRange, waitAll, waitAny, sleepMs}
+
+// Recursive nested fork-join: exercises inline work-helping on a 2-thread pool without deadlocking!
+def fibPar(n: Int): Int =
+    if (n <= 1) n
+    else if (n <= 5) fibPar(n - 1) + fibPar(n - 2)
+    else {
+        let (a, b) = par(() -> fibPar(n - 1), () -> fibPar(n - 2));
+        a + b
+    }
+
+def main() = {
+    // 1. Nested recursive `par` under tight worker thread count (`GEISHA_THREADS=2`)
+    let f11 = fibPar(11); // 89
+
+    // 2. `parMap` & `parRange` preserving deterministic order over immutable values
+    let mapped = parMap([1, 2, 3, 4, 5, 6], (x) -> x * x); // sum = 91
+    let sumMapped = listFold(mapped, 0, (+));
+
+    let ranged = parRange(1, 21, (i) -> i * 2); // 2 * (1..=20) = 420
+    let sumRanged = listFold(ranged, 0, (+));
+
+    // 3. `parFor` + `AtomicInt` (`atomicAdd` & `atomicCas`)
+    let acc = atomicNew(0);
+    parFor(0, 100, (i) -> {
+        let _ = atomicAdd(acc, i);
+        ()
+    }); // 0..99 sum = 4950
+    let casOk = atomicCas(acc, 4950, 5000) && !atomicCas(acc, 4950, 9999);
+
+    // 4. `waitAny`: 2 fast tasks + 1 slow task (`sleepMs(50)`)
+    let slow = spawn(() -> { sleepMs(50); 100 });
+    let fast1 = spawn(() -> 10);
+    let fast2 = spawn(() -> 20);
+    let (ready, pending) = waitAny([slow, fast1, fast2], 2, -1);
+    let readyCountOk = listLen(ready) >= 2 && (listLen(ready) + listLen(pending) == 3);
+    let totalWaitAny = listFold(waitAll(ready), 0, (+)) + listFold(waitAll(pending), 0, (+)); // 130
+
+    if (f11 == 89 && sumMapped == 91 && sumRanged == 420 && casOk && atomicLoad(acc) == 5000 && readyCountOk && totalWaitAny == 130) {
+        printLn("CONC_TASK_OK")
+    } else {
+        printLn("CONC_TASK_FAIL")
+    }
+}
+"#;
+    let out = compile_and_run_src_with_env(src, &[("GEISHA_THREADS", "2")]);
+    assert_eq!(out, "CONC_TASK_OK\n");
+}
+
+#[test]
+fn e2e_concurrency_channels_mvars_actors_and_multicore_gc_stress() {
+    let src = r#"
+use std.option.{Option, Some, None, unwrapOr}
+use std.list.{listFold}
+use std.vec.{Vec, vecNew, vecPush, vecLen}
+use std.map.{StrMap, strMapNew, strMapInsert, strMapGet}
+use std.str.{intToStr}
+use std.sync.{
+    mvarEmpty, mvarPut, mvarTake, mvarRead, mvarTryTake,
+    chanNew, chanSend, chanRecv, chanClose
+}
+use std.task.{spawn, await, waitAll}
+use std.actor.{Actor, actorSpawn, actorCall, actorAsk, actorSend, actorStop}
+
+data Packet {
+    MkPacket(Int, String),
+}
+
+// Actor state combines `!Send` types (`Vec`, `StrMap`, `Cell`) safely on a pinned OS thread!
+data StoreState {
+    MkStore(Vec String, StrMap Int, Cell Int),
+}
+
+def drainSum(ch: Chan Packet, acc: Int): Int = match chanRecv(ch) {
+    None -> acc,
+    Some(MkPacket(v, label)) -> drainSum(ch, acc + v + strLen(label)),
+}
+
+def main() = {
+    // 1. Bounded channel (`cap = 2`) with multiple concurrent producers & heap allocations under tiny GC heap
+    let ch: Chan Packet = chanNew(2);
+    let p1 = spawn(() -> {
+        let i = cellNew(1);
+        while (cellGet(i) <= 15) {
+            let k = cellGet(i);
+            let _ = chanSend(ch, MkPacket(k, "ab" + "cd")); // strLen = 4
+            cellSet(i, k + 1)
+        }
+    });
+    let p2 = spawn(() -> {
+        let i = cellNew(16);
+        while (cellGet(i) <= 30) {
+            let k = cellGet(i);
+            let _ = chanSend(ch, MkPacket(k, "xy" + "zw")); // strLen = 4
+            cellSet(i, k + 1)
+        }
+    });
+    let closer = spawn(() -> {
+        await(p1);
+        await(p2);
+        chanClose(ch)
+    });
+    // Sum of 1..=30 is 465; plus 30 * 4 = 120 -> 585
+    let chanTotal = drainSum(ch, 0);
+    await(closer);
+
+    // 2. `MVar` synchronization (empty -> put -> read -> take -> tryTake)
+    let mv = mvarEmpty();
+    let putter = spawn(() -> mvarPut(mv, ("token-" + intToStr(7), 77)));
+    let peeked = mvarRead(mv);
+    let taken = mvarTake(mv);
+    let afterEmpty = mvarTryTake(mv);
+    await(putter);
+    let mvarOk = match (peeked, taken, afterEmpty) {
+        ((s1, 77), (s2, 77), None) -> s1 == "token-7" && s2 == "token-7",
+        _ -> false,
+    };
+
+    // 3. `Actor` encapsulating `!Send` `Vec`, `StrMap`, and `Cell`, and passing `Actor` handles across tasks!
+    let store: Actor StoreState = actorSpawn(() -> MkStore(vecNew(), strMapNew(), cellNew(0)));
+
+    let w1 = spawn(() -> {
+        let i = cellNew(0);
+        while (cellGet(i) < 10) {
+            let idx = cellGet(i);
+            let key = "k" + intToStr(idx);
+            actorSend(store, (st) -> match st {
+                MkStore(log, mp, cnt) -> {
+                    vecPush(log, key);
+                    strMapInsert(mp, key, idx * 10);
+                    cellSet(cnt, cellGet(cnt) + 1)
+                },
+            });
+            cellSet(i, idx + 1)
+        }
+    });
+    let w2 = spawn(() -> {
+        let i = cellNew(10);
+        while (cellGet(i) < 20) {
+            let idx = cellGet(i);
+            let key = "k" + intToStr(idx);
+            actorSend(store, (st) -> match st {
+                MkStore(log, mp, cnt) -> {
+                    vecPush(log, key);
+                    strMapInsert(mp, key, idx * 10);
+                    cellSet(cnt, cellGet(cnt) + 1)
+                },
+            });
+            cellSet(i, idx + 1)
+        }
+    });
+    await(w1);
+    await(w2);
+
+    // Non-blocking `actorCall` returns `Task r` directly composable with `waitAll`!
+    let q1 = actorCall(store, (st) -> match st {
+        MkStore(log, _, cnt) -> vecLen(log) + cellGet(cnt),
+    });
+    let q2 = actorCall(store, (st) -> match st {
+        MkStore(_, mp, _) -> unwrapOr(strMapGet(mp, "k5"), 0) + unwrapOr(strMapGet(mp, "k15"), 0),
+    });
+    let querySum = listFold(waitAll([q1, q2]), 0, (+)); // (20 + 20) + (50 + 150) = 240
+    let finalSnap = actorAsk(store, (st) -> match st {
+        MkStore(_, mp, _) -> unwrapOr(strMapGet(mp, "k19"), 0),
+    }); // 190
+    actorStop(store);
+
+    if (chanTotal == 585 && mvarOk && querySum == 240 && finalSnap == 190) {
+        putNumber(chanTotal + querySum + finalSnap) // 585 + 240 + 190 = 1015
+    } else {
+        putNumber(0)
+    }
+}
+"#;
+    // Force frequent multicore stop-the-world GC cycles with a tiny 128-word initial heap!
+    let out = compile_and_run_src_with_env(
+        src,
+        &[("GEISHA_GC_HEAP_WORDS", "128"), ("GEISHA_THREADS", "4")],
+    );
+    assert_eq!(out, "1015");
+}
+
+#[test]
+fn e2e_concurrency_send_compile_time_safety_rejections() {
+    let unsafe_programs = [
+        // 1. Returning `!Send` `Cell` from `spawn`
+        r#"
+use std.task.spawn
+def main() = {
+    let _ = spawn(() -> cellNew(1));
+    ()
+}
+"#,
+        // 2. Sending `!Send` `MutArray` over a `Chan`
+        r#"
+use std.sync.{chanNew, chanSend}
+def main() = {
+    let ch = chanNew(1);
+    let _ = chanSend(ch, arrayNew(4, 0));
+    ()
+}
+"#,
+        // 3. Storing `!Send` raw `Ptr` in an `MVar`
+        r#"
+use std.sync.mvarNew
+def main() = {
+    let _ = mvarNew(ptrNull());
+    ()
+}
+"#,
+        // 4. Sending ADT containing `!Send` container (`Vec Int`) across `spawn`
+        r#"
+use std.task.spawn
+use std.vec.vecNew
+def main() = {
+    let _ = spawn(() -> vecNew());
+    ()
+}
+"#,
+        // 5. Capturing parent's `Cell` inside `spawn` closure (even though return type `Int` IS `Send`!)
+        r#"
+use std.task.spawn
+def main() = {
+    let c = cellNew(0);
+    let _ = spawn(() -> { cellSet(c, 1); 42 });
+    ()
+}
+"#,
+        // 6. Capturing parent's `Cell` through higher-order `parMap`
+        r#"
+use std.task.parMap
+def main() = {
+    let c = cellNew(0);
+    let _ = parMap([1, 2, 3], (x) -> { cellSet(c, x); x + 1 });
+    ()
+}
+"#,
+        // 7. Smuggling parent's `!Send` `Vec` into `actorSpawn` initializer closure
+        r#"
+use std.actor.actorSpawn
+use std.vec.{vecNew, vecPush}
+def main() = {
+    let v = vecNew();
+    vecPush(v, 1);
+    let _ = actorSpawn(() -> v);
+    ()
+}
+"#,
+        // 8. Accessing a `!Send` top-level global `Cell` inside a `spawn`ed task
+        r#"
+use std.task.spawn
+def globalCell = cellNew(0)
+def main() = {
+    let _ = spawn(() -> cellGet(globalCell));
+    ()
+}
+"#,
+    ];
+
+    for (idx, src) in unsafe_programs.iter().enumerate() {
+        let err = compile_str("unsafe_conc.gs", src)
+            .expect_err(&format!("Case #{} should have failed Send check!", idx + 1));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Send"),
+            "Case #{} expected `Send` type error, got: {}",
+            idx + 1,
+            msg
+        );
+    }
+}

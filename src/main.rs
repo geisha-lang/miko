@@ -75,6 +75,7 @@ fn run_repl() {
 
 fn link_executable(obj_file: &str, out_file: &str, runtime_path: &str) -> Result<(), CompileError> {
     let status = Command::new("cc")
+        .arg("-pthread")
         .arg("-o")
         .arg(out_file)
         .arg(obj_file)

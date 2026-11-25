@@ -1,5 +1,7 @@
 #include "../include/gc_bitmap.h"
+#include "../include/gs_conc.h"
 
+#include <pthread.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,31 +9,91 @@
 
 #define MAX_GLOBAL_ROOTS 4096
 
+/* Global safepoint flag polled by generated LLVM IR (`0` = normal execution, `1` = STW requested) */
+int32_t __gs_gc_stw_requested = 0;
+
+typedef struct gc_thread_t {
+    uintptr_t root_start;
+    uintptr_t safepoint_sp;
+    jmp_buf safepoint_regs;
+    bool is_blocked_or_parked;
+    struct gc_thread_t *next;
+    struct gc_thread_t *prev;
+} gc_thread_t;
+
+static pthread_mutex_t _gc_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t _stw_park_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t _stw_resume_cv = PTHREAD_COND_INITIALIZER;
+static bool _stw_in_progress = false;
+
+static _Thread_local gc_thread_t *_tls_thread = NULL;
+static gc_thread_t *_threads_head = NULL;
+
 static gc_heap_t *_heaps = NULL;
 static gc_free_t *_free_list = NULL;
-static uintptr_t _root_start = 0;
+static size_t _default_init_words = 131072;
 static void **_global_roots[MAX_GLOBAL_ROOTS];
 static size_t _global_roots_count = 0;
 static size_t _collections = 0;
 
 static gc_heap_t *new_heap(size_t words);
 static void *pickup_fragment(size_t size_words, size_t *out_total_words);
-static void bitmap_collect(void);
-static void bitmap_mark_roots(uintptr_t sp_low, uintptr_t sp_high);
-static void bitmap_mark_obj(gc_heap_t *heap, uintptr_t hdr_addr);
+static void bitmap_collect_locked(gc_thread_t *collector);
+static void bitmap_mark_stack_range(uintptr_t sp_low, uintptr_t sp_high);
+static bool bitmap_mark_obj(gc_heap_t *heap, uintptr_t hdr_addr);
 static void bitmap_sweep(void);
 static gc_heap_t *find_allocated_object_heap(uintptr_t payload_ptr);
 
+static bool all_threads_parked_locked(void)
+{
+    for (gc_thread_t *t = _threads_head; t != NULL; t = t->next) {
+        if (!t->is_blocked_or_parked) {
+            return false;
+        }
+    }
+    return true;
+}
+
 size_t gc_collection_count(void)
 {
-    return _collections;
+    pthread_mutex_lock(&_gc_mu);
+    size_t c = _collections;
+    pthread_mutex_unlock(&_gc_mu);
+    return c;
 }
 
 void gc_register_root(void **slot)
 {
-    if (slot != NULL && _global_roots_count < MAX_GLOBAL_ROOTS) {
+    if (slot == NULL) return;
+    pthread_mutex_lock(&_gc_mu);
+    if (_global_roots_count < MAX_GLOBAL_ROOTS) {
         _global_roots[_global_roots_count++] = slot;
     }
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+static void link_thread_locked(gc_thread_t *t)
+{
+    t->prev = NULL;
+    t->next = _threads_head;
+    if (_threads_head != NULL) {
+        _threads_head->prev = t;
+    }
+    _threads_head = t;
+}
+
+static void unlink_thread_locked(gc_thread_t *t)
+{
+    if (t->prev != NULL) {
+        t->prev->next = t->next;
+    } else {
+        _threads_head = t->next;
+    }
+    if (t->next != NULL) {
+        t->next->prev = t->prev;
+    }
+    t->prev = NULL;
+    t->next = NULL;
 }
 
 void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
@@ -47,8 +109,11 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
         init_size_words = 32;
     }
 
+    pthread_mutex_lock(&_gc_mu);
+    _default_init_words = init_size_words;
     _heaps = new_heap(init_size_words);
     if (_heaps == NULL) {
+        pthread_mutex_unlock(&_gc_mu);
         fprintf(stderr, "GC initial heap allocation failed\n");
         abort();
     }
@@ -57,15 +122,136 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
     _free_list->size = _heaps->total_words;
     _free_list->next = NULL;
 
-    _root_start = (uintptr_t)stack_anchor;
     _global_roots_count = 0;
     _collections = 0;
+    _stw_in_progress = false;
+    __atomic_store_n(&__gs_gc_stw_requested, 0, __ATOMIC_RELEASE);
+
+    if (_tls_thread == NULL) {
+        gc_thread_t *main_thr = (gc_thread_t *)calloc(1, sizeof(gc_thread_t));
+        if (main_thr == NULL) {
+            pthread_mutex_unlock(&_gc_mu);
+            abort();
+        }
+        main_thr->root_start = (uintptr_t)stack_anchor;
+        main_thr->is_blocked_or_parked = false;
+        link_thread_locked(main_thr);
+        _tls_thread = main_thr;
+    } else {
+        _tls_thread->root_start = (uintptr_t)stack_anchor;
+        _tls_thread->is_blocked_or_parked = false;
+    }
+    pthread_mutex_unlock(&_gc_mu);
 }
 
 void gc_init(size_t init_size_words)
 {
     void *frame = __builtin_frame_address(0);
     gc_init_with_stack(init_size_words, frame);
+}
+
+void gc_thread_attach(void *stack_anchor)
+{
+    if (_tls_thread != NULL) {
+        return;
+    }
+    gc_thread_t *thr = (gc_thread_t *)calloc(1, sizeof(gc_thread_t));
+    if (thr == NULL) {
+        fprintf(stderr, "GC failed to allocate thread context\n");
+        abort();
+    }
+    thr->root_start = (uintptr_t)stack_anchor;
+    thr->is_blocked_or_parked = false;
+
+    pthread_mutex_lock(&_gc_mu);
+    while (_stw_in_progress) {
+        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+    }
+    link_thread_locked(thr);
+    _tls_thread = thr;
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+void gc_thread_detach(void)
+{
+    gc_thread_t *thr = _tls_thread;
+    if (thr == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&_gc_mu);
+    unlink_thread_locked(thr);
+    if (_stw_in_progress && all_threads_parked_locked()) {
+        pthread_cond_signal(&_stw_park_cv);
+    }
+    pthread_mutex_unlock(&_gc_mu);
+    _tls_thread = NULL;
+    free(thr);
+}
+
+__attribute__((noinline)) void gc_safepoint_slow(void)
+{
+    gc_thread_t *self = _tls_thread;
+    if (self == NULL) {
+        return;
+    }
+    if (__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_ACQUIRE) == 0) {
+        return;
+    }
+
+    jmp_buf regs;
+    _setjmp(regs);
+    volatile uintptr_t sp_marker = 0;
+
+    pthread_mutex_lock(&_gc_mu);
+    if (_stw_in_progress) {
+        memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
+        self->safepoint_sp = (uintptr_t)&sp_marker;
+        self->is_blocked_or_parked = true;
+        if (all_threads_parked_locked()) {
+            pthread_cond_signal(&_stw_park_cv);
+        }
+        while (_stw_in_progress) {
+            pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        }
+        self->is_blocked_or_parked = false;
+    }
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+void gc_enter_blocking(void *jmp_buf_on_stack)
+{
+    gc_thread_t *self = _tls_thread;
+    if (self == NULL) {
+        return;
+    }
+    volatile uintptr_t sp_here = 0;
+
+    pthread_mutex_lock(&_gc_mu);
+    if (jmp_buf_on_stack != NULL) {
+        memcpy(&self->safepoint_regs, jmp_buf_on_stack, sizeof(jmp_buf));
+        self->safepoint_sp = (uintptr_t)jmp_buf_on_stack;
+    } else {
+        self->safepoint_sp = (uintptr_t)&sp_here;
+    }
+    self->is_blocked_or_parked = true;
+    if (_stw_in_progress && all_threads_parked_locked()) {
+        pthread_cond_signal(&_stw_park_cv);
+    }
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+void gc_leave_blocking(void)
+{
+    gc_thread_t *self = _tls_thread;
+    if (self == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&_gc_mu);
+    while (_stw_in_progress) {
+        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+    }
+    self->is_blocked_or_parked = false;
+    pthread_mutex_unlock(&_gc_mu);
 }
 
 static gc_heap_t *new_heap(size_t max_size_words)
@@ -105,30 +291,56 @@ static gc_heap_t *new_heap(size_t max_size_words)
     return h;
 }
 
-void *gc_alloc(size_t size_bytes)
+__attribute__((noinline)) static void *gc_alloc_impl(size_t size_bytes, bool noscan)
 {
-    /* Minimum payload of 1 word so total block >= 2 words (sizeof(gc_free_t) / WORD_SIZE == 2) */
     size_t payload_words = (size_bytes + WORD_SIZE - 1) / WORD_SIZE;
     if (payload_words == 0) {
         payload_words = 1;
     }
     size_t total_words = payload_words + 1; /* +1 word for object header */
 
+    /* Spill registers before taking `_gc_mu` in case this allocation triggers or parks for STW */
+    jmp_buf regs;
+    _setjmp(regs);
+    volatile uintptr_t sp_marker = 0;
+
+    gc_thread_t *self = _tls_thread;
+
+    pthread_mutex_lock(&_gc_mu);
+    while (_stw_in_progress) {
+        if (self != NULL) {
+            memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
+            self->safepoint_sp = (uintptr_t)&sp_marker;
+            self->is_blocked_or_parked = true;
+            if (all_threads_parked_locked()) {
+                pthread_cond_signal(&_stw_park_cv);
+            }
+        }
+        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        if (self != NULL) {
+            self->is_blocked_or_parked = false;
+        }
+    }
+
     size_t actual_total_words = total_words;
     void *block = pickup_fragment(total_words, &actual_total_words);
     if (block == NULL) {
-        bitmap_collect();
+        if (self != NULL) {
+            memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
+            self->safepoint_sp = (uintptr_t)&sp_marker;
+        }
+        bitmap_collect_locked(self);
         block = pickup_fragment(total_words, &actual_total_words);
     }
 
-    /* If live reachable memory genuinely exceeds current arena(s), grow by adding a new arena */
     if (block == NULL) {
-        size_t grow_words = _heaps ? _heaps->total_words * 2 : 131072;
+        size_t grow_words = _heaps ? _heaps->total_words * 2 : _default_init_words;
         if (grow_words < total_words * 2) {
             grow_words = total_words * 2;
         }
         gc_heap_t *extra = new_heap(grow_words);
         if (extra == NULL) {
+            pthread_mutex_unlock(&_gc_mu);
             fprintf(stderr, "GC out of memory allocating %zu bytes\n", size_bytes);
             abort();
         }
@@ -142,6 +354,7 @@ void *gc_alloc(size_t size_bytes)
 
         block = pickup_fragment(total_words, &actual_total_words);
         if (block == NULL) {
+            pthread_mutex_unlock(&_gc_mu);
             fprintf(stderr, "GC internal fragmentation failure\n");
             abort();
         }
@@ -149,11 +362,9 @@ void *gc_alloc(size_t size_bytes)
 
     payload_words = actual_total_words - 1;
 
-    /* Initialize header word: `(payload_words << 1)` */
     header_t *hdr = (header_t *)block;
-    *hdr = ((header_t)payload_words) << 1;
+    *hdr = (((header_t)payload_words) << 1) | (noscan ? HEADER_NOSCAN_BIT : (header_t)0);
 
-    /* Find owning arena and set allocation bit at `hdr` */
     uintptr_t hdr_addr = (uintptr_t)hdr;
     for (gc_heap_t *h = _heaps; h != NULL; h = h->next) {
         if (hdr_addr >= h->base && hdr_addr < h->end) {
@@ -162,11 +373,22 @@ void *gc_alloc(size_t size_bytes)
             break;
         }
     }
+    pthread_mutex_unlock(&_gc_mu);
 
-    /* Zero-initialize payload so uninitialized padding words never masquerade as stale heap pointers */
+    /* Zero payload outside `_gc_mu`; safe because this thread cannot park at a safepoint before returning */
     void *payload = (void *)(hdr + 1);
     memset(payload, 0, payload_words * WORD_SIZE);
     return payload;
+}
+
+void *gc_alloc(size_t size_bytes)
+{
+    return gc_alloc_impl(size_bytes, false);
+}
+
+void *gc_alloc_atomic(size_t size_bytes)
+{
+    return gc_alloc_impl(size_bytes, true);
 }
 
 static void *pickup_fragment(size_t size_words, size_t *out_total_words)
@@ -177,7 +399,6 @@ static void *pickup_fragment(size_t size_words, size_t *out_total_words)
     while (cur != NULL) {
         if (cur->size >= size_words) {
             size_t rem = cur->size - size_words;
-            /* Only split if remainder can hold a `gc_free_t` (2 words); otherwise hand out the whole fragment */
             if (rem >= 2) {
                 gc_free_t *split = (gc_free_t *)((uintptr_t)cur + size_words * WORD_SIZE);
                 split->size = rem;
@@ -196,32 +417,83 @@ static void *pickup_fragment(size_t size_words, size_t *out_total_words)
     return NULL;
 }
 
-__attribute__((noinline)) static void bitmap_collect(void)
+bool gc_is_obj_marked(const void *payload_ptr)
 {
-    /* Spill callee-saved registers onto the stack so register-resident roots are scanned */
-    jmp_buf regs;
-    setjmp(regs);
+    uintptr_t addr = (uintptr_t)payload_ptr;
+    gc_heap_t *h = find_allocated_object_heap(addr);
+    if (h == NULL) {
+        return false;
+    }
+    uintptr_t hdr_addr = addr - Header_size;
+    uintptr_t off = hdr_addr - h->base;
+    return (h->mark_bits[OFFSET_TO_IDX(off)] & OFFSET_TO_MASK(off)) != 0;
+}
 
-    volatile uintptr_t sp_marker = 0;
-    uintptr_t sp = (uintptr_t)&sp_marker;
-    uintptr_t root_anchor = _root_start;
+bool gc_mark_ptr(const void *payload_ptr)
+{
+    uintptr_t addr = (uintptr_t)payload_ptr;
+    gc_heap_t *h = find_allocated_object_heap(addr);
+    if (h == NULL) {
+        return false;
+    }
+    return bitmap_mark_obj(h, addr - Header_size);
+}
 
-    uintptr_t lo = (sp < root_anchor) ? sp : root_anchor;
-    uintptr_t hi = (sp < root_anchor) ? root_anchor : sp;
+static void bitmap_collect_locked(gc_thread_t *collector)
+{
+    _stw_in_progress = true;
+    __atomic_store_n(&__gs_gc_stw_requested, 1, __ATOMIC_RELEASE);
 
-    /* Scan jmp_buf words explicitly as well */
-    const uintptr_t *reg_words = (const uintptr_t *)&regs;
-    size_t reg_count = sizeof(jmp_buf) / (sizeof(uintptr_t));
-    for (size_t i = 0; i < reg_count; i++) {
-        gc_heap_t *h = find_allocated_object_heap(reg_words[i]);
-        if (h != NULL) {
-            bitmap_mark_obj(h, reg_words[i] - Header_size);
+    if (collector != NULL) {
+        collector->is_blocked_or_parked = true;
+    }
+
+    while (!all_threads_parked_locked()) {
+        pthread_cond_wait(&_stw_park_cv, &_gc_mu);
+    }
+
+    /* 1. Mark roots across all registered threads (saved registers + stack ranges) */
+    for (gc_thread_t *t = _threads_head; t != NULL; t = t->next) {
+        const uintptr_t *reg_words = (const uintptr_t *)&t->safepoint_regs;
+        size_t reg_count = sizeof(jmp_buf) / sizeof(uintptr_t);
+        for (size_t i = 0; i < reg_count; i++) {
+            gc_heap_t *h = find_allocated_object_heap(reg_words[i]);
+            if (h != NULL) {
+                bitmap_mark_obj(h, reg_words[i] - Header_size);
+            }
+        }
+        if (t->safepoint_sp != 0 && t->root_start != 0) {
+            uintptr_t lo = (t->safepoint_sp < t->root_start) ? t->safepoint_sp : t->root_start;
+            uintptr_t hi = (t->safepoint_sp < t->root_start) ? t->root_start : t->safepoint_sp;
+            bitmap_mark_stack_range(lo, hi);
         }
     }
 
-    bitmap_mark_roots(lo, hi);
+    /* 2. Mark registered global value slots */
+    for (size_t i = 0; i < _global_roots_count; i++) {
+        uintptr_t candidate = (uintptr_t)(*_global_roots[i]);
+        gc_heap_t *h = find_allocated_object_heap(candidate);
+        if (h != NULL) {
+            bitmap_mark_obj(h, candidate - Header_size);
+        }
+    }
+
+    /* 3. Trace values held inside active/reachable Tasks, Channels, MVars, and Actors to a fixed point */
+    gs_conc_mark_roots();
+
+    /* 4. Reclaim unreachable synchronization handles BEFORE `mark_bits` are cleared by `bitmap_sweep` */
+    gs_conc_sweep_unreachable();
+
+    /* 5. Sweep heap arenas and coalesce free fragments */
     bitmap_sweep();
     _collections++;
+
+    if (collector != NULL) {
+        collector->is_blocked_or_parked = false;
+    }
+    __atomic_store_n(&__gs_gc_stw_requested, 0, __ATOMIC_RELEASE);
+    _stw_in_progress = false;
+    pthread_cond_broadcast(&_stw_resume_cv);
 }
 
 static gc_heap_t *find_allocated_object_heap(uintptr_t payload_ptr)
@@ -241,9 +513,8 @@ static gc_heap_t *find_allocated_object_heap(uintptr_t payload_ptr)
     return NULL;
 }
 
-static void bitmap_mark_roots(uintptr_t sp_low, uintptr_t sp_high)
+static void bitmap_mark_stack_range(uintptr_t sp_low, uintptr_t sp_high)
 {
-    /* 1. Scan C/LLVM call stack regardless of growth direction */
     uintptr_t cur = sp_low & ~(uintptr_t)(WORD_SIZE - 1);
     for (; cur <= sp_high; cur += WORD_SIZE) {
         uintptr_t candidate = *(const uintptr_t *)cur;
@@ -252,31 +523,26 @@ static void bitmap_mark_roots(uintptr_t sp_low, uintptr_t sp_high)
             bitmap_mark_obj(h, candidate - Header_size);
         }
     }
-
-    /* 2. Scan registered global value roots */
-    for (size_t i = 0; i < _global_roots_count; i++) {
-        uintptr_t candidate = (uintptr_t)(*_global_roots[i]);
-        gc_heap_t *h = find_allocated_object_heap(candidate);
-        if (h != NULL) {
-            bitmap_mark_obj(h, candidate - Header_size);
-        }
-    }
 }
 
-static void bitmap_mark_obj(gc_heap_t *heap, uintptr_t hdr_addr)
+static bool bitmap_mark_obj(gc_heap_t *heap, uintptr_t hdr_addr)
 {
     uintptr_t off = hdr_addr - heap->base;
     size_t idx = OFFSET_TO_IDX(off);
     bitmap_t mask = OFFSET_TO_MASK(off);
 
-    /* Already marked? Stop immediately to handle cycles and shared DAGs */
     if (heap->mark_bits[idx] & mask) {
-        return;
+        return false;
     }
     heap->mark_bits[idx] |= mask;
 
     header_t hdr_val = *(const header_t *)hdr_addr;
-    size_t payload_words = (size_t)(hdr_val >> 1);
+    /* Skip interior word scanning for `NOSCAN` leaf allocations (`String`, scalar `MutArray`, `AtomicInt`)! */
+    if (Is_noscan_hdr(hdr_val)) {
+        return true;
+    }
+
+    size_t payload_words = Get_payload_words_hdr(hdr_val);
     const uintptr_t *fields = (const uintptr_t *)(hdr_addr + Header_size);
 
     for (size_t i = 0; i < payload_words; i++) {
@@ -286,6 +552,7 @@ static void bitmap_mark_obj(gc_heap_t *heap, uintptr_t hdr_addr)
             bitmap_mark_obj(child_heap, field_val - Header_size);
         }
     }
+    return true;
 }
 
 static void bitmap_sweep(void)
@@ -305,10 +572,9 @@ static void bitmap_sweep(void)
 
             if (h->alloc_bits[idx] & mask) {
                 header_t hdr_val = *(const header_t *)cur;
-                size_t obj_total_words = (size_t)(hdr_val >> 1) + 1;
+                size_t obj_total_words = Get_payload_words_hdr(hdr_val) + 1;
 
                 if (h->mark_bits[idx] & mask) {
-                    /* Live object: flush any preceding coalesced free run >= 2 words */
                     if (free_words >= 2) {
                         gc_free_t *frag = (gc_free_t *)free_start;
                         frag->size = free_words;
@@ -322,7 +588,6 @@ static void bitmap_sweep(void)
                     }
                     free_words = 0;
                 } else {
-                    /* Dead object: clear allocation bit and merge into free run */
                     h->alloc_bits[idx] &= ~mask;
                     if (free_words == 0) {
                         free_start = cur;

@@ -101,6 +101,34 @@ pub fn load_prelude<'a, 'b: 'a>(interner: &mut Interner, env: &'b TypeEnv) -> Ty
         ("ptrToString", "Ptr -> String"),
         ("sysArgc", "() -> Int"),
         ("sysArgv", "Int -> String"),
+        // Concurrency runtime intrinsics (wrapped by `std.sync`, `std.task`, `std.actor`)
+        ("__concAtomicNew", "Int -> AtomicInt"),
+        ("__concAtomicLoad", "AtomicInt -> Int"),
+        ("__concAtomicStore", "(AtomicInt, Int) -> Void"),
+        ("__concAtomicAdd", "(AtomicInt, Int) -> Int"),
+        ("__concAtomicCas", "(AtomicInt, Int, Int) -> Bool"),
+        ("__concMVarNew", "forall a. (Send a) => a -> MVar a"),
+        ("__concMVarEmpty", "forall a. (Send a) => () -> MVar a"),
+        ("__concMVarTake", "forall a. (Send a) => MVar a -> a"),
+        ("__concMVarPut", "forall a. (Send a) => (MVar a, a) -> Void"),
+        ("__concMVarRead", "forall a. (Send a) => MVar a -> a"),
+        ("__concMVarTryTake", "forall a. (Send a) => MVar a -> (Bool, a)"),
+        ("__concChanNew", "forall a. (Send a) => Int -> Chan a"),
+        ("__concChanSend", "forall a. (Send a) => (Chan a, a) -> Bool"),
+        ("__concChanRecv", "forall a. (Send a) => Chan a -> (Bool, a)"),
+        ("__concChanTryRecv", "forall a. (Send a) => Chan a -> (Bool, a)"),
+        ("__concChanClose", "forall a. Chan a -> Void"),
+        ("__concChanIsClosed", "forall a. Chan a -> Bool"),
+        ("__concTaskSpawn", "forall a. (Send a) => (() -> a) -> Task a"),
+        ("__concTaskAwait", "forall a. (Send a) => Task a -> a"),
+        ("__concTaskIsReady", "forall a. Task a -> Bool"),
+        ("__concTaskWaitAny", "forall a. (MutArray (Task a), Int, Int) -> Void"),
+        ("__concNumCpu", "() -> Int"),
+        ("__concSleepMs", "Int -> Void"),
+        ("__concActorSpawn", "forall s. (() -> s) -> Actor s"),
+        ("__concActorCall", "forall s r. (Send r) => (Actor s, s -> r) -> Task r"),
+        ("__concActorSend", "forall s. (Actor s, s -> Void) -> Void"),
+        ("__concActorStop", "forall s. Actor s -> Void"),
     ];
     let mut v = Vec::with_capacity(builtins.len());
     for (name, sig) in builtins {
@@ -315,6 +343,27 @@ fn compile_loaded_modules(
         module_ctor_renames.insert(m_key.clone(), ctor_renames);
     }
 
+    // Export built-in concurrent handle types from their canonical `std.*` modules as well
+    for (mod_name, builtin_tys) in [
+        ("std.sync", &["AtomicInt", "MVar", "Chan"][..]),
+        ("std.task", &["Task"][..]),
+        ("std.actor", &["Actor"][..]),
+    ] {
+        if known_keys.contains(mod_name) {
+            for &ty_name in builtin_tys {
+                let raw_id = interner.borrow_mut().intern(ty_name);
+                available_names.insert(
+                    format!("{}.{}", mod_name, ty_name),
+                    NameInfo {
+                        qualified_id: raw_id,
+                        is_public: true,
+                        defined_in_module: mod_name.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
     // 3. Resolve imports per module in topological order (supporting `pub use` re-exports!)
     //    and rewrite each module's AST into the unified qualified namespace.
     let mut all_defs: Vec<Def> = Vec::new();
@@ -498,7 +547,7 @@ fn compile_loaded_modules(
         let mut infer = Infer::new(&mut inter);
         infer
             .infer_defs(&prelude, &mut all_defs)
-            .map_err(|te| CompileError::TypeError(te, single_source))?;
+            .map_err(|te| CompileError::TypeError(te, single_source.clone()))?;
         (
             infer.adt_registry,
             infer.concept_registry,
@@ -519,6 +568,10 @@ fn compile_loaded_modules(
         instantiation_registry,
         HashMap::new(),
     );
+
+    // 5b. Verify that closures passed across threads/actors only capture `Send` values & globals
+    verify_concurrent_closures(&k_out, &inter, &adt_registry)
+        .map_err(|te| CompileError::TypeError(te, single_source))?;
 
     // 6. Fixed-point escape analysis
     let escape_info = crate::core::escape::analyze_all(&k_out.functions, &adt_registry, 128);
@@ -550,6 +603,474 @@ fn compile_loaded_modules(
     }
 
     Ok(emitter.generator)
+}
+
+/// Interprocedural fixed-point verification that closures passed to `spawn` / `par*` / `Actor`
+/// do not capture `!Send` local variables (`Cell`, `MutArray`, `Ptr`, `Vec`, etc.) or reference `!Send` globals.
+fn verify_concurrent_closures(
+    k_out: &KOutput,
+    interner: &Interner,
+    adt_registry: &AdtRegistry,
+) -> Result<(), TypeError> {
+    fn intrinsic_send_closure_arg(callee_name: &str) -> Option<usize> {
+        match callee_name {
+            "__concTaskSpawn" | "__concActorSpawn" => Some(0),
+            "__concActorCall" | "__concActorSend" => Some(1),
+            _ => None,
+        }
+    }
+
+    fn collect_local_closures_and_aliases(
+        term: &TaggedTerm,
+        closures: &mut HashMap<Id, Closure>,
+        aliases: &mut HashMap<Id, Id>,
+    ) {
+        match term.body() {
+            Term::MakeCls(VarDecl(vid, _), cls, body) => {
+                closures.insert(*vid, (**cls).clone());
+                collect_local_closures_and_aliases(body, closures, aliases);
+            }
+            Term::Let(VarDecl(vid, _), val, body) => {
+                if let Term::Var(rhs_id) = val.body() {
+                    aliases.insert(*vid, *rhs_id);
+                }
+                collect_local_closures_and_aliases(val, closures, aliases);
+                collect_local_closures_and_aliases(body, closures, aliases);
+            }
+            Term::Tuple(es) | Term::Block(es) => {
+                for e in es {
+                    collect_local_closures_and_aliases(e, closures, aliases);
+                }
+            }
+            Term::ApplyDir(_, args) => {
+                for a in args {
+                    collect_local_closures_and_aliases(a, closures, aliases);
+                }
+            }
+            Term::ApplyCls(c, args) => {
+                collect_local_closures_and_aliases(c, closures, aliases);
+                for a in args {
+                    collect_local_closures_and_aliases(a, closures, aliases);
+                }
+            }
+            Term::Binary(_, l, r) => {
+                collect_local_closures_and_aliases(l, closures, aliases);
+                collect_local_closures_and_aliases(r, closures, aliases);
+            }
+            Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
+                collect_local_closures_and_aliases(e, closures, aliases);
+            }
+            Term::If(c, t, f) => {
+                collect_local_closures_and_aliases(c, closures, aliases);
+                collect_local_closures_and_aliases(t, closures, aliases);
+                collect_local_closures_and_aliases(f, closures, aliases);
+            }
+            Term::While(c, b) => {
+                collect_local_closures_and_aliases(c, closures, aliases);
+                collect_local_closures_and_aliases(b, closures, aliases);
+            }
+            Term::Match(s, arms) => {
+                collect_local_closures_and_aliases(s, closures, aliases);
+                for (_, g, b) in arms {
+                    if let Some(gt) = g {
+                        collect_local_closures_and_aliases(gt, closures, aliases);
+                    }
+                    collect_local_closures_and_aliases(b, closures, aliases);
+                }
+            }
+            Term::MakeData { fields, .. } => {
+                for f in fields {
+                    collect_local_closures_and_aliases(f, closures, aliases);
+                }
+            }
+            Term::Lit(_) | Term::Var(_) | Term::GlobalVar(_) => {}
+        }
+    }
+
+    fn resolve_alias(mut id: Id, aliases: &HashMap<Id, Id>) -> Id {
+        let mut hops = 0;
+        while let Some(&next) = aliases.get(&id) {
+            if next == id || hops > 32 {
+                break;
+            }
+            id = next;
+            hops += 1;
+        }
+        id
+    }
+
+    #[derive(Clone)]
+    enum ResolvedClosureRef {
+        KnownClosure(Closure),
+        ParamIdx(usize),
+        Opaque(Type),
+    }
+
+    fn resolve_closure_arg(
+        term: &TaggedTerm,
+        param_map: &HashMap<Id, usize>,
+        local_closures: &HashMap<Id, Closure>,
+        aliases: &HashMap<Id, Id>,
+    ) -> ResolvedClosureRef {
+        match term.body() {
+            Term::MakeCls(VarDecl(vid, _), cls, body) => {
+                if let Term::Var(ret_id) = body.body() {
+                    if ret_id == vid {
+                        return ResolvedClosureRef::KnownClosure((**cls).clone());
+                    }
+                }
+                resolve_closure_arg(body, param_map, local_closures, aliases)
+            }
+            Term::Let(_, _, body) => resolve_closure_arg(body, param_map, local_closures, aliases),
+            Term::Block(es) if !es.is_empty() => {
+                resolve_closure_arg(es.last().unwrap(), param_map, local_closures, aliases)
+            }
+            Term::Var(id) => {
+                let root = resolve_alias(*id, aliases);
+                if let Some(&pidx) = param_map.get(&root) {
+                    ResolvedClosureRef::ParamIdx(pidx)
+                } else if let Some(cls) = local_closures.get(&root) {
+                    ResolvedClosureRef::KnownClosure(cls.clone())
+                } else {
+                    ResolvedClosureRef::Opaque(term.ref_scheme().body().clone())
+                }
+            }
+            _ => ResolvedClosureRef::Opaque(term.ref_scheme().body().clone()),
+        }
+    }
+
+    fn find_sink_args_in_term<'a>(
+        term: &'a TaggedTerm,
+        interner: &Interner,
+        req_send_params: &HashMap<Id, HashSet<usize>>,
+        out: &mut Vec<&'a TaggedTerm>,
+    ) {
+        match term.body() {
+            Term::ApplyDir(VarDecl(callee_id, _), args) => {
+                let cname = interner.trace(*callee_id);
+                if let Some(idx) = intrinsic_send_closure_arg(cname) {
+                    if idx < args.len() {
+                        out.push(&args[idx]);
+                    }
+                }
+                if let Some(indices) = req_send_params.get(callee_id) {
+                    for &idx in indices {
+                        if idx < args.len() {
+                            out.push(&args[idx]);
+                        }
+                    }
+                }
+                for a in args {
+                    find_sink_args_in_term(a, interner, req_send_params, out);
+                }
+            }
+            Term::ApplyCls(c, args) => {
+                find_sink_args_in_term(c, interner, req_send_params, out);
+                for a in args {
+                    find_sink_args_in_term(a, interner, req_send_params, out);
+                }
+            }
+            Term::MakeCls(_, _, body) => {
+                find_sink_args_in_term(body, interner, req_send_params, out);
+            }
+            Term::Let(_, val, body) => {
+                find_sink_args_in_term(val, interner, req_send_params, out);
+                find_sink_args_in_term(body, interner, req_send_params, out);
+            }
+            Term::Tuple(es) | Term::Block(es) => {
+                for e in es {
+                    find_sink_args_in_term(e, interner, req_send_params, out);
+                }
+            }
+            Term::Binary(_, l, r) => {
+                find_sink_args_in_term(l, interner, req_send_params, out);
+                find_sink_args_in_term(r, interner, req_send_params, out);
+            }
+            Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
+                find_sink_args_in_term(e, interner, req_send_params, out);
+            }
+            Term::If(c, t, f) => {
+                find_sink_args_in_term(c, interner, req_send_params, out);
+                find_sink_args_in_term(t, interner, req_send_params, out);
+                find_sink_args_in_term(f, interner, req_send_params, out);
+            }
+            Term::While(c, b) => {
+                find_sink_args_in_term(c, interner, req_send_params, out);
+                find_sink_args_in_term(b, interner, req_send_params, out);
+            }
+            Term::Match(s, arms) => {
+                find_sink_args_in_term(s, interner, req_send_params, out);
+                for (_, g, b) in arms {
+                    if let Some(gt) = g {
+                        find_sink_args_in_term(gt, interner, req_send_params, out);
+                    }
+                    find_sink_args_in_term(b, interner, req_send_params, out);
+                }
+            }
+            Term::MakeData { fields, .. } => {
+                for f in fields {
+                    find_sink_args_in_term(f, interner, req_send_params, out);
+                }
+            }
+            Term::Lit(_) | Term::Var(_) | Term::GlobalVar(_) => {}
+        }
+    }
+
+    // Precompute per-function local closure maps, alias maps, and parameter index maps
+    let mut fn_local_closures: HashMap<Id, HashMap<Id, Closure>> = HashMap::new();
+    let mut fn_aliases: HashMap<Id, HashMap<Id, Id>> = HashMap::new();
+    let mut fn_param_maps: HashMap<Id, HashMap<Id, usize>> = HashMap::new();
+
+    for (&fid, fdef) in &k_out.functions {
+        let mut closures = HashMap::new();
+        let mut aliases = HashMap::new();
+        collect_local_closures_and_aliases(fdef.body(), &mut closures, &mut aliases);
+        let pmap: HashMap<Id, usize> = fdef
+            .parameters()
+            .iter()
+            .enumerate()
+            .map(|(i, VarDecl(pid, _))| (*pid, i))
+            .collect();
+        fn_local_closures.insert(fid, closures);
+        fn_aliases.insert(fid, aliases);
+        fn_param_maps.insert(fid, pmap);
+    }
+
+    // 1. Fixed-point propagation of `RequiresSendClosure` across higher-order parameters
+    let mut req_send_params: HashMap<Id, HashSet<usize>> = HashMap::new();
+    let mut changed = true;
+    let mut iter = 0;
+    while changed && iter < 64 {
+        changed = false;
+        iter += 1;
+        for (&fid, fdef) in &k_out.functions {
+            let mut sink_args = Vec::new();
+            find_sink_args_in_term(fdef.body(), interner, &req_send_params, &mut sink_args);
+            let pmap = &fn_param_maps[&fid];
+            let lcls = &fn_local_closures[&fid];
+            let aliases = &fn_aliases[&fid];
+
+            let mut cls_worklist: Vec<Closure> = Vec::new();
+            for arg in sink_args {
+                match resolve_closure_arg(arg, pmap, lcls, aliases) {
+                    ResolvedClosureRef::ParamIdx(pidx) => {
+                        if req_send_params.entry(fid).or_default().insert(pidx) {
+                            changed = true;
+                        }
+                    }
+                    ResolvedClosureRef::KnownClosure(cls) => cls_worklist.push(cls),
+                    ResolvedClosureRef::Opaque(_) => {}
+                }
+            }
+
+            let mut seen_entries = HashSet::new();
+            while let Some(cls) = cls_worklist.pop() {
+                if !seen_entries.insert(cls.entry()) {
+                    continue;
+                }
+                for fv_id in cls.fv() {
+                    let root = resolve_alias(fv_id, aliases);
+                    if let Some(&pidx) = pmap.get(&root) {
+                        let p_ty = fdef.parameters()[pidx].1.body();
+                        if matches!(p_ty, Type::Arr(..)) {
+                            if req_send_params.entry(fid).or_default().insert(pidx) {
+                                changed = true;
+                            }
+                        }
+                    } else if let Some(nested_cls) = lcls.get(&root) {
+                        cls_worklist.push(nested_cls.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Validate all closures flowing into `SendClosure` sinks (both in functions and top-level global inits)
+    let global_types: HashMap<Id, Type> = k_out
+        .globals
+        .iter()
+        .map(|g| (g.name, g.ty.clone()))
+        .collect();
+
+    let mut verified_send_entries: HashSet<Id> = HashSet::new();
+
+    for (&fid, fdef) in &k_out.functions {
+        let mut sink_args = Vec::new();
+        find_sink_args_in_term(fdef.body(), interner, &req_send_params, &mut sink_args);
+        let pmap = &fn_param_maps[&fid];
+        let lcls = &fn_local_closures[&fid];
+        let aliases = &fn_aliases[&fid];
+        let allowed_fn_params = req_send_params.get(&fid);
+
+        let mut cls_worklist: Vec<Closure> = Vec::new();
+        for arg in sink_args {
+            match resolve_closure_arg(arg, pmap, lcls, aliases) {
+                ResolvedClosureRef::ParamIdx(_) => {}
+                ResolvedClosureRef::KnownClosure(cls) => cls_worklist.push(cls),
+                ResolvedClosureRef::Opaque(ty) => {
+                    return Err(TypeError::NoInstance {
+                        concept: "Send".to_string(),
+                        ty,
+                        span: Span::default(),
+                    });
+                }
+            }
+        }
+
+        let mut seen_local = HashSet::new();
+        while let Some(cls) = cls_worklist.pop() {
+            if !seen_local.insert(cls.entry()) {
+                continue;
+            }
+            verified_send_entries.insert(cls.entry());
+            let Some(entry_def) = k_out.functions.get(&cls.entry()) else {
+                continue;
+            };
+            for (actual_id, VarDecl(_, formal_scm)) in cls.fv().into_iter().zip(entry_def.fv().iter())
+            {
+                let root = resolve_alias(actual_id, aliases);
+                if let Some(&pidx) = pmap.get(&root) {
+                    if allowed_fn_params.map_or(false, |s| s.contains(&pidx)) {
+                        continue;
+                    }
+                }
+                if let Some(nested_cls) = lcls.get(&root) {
+                    cls_worklist.push(nested_cls.clone());
+                    continue;
+                }
+                let fv_ty = formal_scm.body();
+                if !Infer::is_concrete_type_send(fv_ty, adt_registry) {
+                    return Err(TypeError::NoInstance {
+                        concept: "Send".to_string(),
+                        ty: fv_ty.clone(),
+                        span: Span::default(),
+                    });
+                }
+            }
+        }
+    }
+
+    // 3. Ensure no spawned closure transitively reads a `!Send` top-level global (`def g = cellNew(0)`)
+    fn check_globals_in_term(
+        term: &TaggedTerm,
+        k_out: &KOutput,
+        global_types: &HashMap<Id, Type>,
+        adt_registry: &AdtRegistry,
+        visited_fns: &mut HashSet<Id>,
+    ) -> Result<(), TypeError> {
+        match term.body() {
+            Term::Var(id) | Term::GlobalVar(id) => {
+                if let Some(gty) = global_types.get(id) {
+                    if !Infer::is_concrete_type_send(gty, adt_registry) {
+                        return Err(TypeError::NoInstance {
+                            concept: "Send".to_string(),
+                            ty: gty.clone(),
+                            span: Span::default(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            Term::MakeCls(_, cls, body) => {
+                if visited_fns.insert(cls.entry()) {
+                    if let Some(edef) = k_out.functions.get(&cls.entry()) {
+                        check_globals_in_term(
+                            edef.body(),
+                            k_out,
+                            global_types,
+                            adt_registry,
+                            visited_fns,
+                        )?;
+                    }
+                }
+                check_globals_in_term(body, k_out, global_types, adt_registry, visited_fns)
+            }
+            Term::ApplyDir(VarDecl(callee_id, _), args) => {
+                if visited_fns.insert(*callee_id) {
+                    if let Some(cdef) = k_out.functions.get(callee_id) {
+                        check_globals_in_term(
+                            cdef.body(),
+                            k_out,
+                            global_types,
+                            adt_registry,
+                            visited_fns,
+                        )?;
+                    }
+                }
+                for a in args {
+                    check_globals_in_term(a, k_out, global_types, adt_registry, visited_fns)?;
+                }
+                Ok(())
+            }
+            Term::ApplyCls(c, args) => {
+                check_globals_in_term(c, k_out, global_types, adt_registry, visited_fns)?;
+                for a in args {
+                    check_globals_in_term(a, k_out, global_types, adt_registry, visited_fns)?;
+                }
+                Ok(())
+            }
+            Term::Let(_, v, b) => {
+                check_globals_in_term(v, k_out, global_types, adt_registry, visited_fns)?;
+                check_globals_in_term(b, k_out, global_types, adt_registry, visited_fns)
+            }
+            Term::Tuple(es) | Term::Block(es) => {
+                for e in es {
+                    check_globals_in_term(e, k_out, global_types, adt_registry, visited_fns)?;
+                }
+                Ok(())
+            }
+            Term::Binary(_, l, r) => {
+                check_globals_in_term(l, k_out, global_types, adt_registry, visited_fns)?;
+                check_globals_in_term(r, k_out, global_types, adt_registry, visited_fns)
+            }
+            Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
+                check_globals_in_term(e, k_out, global_types, adt_registry, visited_fns)
+            }
+            Term::If(c, t, f) => {
+                check_globals_in_term(c, k_out, global_types, adt_registry, visited_fns)?;
+                check_globals_in_term(t, k_out, global_types, adt_registry, visited_fns)?;
+                check_globals_in_term(f, k_out, global_types, adt_registry, visited_fns)
+            }
+            Term::While(c, b) => {
+                check_globals_in_term(c, k_out, global_types, adt_registry, visited_fns)?;
+                check_globals_in_term(b, k_out, global_types, adt_registry, visited_fns)
+            }
+            Term::Match(s, arms) => {
+                check_globals_in_term(s, k_out, global_types, adt_registry, visited_fns)?;
+                for (_, g, b) in arms {
+                    if let Some(gt) = g {
+                        check_globals_in_term(gt, k_out, global_types, adt_registry, visited_fns)?;
+                    }
+                    check_globals_in_term(b, k_out, global_types, adt_registry, visited_fns)?;
+                }
+                Ok(())
+            }
+            Term::MakeData { fields, .. } => {
+                for f in fields {
+                    check_globals_in_term(f, k_out, global_types, adt_registry, visited_fns)?;
+                }
+                Ok(())
+            }
+            Term::Lit(_) => Ok(()),
+        }
+    }
+
+    let mut visited_fns = HashSet::new();
+    for entry_id in verified_send_entries {
+        if visited_fns.insert(entry_id) {
+            if let Some(edef) = k_out.functions.get(&entry_id) {
+                check_globals_in_term(
+                    edef.body(),
+                    k_out,
+                    &global_types,
+                    adt_registry,
+                    &mut visited_fns,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 struct ModuleAstRewriter<'a> {

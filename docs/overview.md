@@ -72,6 +72,7 @@ def main() = if (allEqual(7, 7, 7)) putNumber(42) else putNumber(0)
 - [Concepts](specs/concepts.md)
 - [Operators](specs/operators.md)
 - [Modules](specs/modules.md)
+- [Concurrency Model](specs/concurrency.md)
 
 ### Runtime & Compiler Internals
 - [Compilation Pipeline](runtime/compilation.md)

@@ -216,6 +216,14 @@ impl LLVMModule {
         }
     }
 
+    pub fn add_external_global(&self, ty: &LLVMType, name: &str) -> LLVMValue {
+        let cname = to_cstring(name);
+        unsafe {
+            let g = LLVMAddGlobal(self.raw_ptr(), ty.raw_ptr(), cname.as_ptr());
+            LLVMValue::from_ref(g)
+        }
+    }
+
     pub fn get_global(&self, name: &str) -> Option<LLVMValue> {
         let cname = to_cstring(name);
         unsafe {
@@ -364,6 +372,22 @@ impl LLVMBuilder {
                 ptr.raw_ptr(),
                 c.as_ptr(),
             ))
+        }
+    }
+
+    /// Relaxed (`monotonic`) 4-byte aligned atomic load for fast safepoint flag polling.
+    pub fn load_atomic_monotonic_i32(&self, elem_ty: &LLVMType, ptr: &LLVMValue, dest: &str) -> LLVMValue {
+        let c = to_cstring(dest);
+        unsafe {
+            let inst = LLVMBuildLoad2(
+                self.raw_ptr(),
+                elem_ty.raw_ptr(),
+                ptr.raw_ptr(),
+                c.as_ptr(),
+            );
+            LLVMSetOrdering(inst, llvm_sys::LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic);
+            LLVMSetAlignment(inst, 4);
+            LLVMValue::from_ref(inst)
         }
     }
 

@@ -20,7 +20,7 @@ pub fn is_primitive_type(t: &Type) -> bool {
     match t {
         Type::Con(n) => matches!(
             n.as_str(),
-            "Int" | "Float" | "Char" | "String" | "Void" | "Bool"
+            "Int" | "Int64" | "Float" | "Char" | "String" | "Void" | "Bool" | "Ptr" | "AtomicInt"
         ),
         Type::Void | Type::Var(_) => true,
         _ => false,
@@ -31,22 +31,67 @@ pub fn is_adt_type(t: &Type) -> bool {
     match t {
         Type::Con(n) => !matches!(
             n.as_str(),
-            "Int" | "Float" | "Char" | "String" | "Void" | "Bool"
+            "Int"
+                | "Int64"
+                | "Float"
+                | "Char"
+                | "String"
+                | "Void"
+                | "Bool"
+                | "Ptr"
+                | "AtomicInt"
         ),
         Type::Comp(_, _) => {
             let base = get_comp_base_name_static(t);
             !matches!(
                 base.as_str(),
-                "Int" | "Float" | "Char" | "String" | "Void" | "Bool"
+                "Int"
+                    | "Int64"
+                    | "Float"
+                    | "Char"
+                    | "String"
+                    | "Void"
+                    | "Bool"
+                    | "Ptr"
+                    | "Cell"
+                    | "MutArray"
+                    | "MVar"
+                    | "Chan"
+                    | "Task"
+                    | "Actor"
             )
         }
         _ => false,
     }
 }
 
-/// Whether a value of type `t` can hold a GC heap pointer (used to register global GC roots)
+/// Whether an element type contains zero interior GC heap pointers (eligible for `gc_alloc_atomic` `NOSCAN`).
+pub fn is_noscan_elem_type(t: &Type) -> bool {
+    match t {
+        Type::Void => true,
+        Type::Con(n) => matches!(
+            n.as_str(),
+            "Int" | "Int64" | "Float" | "Char" | "Bool" | "Void" | "Ptr"
+        ),
+        Type::Tuple(elems) => elems.iter().all(is_noscan_elem_type),
+        _ => false,
+    }
+}
+
+/// Whether a global variable slot of type `t` holds a single GC heap pointer (`void*`)
 pub fn is_gc_pointer_type(t: &Type) -> bool {
-    matches!(t, Type::Arr(..)) || is_adt_type(t)
+    match t {
+        Type::Arr(..) => true,
+        Type::Con(n) => matches!(n.as_str(), "String" | "AtomicInt") || is_adt_type(t),
+        Type::Comp(..) => {
+            let base = get_comp_base_name_static(t);
+            matches!(
+                base.as_str(),
+                "Cell" | "MutArray" | "MVar" | "Chan" | "Task" | "Actor"
+            ) || is_adt_type(t)
+        }
+        _ => false,
+    }
 }
 
 fn get_comp_base_name_static(ty: &Type) -> String {
@@ -403,6 +448,76 @@ impl LLVMCodegen {
         let ptr_ty = self.context.get_ptr_type();
         let fn_ty = LLVMContext::get_function_type(&ptr_ty, &[size_ty], false);
         self.module.add_function("gc_alloc", &fn_ty)
+    }
+
+    pub fn declare_gc_alloc_atomic(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("gc_alloc_atomic") {
+            return f;
+        }
+        let size_ty = self.context.get_int64_type();
+        let ptr_ty = self.context.get_ptr_type();
+        let fn_ty = LLVMContext::get_function_type(&ptr_ty, &[size_ty], false);
+        self.module.add_function("gc_alloc_atomic", &fn_ty)
+    }
+
+    pub fn declare_gc_stw_requested_global(&self) -> LLVMValue {
+        if let Some(g) = self.module.get_global("__gs_gc_stw_requested") {
+            return g;
+        }
+        let i32_ty = self.context.get_int32_type();
+        self.module
+            .add_external_global(&i32_ty, "__gs_gc_stw_requested")
+    }
+
+    pub fn declare_gc_safepoint_slow(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("gc_safepoint_slow") {
+            return f;
+        }
+        let void_ty = self.context.get_void_type();
+        let fn_ty = LLVMContext::get_function_type(&void_ty, &[], false);
+        self.module.add_function("gc_safepoint_slow", &fn_ty)
+    }
+
+    pub fn declare_posix_setjmp(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("_setjmp") {
+            return f;
+        }
+        let i32_ty = self.context.get_int32_type();
+        let ptr_ty = self.context.get_ptr_type();
+        let fn_ty = LLVMContext::get_function_type(&i32_ty, &[ptr_ty], false);
+        self.module.add_function("_setjmp", &fn_ty)
+    }
+
+    pub fn declare_gc_enter_blocking(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("gc_enter_blocking") {
+            return f;
+        }
+        let void_ty = self.context.get_void_type();
+        let ptr_ty = self.context.get_ptr_type();
+        let fn_ty = LLVMContext::get_function_type(&void_ty, &[ptr_ty], false);
+        self.module.add_function("gc_enter_blocking", &fn_ty)
+    }
+
+    pub fn declare_gc_leave_blocking(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("gc_leave_blocking") {
+            return f;
+        }
+        let void_ty = self.context.get_void_type();
+        let fn_ty = LLVMContext::get_function_type(&void_ty, &[], false);
+        self.module.add_function("gc_leave_blocking", &fn_ty)
+    }
+
+    pub fn declare_c_runtime_fn(
+        &self,
+        sym: &str,
+        ret_ty: &LLVMType,
+        param_tys: &[LLVMType],
+    ) -> LLVMFunction {
+        if let Some(f) = self.module.get_function(sym) {
+            return f;
+        }
+        let fn_ty = LLVMContext::get_function_type(ret_ty, param_tys, false);
+        self.module.add_function(sym, &fn_ty)
     }
 
     pub fn declare_gs_str_cmp(&self) -> LLVMFunction {

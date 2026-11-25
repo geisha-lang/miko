@@ -5,11 +5,13 @@ fn main() {
     // Get output directory from cargo
     let out_dir = env::var("OUT_DIR").unwrap();
 
-    // Compile the Geisha runtime library
+    // Compile the Geisha runtime library (GC + multicore concurrency primitives)
     cc::Build::new()
         .file("src/lib/base.c")
         .file("src/lib/runtime/gc_bitmap.c")
+        .file("src/lib/runtime/gs_conc.c")
         .include("src/lib/include")
+        .flag_if_supported("-pthread")
         .opt_level(2)
         .warnings(true)
         .compile("geisha_runtime");
@@ -21,9 +23,11 @@ fn main() {
     // Re-run build script if runtime sources change
     println!("cargo:rerun-if-changed=src/lib/base.c");
     println!("cargo:rerun-if-changed=src/lib/runtime/gc_bitmap.c");
+    println!("cargo:rerun-if-changed=src/lib/runtime/gs_conc.c");
     println!("cargo:rerun-if-changed=src/lib/include/gsvalue.h");
     println!("cargo:rerun-if-changed=src/lib/include/gc.h");
     println!("cargo:rerun-if-changed=src/lib/include/gc_bitmap.h");
+    println!("cargo:rerun-if-changed=src/lib/include/gs_conc.h");
 
     // Export the runtime library path for the compiler to use at link time
     let runtime_path = PathBuf::from(&out_dir).join("libgeisha_runtime.a");

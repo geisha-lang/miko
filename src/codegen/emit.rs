@@ -183,6 +183,7 @@ impl<'i> LLVMEmit<'i> {
         }
 
         let allow_tail = !self.escape_info.has_stack_allocations(&def.name());
+        self.emit_gc_safepoint_poll();
         let fun_body = self.gen_expr_in_pos(def.body(), &mut symtbl, allow_tail);
         if !self.builder().current_block_has_terminator() {
             if void_ret {
@@ -461,12 +462,27 @@ impl<'i> LLVMEmit<'i> {
                 }
 
                 // Platform C ABI `extern` call (NO trailing `ptr %fvs` closure argument!)
+                // Wrapped in `_setjmp` + `gc_enter_blocking` / `gc_leave_blocking` so blocking syscalls never stall STW GC!
                 if let Some((c_sym, c_fty)) = self.extern_fns.get(&fun_id).cloned() {
                     let c_callee = self.generator.get_or_add_c_function(&c_sym, &c_fty);
                     let c_llvm_fty = c_callee.get_function_type();
                     let mut argsv: Vec<LLVMValue> =
                         args.iter().map(|arg| self.gen_expr(arg, symbols)).collect();
+
+                    let parent = self.builder().get_insert_block().get_parent();
+                    let jb_ty = LLVMContext::get_array_type(&self.context().get_int64_type(), 64);
+                    let jb_ptr = self
+                        .generator
+                        .create_entry_block_alloca(&parent, "ffi.jb", &jb_ty);
+                    let setjmp_fn = self.generator.declare_posix_setjmp();
+                    let enter_fn = self.generator.declare_gc_enter_blocking();
+                    let leave_fn = self.generator.declare_gc_leave_blocking();
+
+                    self.builder().call(&setjmp_fn, &mut [jb_ptr], "");
+                    self.builder().call(&enter_fn, &mut [jb_ptr], "");
                     let call_val = self.builder().call(&c_callee, &mut argsv, "callc");
+                    self.builder().call(&leave_fn, &mut [], "");
+
                     return if c_llvm_fty.get_return_type().is_void() {
                         self.context().get_uint8_const(0)
                     } else {
@@ -625,6 +641,7 @@ impl<'i> LLVMEmit<'i> {
                 self.builder().br(&cond_blk);
 
                 self.builder().set_position_at_end(&cond_blk);
+                self.emit_gc_safepoint_poll();
                 let cval = self.gen_expr(cond, symbols);
                 self.builder().cond_br(&cval, &body_blk, &end_blk);
 
@@ -865,7 +882,11 @@ impl<'i> LLVMEmit<'i> {
                 let hdr_bytes = self.context().get_int64_const(8);
                 let total_bytes = self.builder().add(&hdr_bytes, &data_bytes, "arr.total_bytes");
 
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let gc_alloc_fn = if is_noscan_elem_type(args[1].ref_scheme().body()) {
+                    self.generator.declare_gc_alloc_atomic()
+                } else {
+                    self.generator.declare_gc_alloc()
+                };
                 let arr_ptr = self
                     .builder()
                     .call(&gc_alloc_fn, &mut [total_bytes], "arr.ptr");
@@ -1058,7 +1079,7 @@ impl<'i> LLVMEmit<'i> {
                 let n32 = self.gen_expr(&args[0], symbols);
                 let i64_ty = self.context().get_int64_type();
                 let n64 = self.builder().sext(&n32, &i64_ty, "alloc.n64");
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let gc_alloc_fn = self.generator.declare_gc_alloc_atomic();
                 Some(self.builder().call(&gc_alloc_fn, &mut [n64], "raw.ptr"))
             }
             "ptrByteAt" => {
@@ -1090,7 +1111,7 @@ impl<'i> LLVMEmit<'i> {
                 let p = self.gen_expr(&args[0], symbols);
                 let strlen_fn = self.generator.declare_libc_strlen();
                 let memcpy_fn = self.generator.declare_libc_memcpy();
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let gc_alloc_fn = self.generator.declare_gc_alloc_atomic();
                 let i8_ty = self.context().get_int8_type();
                 let one64 = self.context().get_int64_const(1);
                 let zero8 = self.context().get_uint8_const(0);
@@ -1152,7 +1173,7 @@ impl<'i> LLVMEmit<'i> {
 
                 let strlen_fn = self.generator.declare_libc_strlen();
                 let memcpy_fn = self.generator.declare_libc_memcpy();
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let gc_alloc_fn = self.generator.declare_gc_alloc_atomic();
                 let i64_ty = self.context().get_int64_type();
                 let i32_ty = self.context().get_int32_type();
                 let i8_ty = self.context().get_int8_type();
@@ -1215,7 +1236,7 @@ impl<'i> LLVMEmit<'i> {
                 let b = self.gen_expr(&args[1], symbols);
                 let strlen_fn = self.generator.declare_libc_strlen();
                 let memcpy_fn = self.generator.declare_libc_memcpy();
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let gc_alloc_fn = self.generator.declare_gc_alloc_atomic();
                 let i8_ty = self.context().get_int8_type();
                 let one64 = self.context().get_int64_const(1);
                 let zero8 = self.context().get_uint8_const(0);
@@ -1278,7 +1299,7 @@ impl<'i> LLVMEmit<'i> {
                 let count64 = self.builder().sext(&count32, &i64_ty, "sfb.cnt64");
                 let one64 = self.context().get_int64_const(1);
                 let alloc_sz = self.builder().add(&count64, &one64, "sfb.alloc_sz");
-                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let gc_alloc_fn = self.generator.declare_gc_alloc_atomic();
                 let dst = self.builder().call(&gc_alloc_fn, &mut [alloc_sz], "sfb.dst");
 
                 let mut off8 = [self.context().get_int64_const(8)];
@@ -1360,6 +1381,554 @@ impl<'i> LLVMEmit<'i> {
                 let mut idx_arr = [idx64];
                 let elem_p = self.builder().gep(&ptr_ty, &argv, &mut idx_arr, "cli.argp");
                 Some(self.builder().load(&ptr_ty, &elem_p, "cli.arg"))
+            }
+            _ => self.try_emit_conc_intrinsic(name, args, ret_ty, symbols),
+        }
+    }
+
+    fn emit_gc_safepoint_poll(&mut self) {
+        let req_global = self.generator.declare_gc_stw_requested_global();
+        let i32_ty = self.context().get_int32_type();
+        let flag = self
+            .builder()
+            .load_atomic_monotonic_i32(&i32_ty, &req_global, "gc.req");
+        let zero = self.context().get_int32_const(0);
+        let need_sp =
+            self.builder()
+                .icmp(LLVMIntPredicate::LLVMIntNE, &flag, &zero, "gc.need_sp");
+
+        let parent = self.builder().get_insert_block().get_parent();
+        let slow_blk = self.context().append_basic_block(&parent, "gc.sp.slow");
+        let cont_blk = self.context().append_basic_block(&parent, "gc.sp.cont");
+        self.builder().cond_br(&need_sp, &slow_blk, &cont_blk);
+
+        self.builder().set_position_at_end(&slow_blk);
+        let sp_fn = self.generator.declare_gc_safepoint_slow();
+        self.builder().call(&sp_fn, &mut [], "");
+        self.builder().br(&cont_blk);
+
+        self.builder().set_position_at_end(&cont_blk);
+    }
+
+    fn is_void_geisha_type(ty: &Type) -> bool {
+        matches!(ty, Type::Void) || matches!(ty, Type::Con(n) if n == "Void")
+    }
+
+    fn mangle_conc_type_sym(ty: &Type) -> String {
+        match ty {
+            Type::Void => "Void".to_string(),
+            Type::Con(n) => n.replace('.', "_"),
+            Type::Var(v) => format!("V_{}", v),
+            Type::Tuple(es) => {
+                let parts: Vec<String> = es.iter().map(Self::mangle_conc_type_sym).collect();
+                format!("Tup{}_{}", es.len(), parts.join("_"))
+            }
+            Type::Arr(ps, r) => {
+                let parts: Vec<String> = ps.iter().map(Self::mangle_conc_type_sym).collect();
+                format!(
+                    "Fn{}_{}_to_{}",
+                    ps.len(),
+                    parts.join("_"),
+                    Self::mangle_conc_type_sym(r)
+                )
+            }
+            Type::Comp(b, a) => format!(
+                "{}_of_{}",
+                Self::mangle_conc_type_sym(b),
+                Self::mangle_conc_type_sym(a)
+            ),
+        }
+    }
+
+    fn box_geisha_value(&mut self, val: LLVMValue, ty: &Type) -> LLVMValue {
+        if Self::is_void_geisha_type(ty) {
+            return self.context().get_ptr_type().get_null();
+        }
+        let elem_llvm_ty = self.generator.get_val_llvm_type(ty);
+        let byte_size = self.generator.get_type_size(&elem_llvm_ty).max(8);
+        let alloc_fn = if is_noscan_elem_type(ty) {
+            self.generator.declare_gc_alloc_atomic()
+        } else {
+            self.generator.declare_gc_alloc()
+        };
+        let sz_val = self.context().get_int64_const(byte_size as i64);
+        let box_ptr = self.builder().call(&alloc_fn, &mut [sz_val], "conc.box");
+        self.builder().store(&val, &box_ptr);
+        box_ptr
+    }
+
+    fn unbox_geisha_value(&mut self, box_ptr: LLVMValue, ty: &Type) -> LLVMValue {
+        if Self::is_void_geisha_type(ty) {
+            return self.context().get_uint8_const(0);
+        }
+        let elem_llvm_ty = self.generator.get_val_llvm_type(ty);
+        self.builder().load(&elem_llvm_ty, &box_ptr, "conc.unbox")
+    }
+
+    fn emit_nullable_box_to_pair(
+        &mut self,
+        box_ptr: LLVMValue,
+        pair_ret_ty: &Type,
+    ) -> LLVMValue {
+        let elem_ty = match pair_ret_ty {
+            Type::Tuple(es) if es.len() == 2 => es[1].clone(),
+            _ => panic!("Expected (Bool, T) return type, got {}", pair_ret_ty),
+        };
+        let pair_llvm_ty = self.generator.get_val_llvm_type(pair_ret_ty);
+        let elem_llvm_ty = self.generator.get_val_llvm_type(&elem_ty);
+        let null_ptr = self.context().get_ptr_type().get_null();
+        let has_val = self.builder().icmp(
+            LLVMIntPredicate::LLVMIntNE,
+            &box_ptr,
+            &null_ptr,
+            "conc.has_val",
+        );
+
+        let parent = self.builder().get_insert_block().get_parent();
+        let some_blk = self.context().append_basic_block(&parent, "conc.some");
+        let none_blk = self.context().append_basic_block(&parent, "conc.none");
+        let merge_blk = self.context().append_basic_block(&parent, "conc.merge");
+        self.builder().cond_br(&has_val, &some_blk, &none_blk);
+
+        self.builder().set_position_at_end(&some_blk);
+        let loaded_val = if Self::is_void_geisha_type(&elem_ty) {
+            self.context().get_uint8_const(0)
+        } else {
+            self.builder().load(&elem_llvm_ty, &box_ptr, "conc.some.v")
+        };
+        let some_end = self.builder().get_insert_block();
+        self.builder().br(&merge_blk);
+
+        self.builder().set_position_at_end(&none_blk);
+        let zero_val = elem_llvm_ty.get_null();
+        let none_end = self.builder().get_insert_block();
+        self.builder().br(&merge_blk);
+
+        self.builder().set_position_at_end(&merge_blk);
+        let val_phi = self.builder().phi_node(
+            &elem_llvm_ty,
+            &[(&loaded_val, &some_end), (&zero_val, &none_end)],
+            "conc.pair.v",
+        );
+        let mut agg = pair_llvm_ty.get_undef();
+        agg = self.builder().insert_value(&agg, &has_val, 0, "conc.pair.0");
+        self.builder().insert_value(&agg, &val_phi, 1, "conc.pair.1")
+    }
+
+    /// Synthesize `(ptr %cls_ptr) -> ptr` trampoline invoking a Geisha `() -> T` closure and boxing `T`.
+    fn get_or_emit_thunk_runner(&mut self, ret_ty: &Type) -> LLVMFunction {
+        let sym = format!("__gs_thunk_runner__{}", Self::mangle_conc_type_sym(ret_ty));
+        if let Some(existing) = self.module().get_function(&sym) {
+            return existing;
+        }
+
+        let saved_blk = self.builder().get_insert_block();
+        let ptr_ty = self.context().get_ptr_type();
+        let runner_fty = LLVMContext::get_function_type(&ptr_ty, &[ptr_ty], false);
+        let runner_fn = self.module().add_function(&sym, &runner_fty);
+        let entry = self.context().append_basic_block(&runner_fn, "entry");
+        self.builder().set_position_at_end(&entry);
+
+        let cls_ptr = runner_fn.get_param(0);
+        let cls_hdr_ty = self.generator.get_closure_header_type();
+        let fvs_ptr = self
+            .builder()
+            .struct_field_ptr(&cls_hdr_ty, &cls_ptr, 1, "tr.fv");
+        let fn_slot = self
+            .builder()
+            .struct_field_ptr(&cls_hdr_ty, &cls_ptr, 0, "tr.fn.slot");
+        let fn_entry = self.builder().load(&ptr_ty, &fn_slot, "tr.fn");
+
+        let geisha_fty = Type::Arr(vec![], Box::new(ret_ty.clone()));
+        let llvm_fty = self.generator.get_fn_llvm_type(&geisha_fty);
+        let call_val = self
+            .builder()
+            .call_value(&llvm_fty, &fn_entry, &mut [fvs_ptr], "tr.call");
+
+        let boxed = if Self::is_void_geisha_type(ret_ty) {
+            // Allocate a tiny 1-word marker box so `gs_mvar`/`gs_chan` distinguish `Some(())` (`non-null`) from `None` (`null`)!
+            let alloc_fn = self.generator.declare_gc_alloc_atomic();
+            let eight = self.context().get_int64_const(8);
+            self.builder().call(&alloc_fn, &mut [eight], "tr.void.box")
+        } else {
+            self.box_geisha_value(call_val, ret_ty)
+        };
+        self.builder().ret(&boxed);
+
+        if !runner_fn.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction) {
+            self.generator.module.dump();
+            panic!("LLVM verification failed for '{}'", sym);
+        }
+
+        self.builder().set_position_at_end(&saved_blk);
+        runner_fn
+    }
+
+    /// Synthesize `(ptr %state_box, ptr %cls_ptr) -> ptr` trampoline invoking an Actor handler `S -> R`.
+    fn get_or_emit_actor_runner(&mut self, state_ty: &Type, ret_ty: &Type) -> LLVMFunction {
+        let sym = format!(
+            "__gs_actor_runner__{}__{}",
+            Self::mangle_conc_type_sym(state_ty),
+            Self::mangle_conc_type_sym(ret_ty)
+        );
+        if let Some(existing) = self.module().get_function(&sym) {
+            return existing;
+        }
+
+        let saved_blk = self.builder().get_insert_block();
+        let ptr_ty = self.context().get_ptr_type();
+        let runner_fty = LLVMContext::get_function_type(&ptr_ty, &[ptr_ty, ptr_ty], false);
+        let runner_fn = self.module().add_function(&sym, &runner_fty);
+        let entry = self.context().append_basic_block(&runner_fn, "entry");
+        self.builder().set_position_at_end(&entry);
+
+        let state_box = runner_fn.get_param(0);
+        let cls_ptr = runner_fn.get_param(1);
+
+        let st_val = self.unbox_geisha_value(state_box, state_ty);
+        let cls_hdr_ty = self.generator.get_closure_header_type();
+        let fvs_ptr = self
+            .builder()
+            .struct_field_ptr(&cls_hdr_ty, &cls_ptr, 1, "ar.fv");
+        let fn_slot = self
+            .builder()
+            .struct_field_ptr(&cls_hdr_ty, &cls_ptr, 0, "ar.fn.slot");
+        let fn_entry = self.builder().load(&ptr_ty, &fn_slot, "ar.fn");
+
+        let geisha_fty = Type::Arr(vec![state_ty.clone()], Box::new(ret_ty.clone()));
+        let llvm_fty = self.generator.get_fn_llvm_type(&geisha_fty);
+        let call_val =
+            self.builder()
+                .call_value(&llvm_fty, &fn_entry, &mut [st_val, fvs_ptr], "ar.call");
+
+        let boxed = if Self::is_void_geisha_type(ret_ty) {
+            ptr_ty.get_null()
+        } else {
+            self.box_geisha_value(call_val, ret_ty)
+        };
+        self.builder().ret(&boxed);
+
+        if !runner_fn.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction) {
+            self.generator.module.dump();
+            panic!("LLVM verification failed for '{}'", sym);
+        }
+
+        self.builder().set_position_at_end(&saved_blk);
+        runner_fn
+    }
+
+    /// Emit inline LLVM IR for concurrency runtime intrinsics (`__conc*`).
+    fn try_emit_conc_intrinsic<'a: 'b, 'b>(
+        &mut self,
+        name: &str,
+        args: &'a [Node],
+        ret_ty: &Type,
+        symbols: &mut VarEnv<'b>,
+    ) -> Option<LLVMValue> {
+        let ptr_ty = self.context().get_ptr_type();
+        let i32_ty = self.context().get_int32_type();
+        let void_ty = self.context().get_void_type();
+
+        match name {
+            "__concAtomicNew" => {
+                let init = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_atomic_new", &ptr_ty, &[i32_ty]);
+                Some(self.builder().call(&f, &mut [init], "atom.new"))
+            }
+            "__concAtomicLoad" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_atomic_load", &i32_ty, &[ptr_ty]);
+                Some(self.builder().call(&f, &mut [a], "atom.load"))
+            }
+            "__concAtomicStore" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let v = self.gen_expr(&args[1], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_atomic_store", &void_ty, &[ptr_ty, i32_ty]);
+                self.builder().call(&f, &mut [a, v], "");
+                Some(self.context().get_uint8_const(0))
+            }
+            "__concAtomicAdd" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let d = self.gen_expr(&args[1], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_atomic_add", &i32_ty, &[ptr_ty, i32_ty]);
+                Some(self.builder().call(&f, &mut [a, d], "atom.add"))
+            }
+            "__concAtomicCas" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let exp = self.gen_expr(&args[1], symbols);
+                let des = self.gen_expr(&args[2], symbols);
+                let f = self.generator.declare_c_runtime_fn(
+                    "gs_atomic_cas",
+                    &i32_ty,
+                    &[ptr_ty, i32_ty, i32_ty],
+                );
+                let r = self.builder().call(&f, &mut [a, exp, des], "atom.cas");
+                let zero = self.context().get_int32_const(0);
+                Some(
+                    self.builder()
+                        .icmp(LLVMIntPredicate::LLVMIntNE, &r, &zero, "atom.cas.b"),
+                )
+            }
+            "__concMVarNew" => {
+                let val_ty = args[0].ref_scheme().body().clone();
+                let val = self.gen_expr(&args[0], symbols);
+                let boxed = if Self::is_void_geisha_type(&val_ty) {
+                    let alloc_fn = self.generator.declare_gc_alloc_atomic();
+                    let eight = self.context().get_int64_const(8);
+                    self.builder().call(&alloc_fn, &mut [eight], "mvar.void")
+                } else {
+                    self.box_geisha_value(val, &val_ty)
+                };
+                let one = self.context().get_int32_const(1);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_mvar_new", &ptr_ty, &[ptr_ty, i32_ty]);
+                Some(self.builder().call(&f, &mut [boxed, one], "mvar.new"))
+            }
+            "__concMVarEmpty" => {
+                let null_p = ptr_ty.get_null();
+                let zero = self.context().get_int32_const(0);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_mvar_new", &ptr_ty, &[ptr_ty, i32_ty]);
+                Some(self.builder().call(&f, &mut [null_p, zero], "mvar.empty"))
+            }
+            "__concMVarTake" => {
+                let m = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_mvar_take", &ptr_ty, &[ptr_ty]);
+                let box_ptr = self.builder().call(&f, &mut [m], "mvar.take");
+                Some(self.unbox_geisha_value(box_ptr, ret_ty))
+            }
+            "__concMVarPut" => {
+                let m = self.gen_expr(&args[0], symbols);
+                let val_ty = args[1].ref_scheme().body().clone();
+                let val = self.gen_expr(&args[1], symbols);
+                let boxed = if Self::is_void_geisha_type(&val_ty) {
+                    let alloc_fn = self.generator.declare_gc_alloc_atomic();
+                    let eight = self.context().get_int64_const(8);
+                    self.builder().call(&alloc_fn, &mut [eight], "mvar.void")
+                } else {
+                    self.box_geisha_value(val, &val_ty)
+                };
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_mvar_put", &void_ty, &[ptr_ty, ptr_ty]);
+                self.builder().call(&f, &mut [m, boxed], "");
+                Some(self.context().get_uint8_const(0))
+            }
+            "__concMVarRead" => {
+                let m = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_mvar_read", &ptr_ty, &[ptr_ty]);
+                let box_ptr = self.builder().call(&f, &mut [m], "mvar.read");
+                Some(self.unbox_geisha_value(box_ptr, ret_ty))
+            }
+            "__concMVarTryTake" => {
+                let m = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_mvar_try_take", &ptr_ty, &[ptr_ty]);
+                let box_ptr = self.builder().call(&f, &mut [m], "mvar.trytake");
+                Some(self.emit_nullable_box_to_pair(box_ptr, ret_ty))
+            }
+            "__concChanNew" => {
+                let cap = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_chan_new", &ptr_ty, &[i32_ty]);
+                Some(self.builder().call(&f, &mut [cap], "chan.new"))
+            }
+            "__concChanSend" => {
+                let ch = self.gen_expr(&args[0], symbols);
+                let val_ty = args[1].ref_scheme().body().clone();
+                let val = self.gen_expr(&args[1], symbols);
+                let boxed = if Self::is_void_geisha_type(&val_ty) {
+                    let alloc_fn = self.generator.declare_gc_alloc_atomic();
+                    let eight = self.context().get_int64_const(8);
+                    self.builder().call(&alloc_fn, &mut [eight], "chan.void")
+                } else {
+                    self.box_geisha_value(val, &val_ty)
+                };
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_chan_send", &i32_ty, &[ptr_ty, ptr_ty]);
+                let r = self.builder().call(&f, &mut [ch, boxed], "chan.send");
+                let zero = self.context().get_int32_const(0);
+                Some(
+                    self.builder()
+                        .icmp(LLVMIntPredicate::LLVMIntNE, &r, &zero, "chan.send.ok"),
+                )
+            }
+            "__concChanRecv" => {
+                let ch = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_chan_recv", &ptr_ty, &[ptr_ty]);
+                let box_ptr = self.builder().call(&f, &mut [ch], "chan.recv");
+                Some(self.emit_nullable_box_to_pair(box_ptr, ret_ty))
+            }
+            "__concChanTryRecv" => {
+                let ch = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_chan_try_recv", &ptr_ty, &[ptr_ty]);
+                let box_ptr = self.builder().call(&f, &mut [ch], "chan.tryrecv");
+                Some(self.emit_nullable_box_to_pair(box_ptr, ret_ty))
+            }
+            "__concChanClose" => {
+                let ch = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_chan_close", &void_ty, &[ptr_ty]);
+                self.builder().call(&f, &mut [ch], "");
+                Some(self.context().get_uint8_const(0))
+            }
+            "__concChanIsClosed" => {
+                let ch = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_chan_is_closed", &i32_ty, &[ptr_ty]);
+                let r = self.builder().call(&f, &mut [ch], "chan.closed");
+                let zero = self.context().get_int32_const(0);
+                Some(
+                    self.builder()
+                        .icmp(LLVMIntPredicate::LLVMIntNE, &r, &zero, "chan.closed.b"),
+                )
+            }
+            "__concTaskSpawn" => {
+                let inner_ty = match ret_ty {
+                    Type::Comp(_, elem) => elem.as_ref().clone(),
+                    _ => panic!("Expected Task T return type, got {}", ret_ty),
+                };
+                let cls_ptr = self.gen_expr(&args[0], symbols);
+                let runner = self.get_or_emit_thunk_runner(&inner_ty).into_value();
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_task_spawn", &ptr_ty, &[ptr_ty, ptr_ty]);
+                Some(self.builder().call(&f, &mut [runner, cls_ptr], "task.spawn"))
+            }
+            "__concTaskAwait" => {
+                let t = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_task_await", &ptr_ty, &[ptr_ty]);
+                let box_ptr = self.builder().call(&f, &mut [t], "task.await");
+                Some(self.unbox_geisha_value(box_ptr, ret_ty))
+            }
+            "__concTaskIsReady" => {
+                let t = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_task_is_ready", &i32_ty, &[ptr_ty]);
+                let r = self.builder().call(&f, &mut [t], "task.ready");
+                let zero = self.context().get_int32_const(0);
+                Some(
+                    self.builder()
+                        .icmp(LLVMIntPredicate::LLVMIntNE, &r, &zero, "task.ready.b"),
+                )
+            }
+            "__concTaskWaitAny" => {
+                let arr = self.gen_expr(&args[0], symbols);
+                let cnt = self.gen_expr(&args[1], symbols);
+                let tmo = self.gen_expr(&args[2], symbols);
+                let f = self.generator.declare_c_runtime_fn(
+                    "gs_task_wait_any",
+                    &void_ty,
+                    &[ptr_ty, i32_ty, i32_ty],
+                );
+                self.builder().call(&f, &mut [arr, cnt, tmo], "");
+                Some(self.context().get_uint8_const(0))
+            }
+            "__concNumCpu" => {
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_conc_num_cpu", &i32_ty, &[]);
+                Some(self.builder().call(&f, &mut [], "conc.ncpu"))
+            }
+            "__concSleepMs" => {
+                let ms = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_conc_sleep_ms", &void_ty, &[i32_ty]);
+                self.builder().call(&f, &mut [ms], "");
+                Some(self.context().get_uint8_const(0))
+            }
+            "__concActorSpawn" => {
+                let state_ty = match ret_ty {
+                    Type::Comp(_, st) => st.as_ref().clone(),
+                    _ => panic!("Expected Actor S return type, got {}", ret_ty),
+                };
+                let init_cls = self.gen_expr(&args[0], symbols);
+                let runner = self.get_or_emit_thunk_runner(&state_ty).into_value();
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_actor_spawn", &ptr_ty, &[ptr_ty, ptr_ty]);
+                Some(
+                    self.builder()
+                        .call(&f, &mut [runner, init_cls], "actor.spawn"),
+                )
+            }
+            "__concActorCall" => {
+                let state_ty = match args[0].ref_scheme().body() {
+                    Type::Comp(_, st) => st.as_ref().clone(),
+                    other => panic!("Expected Actor S argument, got {}", other),
+                };
+                let resp_ty = match ret_ty {
+                    Type::Comp(_, r) => r.as_ref().clone(),
+                    _ => panic!("Expected Task R return type, got {}", ret_ty),
+                };
+                let actor_h = self.gen_expr(&args[0], symbols);
+                let handler_cls = self.gen_expr(&args[1], symbols);
+                let runner = self
+                    .get_or_emit_actor_runner(&state_ty, &resp_ty)
+                    .into_value();
+                let f = self.generator.declare_c_runtime_fn(
+                    "gs_actor_call",
+                    &ptr_ty,
+                    &[ptr_ty, ptr_ty, ptr_ty],
+                );
+                Some(
+                    self.builder()
+                        .call(&f, &mut [actor_h, runner, handler_cls], "actor.call"),
+                )
+            }
+            "__concActorSend" => {
+                let state_ty = match args[0].ref_scheme().body() {
+                    Type::Comp(_, st) => st.as_ref().clone(),
+                    other => panic!("Expected Actor S argument, got {}", other),
+                };
+                let actor_h = self.gen_expr(&args[0], symbols);
+                let handler_cls = self.gen_expr(&args[1], symbols);
+                let runner = self
+                    .get_or_emit_actor_runner(&state_ty, &Type::Void)
+                    .into_value();
+                let f = self.generator.declare_c_runtime_fn(
+                    "gs_actor_send",
+                    &void_ty,
+                    &[ptr_ty, ptr_ty, ptr_ty],
+                );
+                self.builder()
+                    .call(&f, &mut [actor_h, runner, handler_cls], "");
+                Some(self.context().get_uint8_const(0))
+            }
+            "__concActorStop" => {
+                let actor_h = self.gen_expr(&args[0], symbols);
+                let f = self
+                    .generator
+                    .declare_c_runtime_fn("gs_actor_stop", &void_ty, &[ptr_ty]);
+                self.builder().call(&f, &mut [actor_h], "");
+                Some(self.context().get_uint8_const(0))
             }
             _ => None,
         }

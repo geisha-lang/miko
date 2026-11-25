@@ -125,6 +125,17 @@ impl<'i> Infer<'i> {
                 });
             }
         }
+
+        // Built-in structural marker concept `Send a` for static data-race safety
+        self.concept_registry.insert(
+            "Send".to_string(),
+            ConceptInfo {
+                name: "Send".to_string(),
+                type_params: vec!["a".to_string()],
+                superclasses: vec![],
+                methods: vec![],
+            },
+        );
     }
 
     fn register_default_list_adt(&mut self) {
@@ -400,6 +411,18 @@ impl<'i> Infer<'i> {
             return Ok(());
         }
 
+        if wc.concept == "Send" {
+            let mut visiting = HashSet::new();
+            return self.discharge_send_constraint(
+                &wc.ty,
+                wc.span,
+                given,
+                residual,
+                &mut visiting,
+                depth,
+            );
+        }
+
         // Non-variable head: look up matching instance in `instance_registry`
         for inst in &self.instance_registry {
             if inst.concept_name != wc.concept || inst.target_types.is_empty() {
@@ -429,6 +452,237 @@ impl<'i> Infer<'i> {
             ty: wc.ty.clone(),
             span: wc.span,
         })
+    }
+
+    /// Structural coinductive solver for the built-in `Send` concept:
+    /// - Scalar primitives, `String`, `AtomicInt`, `Actor s`, and tuples/ADTs of `Send` fields are `Send`.
+    /// - `Task a`, `Chan a`, and `MVar a` are `Send` iff `a: Send`.
+    /// - `Cell a`, `MutArray a`, `Ptr`, and arbitrary closures `a -> b` are strictly `!Send`.
+    fn discharge_send_constraint(
+        &self,
+        ty: &Type,
+        span: Span,
+        given: &[(Name, Name)],
+        residual: &mut Vec<WantedConstraint>,
+        visiting: &mut HashSet<Type>,
+        depth: usize,
+    ) -> Result<(), TypeError> {
+        if depth > 64 {
+            return Err(TypeError::NoInstance {
+                concept: "Send".to_string(),
+                ty: ty.clone(),
+                span,
+            });
+        }
+
+        let expanded = self.expand_type(ty, span)?;
+        match &expanded {
+            Type::Var(v) => {
+                if self.given_entails(given, "Send", v) {
+                    return Ok(());
+                }
+                if !residual
+                    .iter()
+                    .any(|r| r.concept == "Send" && r.ty == expanded)
+                {
+                    residual.push(WantedConstraint {
+                        concept: "Send".to_string(),
+                        ty: expanded,
+                        span,
+                    });
+                }
+                Ok(())
+            }
+            Type::Void => Ok(()),
+            Type::Con(name) => match name.as_str() {
+                "Int" | "Int64" | "Float" | "Bool" | "Char" | "String" | "Void" | "AtomicInt" => {
+                    Ok(())
+                }
+                "Ptr" => Err(TypeError::NoInstance {
+                    concept: "Send".to_string(),
+                    ty: expanded,
+                    span,
+                }),
+                _ => {
+                    if let Some(adt_info) = self.adt_registry.get(name) {
+                        if adt_info.type_params.is_empty() {
+                            if !visiting.insert(expanded.clone()) {
+                                return Ok(());
+                            }
+                            for variant in &adt_info.variants {
+                                for ft in &variant.field_types {
+                                    self.discharge_send_constraint(
+                                        ft,
+                                        span,
+                                        given,
+                                        residual,
+                                        visiting,
+                                        depth + 1,
+                                    )?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    Err(TypeError::NoInstance {
+                        concept: "Send".to_string(),
+                        ty: expanded,
+                        span,
+                    })
+                }
+            },
+            Type::Tuple(elems) => {
+                for el in elems {
+                    self.discharge_send_constraint(el, span, given, residual, visiting, depth + 1)?;
+                }
+                Ok(())
+            }
+            Type::Arr(..) => Err(TypeError::NoInstance {
+                concept: "Send".to_string(),
+                ty: expanded,
+                span,
+            }),
+            Type::Comp(..) => {
+                let mut args = Vec::new();
+                let mut curr = &expanded;
+                while let Type::Comp(base, arg) = curr {
+                    args.push(arg.as_ref().clone());
+                    curr = base.as_ref();
+                }
+                args.reverse();
+
+                if let Type::Con(head_name) = curr {
+                    match head_name.as_str() {
+                        "Cell" | "MutArray" => {
+                            return Err(TypeError::NoInstance {
+                                concept: "Send".to_string(),
+                                ty: expanded,
+                                span,
+                            });
+                        }
+                        "Actor" if args.len() == 1 => return Ok(()),
+                        "Task" | "Chan" | "MVar" if args.len() == 1 => {
+                            return self.discharge_send_constraint(
+                                &args[0],
+                                span,
+                                given,
+                                residual,
+                                visiting,
+                                depth + 1,
+                            );
+                        }
+                        _ => {
+                            if let Some(adt_info) = self.adt_registry.get(head_name) {
+                                if adt_info.type_params.len() == args.len() {
+                                    if !visiting.insert(expanded.clone()) {
+                                        return Ok(());
+                                    }
+                                    let sub: Subst = adt_info
+                                        .type_params
+                                        .iter()
+                                        .cloned()
+                                        .zip(args.into_iter())
+                                        .collect();
+                                    for variant in &adt_info.variants {
+                                        for ft in &variant.field_types {
+                                            let inst_ft = ft.clone().apply(&sub);
+                                            self.discharge_send_constraint(
+                                                &inst_ft,
+                                                span,
+                                                given,
+                                                residual,
+                                                visiting,
+                                                depth + 1,
+                                            )?;
+                                        }
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Err(TypeError::NoInstance {
+                    concept: "Send".to_string(),
+                    ty: expanded,
+                    span,
+                })
+            }
+        }
+    }
+
+    /// Check whether a concrete post-monomorphization `Type` satisfies `Send`.
+    pub fn is_concrete_type_send(ty: &Type, adt_registry: &AdtRegistry) -> bool {
+        fn go(ty: &Type, adts: &AdtRegistry, visiting: &mut HashSet<Type>) -> bool {
+            match ty {
+                Type::Void => true,
+                Type::Var(_) | Type::Arr(..) => false,
+                Type::Con(name) => match name.as_str() {
+                    "Int" | "Int64" | "Float" | "Bool" | "Char" | "String" | "Void"
+                    | "AtomicInt" => true,
+                    "Ptr" => false,
+                    _ => {
+                        if let Some(adt_info) = adts.get(name) {
+                            if adt_info.type_params.is_empty() {
+                                if !visiting.insert(ty.clone()) {
+                                    return true;
+                                }
+                                return adt_info.variants.iter().all(|v| {
+                                    v.field_types.iter().all(|ft| go(ft, adts, visiting))
+                                });
+                            }
+                        }
+                        false
+                    }
+                },
+                Type::Tuple(elems) => elems.iter().all(|e| go(e, adts, visiting)),
+                Type::Comp(..) => {
+                    let mut args = Vec::new();
+                    let mut curr = ty;
+                    while let Type::Comp(base, arg) = curr {
+                        args.push(arg.as_ref().clone());
+                        curr = base.as_ref();
+                    }
+                    args.reverse();
+                    if let Type::Con(head) = curr {
+                        match head.as_str() {
+                            "Cell" | "MutArray" => false,
+                            "Actor" => args.len() == 1,
+                            "Task" | "Chan" | "MVar" => {
+                                args.len() == 1 && go(&args[0], adts, visiting)
+                            }
+                            _ => {
+                                if let Some(adt_info) = adts.get(head) {
+                                    if adt_info.type_params.len() == args.len() {
+                                        if !visiting.insert(ty.clone()) {
+                                            return true;
+                                        }
+                                        let sub: Subst = adt_info
+                                            .type_params
+                                            .iter()
+                                            .cloned()
+                                            .zip(args.into_iter())
+                                            .collect();
+                                        return adt_info.variants.iter().all(|v| {
+                                            v.field_types.iter().all(|ft| {
+                                                let inst = ft.clone().apply(&sub);
+                                                go(&inst, adts, visiting)
+                                            })
+                                        });
+                                    }
+                                }
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                }
+            }
+        }
+        let mut visiting = HashSet::new();
+        go(ty, adt_registry, &mut visiting)
     }
 
     fn process_adt(

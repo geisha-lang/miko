@@ -37,6 +37,9 @@
 - **`std.str`** — `intToStr`, `boolToStr`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, `strTrim`, `strSplitChar`, `strJoin`, `strHash`
 - **`std.vec`** — Dynamic growable `Vec a` (`vecNew`, `vecLen`, `vecPush`, `vecPop`, `vecGet`, `vecGetOr`, `vecSet`, `vecClear`, `vecToList`)
 - **`std.map`** — Resizable `StrMap v`, `IntMap v`, and bidirectional compiler symbol `Interner` (`internerNew`, `intern`, `internerResolve`, `internerCount`)
+- **`std.sync`** — Shared-memory synchronization (`AtomicInt`, `MVar a`, bounded/unbounded `Chan a`)
+- **`std.task`** — Native multicore futures & data parallelism (`Task a`, `spawn`, `await`, `isReady`, `waitAll`, `waitAny`, `par`, `parMap`, `parFor`, `numCpu`, `sleepMs`)
+- **`std.actor`** — Thread-pinned sequential actors encapsulating `!Send` state (`Actor s`, `actorSpawn`, `actorCall`, `actorAsk`, `actorSend`, `actorStop`)
 - **`sys.io`** — Stream output (`print`, `eprint`, `eprintLn` via POSIX `write`)
 - **`sys.fs`** — File I/O (`fileExists`, `readFile`, `writeFile`, `removeFile` via ANSI C / POSIX FFI)
 - **`sys.env`** — CLI & environment (`argCount`, `argAt`, `args`, `getEnv`)

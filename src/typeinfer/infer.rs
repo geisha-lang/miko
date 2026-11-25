@@ -83,14 +83,25 @@ impl<'i> Infer<'i> {
             vec![tv_a.clone(), tv_a.clone()],
             P(Type::Con("Int".to_string())),
         );
+        let bin_shift = Type::Arr(
+            vec![tv_a.clone(), Type::Con("Int".to_string())],
+            P(tv_a.clone()),
+        );
 
-        let specs: [(&str, &str, Type, &[&str]); 8] = [
+        let specs: [(&str, &str, Type, &[&str]); 15] = [
             ("Add", "$op$plus", bin_same.clone(), &["Int", "Int64", "Float", "String"]),
             ("Sub", "$op$minus", bin_same.clone(), &["Int", "Int64", "Float"]),
             ("Mul", "$op$star", bin_same.clone(), &["Int", "Int64", "Float"]),
             ("Div", "$op$slash", bin_same.clone(), &["Int", "Int64", "Float"]),
-            ("Rem", "$op$rem", bin_same, &["Int", "Int64"]),
-            ("Neg", "neg", unary_same, &["Int", "Int64", "Float"]),
+            ("Rem", "$op$rem", bin_same.clone(), &["Int", "Int64"]),
+            ("Neg", "neg", unary_same.clone(), &["Int", "Int64", "Float"]),
+            ("BitAnd", "$op$amp", bin_same.clone(), &["Int", "Int64", "Bool"]),
+            ("BitOr", "$op$bar", bin_same.clone(), &["Int", "Int64", "Bool"]),
+            ("BitXor", "$op$caret", bin_same, &["Int", "Int64", "Bool"]),
+            ("BitNot", "$op$tilde", unary_same, &["Int", "Int64"]),
+            ("Shl", "$op$lt_lt", bin_shift.clone(), &["Int", "Int64"]),
+            ("Shr", "$op$gt_gt", bin_shift.clone(), &["Int", "Int64"]),
+            ("Ushr", "$op$gt_gt_gt", bin_shift, &["Int", "Int64"]),
             ("Eq", "eq", bin_bool, &["Int", "Int64", "Float", "Bool", "Char", "String"]),
             ("Ord", "compare", bin_int, &["Int", "Int64", "Float", "Char", "String"]),
         ];
@@ -929,6 +940,23 @@ impl<'i> Infer<'i> {
                                 | ("$op$rem", "rem")
                                 | ("rem", "$op$rem")
                                 | ("neg", "$op$minus")
+                                | ("$op$amp", "bitAnd")
+                                | ("bitAnd", "$op$amp")
+                                | ("$op$bar", "bitOr")
+                                | ("bitOr", "$op$bar")
+                                | ("$op$caret", "bitXor")
+                                | ("bitXor", "$op$caret")
+                                | ("$op$tilde", "bitNot")
+                                | ("bitNot", "$op$tilde")
+                                | ("$op$lt_lt", "shl")
+                                | ("$op$lt_lt", "bitShl")
+                                | ("shl", "$op$lt_lt")
+                                | ("$op$gt_gt", "shr")
+                                | ("$op$gt_gt", "bitShr")
+                                | ("shr", "$op$gt_gt")
+                                | ("$op$gt_gt_gt", "ushr")
+                                | ("$op$gt_gt_gt", "bitUshr")
+                                | ("ushr", "$op$gt_gt_gt")
                                 | ("eq", "$op$eq_eq")
                                 | ("$op$eq_eq", "eq")
                         )
@@ -1633,13 +1661,23 @@ impl<'i> Infer<'i> {
                 let ty_right = self.infer(e, right.as_mut())?.body().clone();
 
                 match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor => {
                         let concept = match op {
                             BinOp::Add => "Add",
                             BinOp::Sub => "Sub",
                             BinOp::Mul => "Mul",
                             BinOp::Div => "Div",
                             BinOp::Rem => "Rem",
+                            BinOp::BitAnd => "BitAnd",
+                            BinOp::BitOr => "BitOr",
+                            BinOp::BitXor => "BitXor",
                             _ => unreachable!(),
                         };
                         let a = self.fresh();
@@ -1650,6 +1688,23 @@ impl<'i> Infer<'i> {
                         });
                         self.uni(&ty_left, &a, left.tag.pos);
                         self.uni(&ty_right, &a, right.tag.pos);
+                        form.tag.set_type(a);
+                    }
+                    BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
+                        let concept = match op {
+                            BinOp::Shl => "Shl",
+                            BinOp::Shr => "Shr",
+                            BinOp::Ushr => "Ushr",
+                            _ => unreachable!(),
+                        };
+                        let a = self.fresh();
+                        self.wanted_constraints.push(WantedConstraint {
+                            concept: concept.to_string(),
+                            ty: a.clone(),
+                            span,
+                        });
+                        self.uni(&ty_left, &a, left.tag.pos);
+                        self.uni(&ty_right, &Type::Con("Int".to_string()), right.tag.pos);
                         form.tag.set_type(a);
                     }
                     BinOp::Eq | BinOp::Ne => {
@@ -1692,10 +1747,15 @@ impl<'i> Infer<'i> {
                         self.uni(&ty_op, &bool_ty, operand.tag.pos);
                         form.tag.set_type(bool_ty);
                     }
-                    UnOp::Neg => {
+                    UnOp::Neg | UnOp::BitNot => {
+                        let concept = match op {
+                            UnOp::Neg => "Neg",
+                            UnOp::BitNot => "BitNot",
+                            _ => unreachable!(),
+                        };
                         let a = self.fresh();
                         self.wanted_constraints.push(WantedConstraint {
-                            concept: "Neg".to_string(),
+                            concept: concept.to_string(),
                             ty: a.clone(),
                             span,
                         });

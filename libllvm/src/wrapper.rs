@@ -552,6 +552,23 @@ impl LLVMBuilder {
         }
     }
 
+    pub fn ashr(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildAShr(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn not(&self, val: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe { LLVMValue::from_ref(LLVMBuildNot(self.raw_ptr(), val.raw_ptr(), c.as_ptr())) }
+    }
+
     pub fn ret(&self, val: &LLVMValue) -> LLVMValue {
         unsafe { LLVMValue::from_ref(LLVMBuildRet(self.raw_ptr(), val.raw_ptr())) }
     }

@@ -335,6 +335,7 @@ impl<'i> LLVMEmit<'i> {
                         Type::Con(n) if n == "Float" => self.builder().fneg(&val, "fneg"),
                         _ => self.builder().neg(&val, "neg"),
                     },
+                    UnOp::BitNot => self.builder().not(&val, "bitnot"),
                 }
             }
 
@@ -1019,20 +1020,24 @@ impl<'i> LLVMEmit<'i> {
                 self.builder().store(&new_val, &slot_ptr);
                 Some(self.context().get_uint8_const(0))
             }
-            "bitAnd" => {
+            "bitAnd" | "bitAnd64" => {
                 let a = self.gen_expr(&args[0], symbols);
                 let b = self.gen_expr(&args[1], symbols);
                 Some(self.builder().and(&a, &b, "bit.and"))
             }
-            "bitOr" => {
+            "bitOr" | "bitOr64" => {
                 let a = self.gen_expr(&args[0], symbols);
                 let b = self.gen_expr(&args[1], symbols);
                 Some(self.builder().or(&a, &b, "bit.or"))
             }
-            "bitXor" => {
+            "bitXor" | "bitXor64" => {
                 let a = self.gen_expr(&args[0], symbols);
                 let b = self.gen_expr(&args[1], symbols);
                 Some(self.builder().xor(&a, &b, "bit.xor"))
+            }
+            "bitNot" | "bitNot64" => {
+                let a = self.gen_expr(&args[0], symbols);
+                Some(self.builder().not(&a, "bit.not"))
             }
             "bitShl" => {
                 let a = self.gen_expr(&args[0], symbols);
@@ -1042,7 +1047,33 @@ impl<'i> LLVMEmit<'i> {
             "bitShr" => {
                 let a = self.gen_expr(&args[0], symbols);
                 let b = self.gen_expr(&args[1], symbols);
-                Some(self.builder().lshr(&a, &b, "bit.shr"))
+                Some(self.builder().ashr(&a, &b, "bit.shr"))
+            }
+            "bitUshr" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b = self.gen_expr(&args[1], symbols);
+                Some(self.builder().lshr(&a, &b, "bit.ushr"))
+            }
+            "bitShl64" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b32 = self.gen_expr(&args[1], symbols);
+                let i64_ty = self.context().get_int64_type();
+                let b64 = self.builder().zext(&b32, &i64_ty, "sh64.cnt");
+                Some(self.builder().shl(&a, &b64, "bit64.shl"))
+            }
+            "bitShr64" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b32 = self.gen_expr(&args[1], symbols);
+                let i64_ty = self.context().get_int64_type();
+                let b64 = self.builder().zext(&b32, &i64_ty, "sh64.cnt");
+                Some(self.builder().ashr(&a, &b64, "bit64.shr"))
+            }
+            "bitUshr64" => {
+                let a = self.gen_expr(&args[0], symbols);
+                let b32 = self.gen_expr(&args[1], symbols);
+                let i64_ty = self.context().get_int64_type();
+                let b64 = self.builder().zext(&b32, &i64_ty, "sh64.cnt");
+                Some(self.builder().lshr(&a, &b64, "bit64.ushr"))
             }
             "charToInt" => {
                 let c = self.gen_expr(&args[0], symbols);

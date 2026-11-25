@@ -684,7 +684,7 @@ impl LLVMCodegen {
                 (Gt, "Float") => LLVMBuildFCmp(b, LLVMRealPredicate::LLVMRealOGT, l, r, d),
                 (Ge, "Float") => LLVMBuildFCmp(b, LLVMRealPredicate::LLVMRealOGE, l, r, d),
 
-                // Bool & Char comparisons
+                // Bool & Char comparisons + bitwise/eager boolean ops
                 (Eq, "Bool") | (Eq, "Char") => {
                     LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, l, r, d)
                 }
@@ -697,6 +697,29 @@ impl LLVMCodegen {
                 (Ge, "Char") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntUGE, l, r, d),
                 (And, "Bool") => LLVMBuildAnd(b, l, r, d),
                 (Or, "Bool") => LLVMBuildOr(b, l, r, d),
+
+                // Bitwise AND / OR / XOR / shifts for Int, Int64, and Bool
+                (BitAnd, "Int") | (BitAnd, "Int64") | (BitAnd, "Bool") => LLVMBuildAnd(b, l, r, d),
+                (BitOr, "Int") | (BitOr, "Int64") | (BitOr, "Bool") => LLVMBuildOr(b, l, r, d),
+                (BitXor, "Int") | (BitXor, "Int64") | (BitXor, "Bool") => LLVMBuildXor(b, l, r, d),
+                (Shl, "Int") => LLVMBuildShl(b, l, r, d),
+                (Shr, "Int") => LLVMBuildAShr(b, l, r, d),
+                (Ushr, "Int") => LLVMBuildLShr(b, l, r, d),
+                (Shl, "Int64") => {
+                    let i64_ty = self.context.get_int64_type();
+                    let cnt64 = self.builder.zext(&rhs, &i64_ty, "sh.cnt64");
+                    LLVMBuildShl(b, l, cnt64.raw_ptr(), d)
+                }
+                (Shr, "Int64") => {
+                    let i64_ty = self.context.get_int64_type();
+                    let cnt64 = self.builder.zext(&rhs, &i64_ty, "sh.cnt64");
+                    LLVMBuildAShr(b, l, cnt64.raw_ptr(), d)
+                }
+                (Ushr, "Int64") => {
+                    let i64_ty = self.context.get_int64_type();
+                    let cnt64 = self.builder.zext(&rhs, &i64_ty, "sh.cnt64");
+                    LLVMBuildLShr(b, l, cnt64.raw_ptr(), d)
+                }
 
                 other => panic!("Binary operation {:?} not implemented", other),
             };

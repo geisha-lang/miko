@@ -16,6 +16,7 @@ pub fn builtin_module_source(module_key: &str) -> Option<&'static str> {
         "std.option" => Some(include_str!("../../stdlib/std/option.gs")),
         "std.result" => Some(include_str!("../../stdlib/std/result.gs")),
         "std.list" => Some(include_str!("../../stdlib/std/list.gs")),
+        "std.bits" => Some(include_str!("../../stdlib/std/bits.gs")),
         "std.char" => Some(include_str!("../../stdlib/std/char.gs")),
         "std.buf" => Some(include_str!("../../stdlib/std/buf.gs")),
         "std.str" => Some(include_str!("../../stdlib/std/str.gs")),

@@ -658,16 +658,32 @@ impl<'i> K<'i> {
 
                 let operand_ty = l.ty.body().clone();
                 if is_type_concrete(&operand_ty) && !is_builtin_op_primitive(&operand_ty) {
-                    let arg_tys = vec![operand_ty.clone(), operand_ty.clone()];
+                    let arg_tys = vec![operand_ty.clone(), r.ty.body().clone()];
                     let ret_ty = term.ty.body().clone();
                     match bop {
-                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                        BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr
+                        | BinOp::Ushr => {
                             let mname = match bop {
                                 BinOp::Add => "$op$plus",
                                 BinOp::Sub => "$op$minus",
                                 BinOp::Mul => "$op$star",
                                 BinOp::Div => "$op$slash",
                                 BinOp::Rem => "$op$rem",
+                                BinOp::BitAnd => "$op$amp",
+                                BinOp::BitOr => "$op$bar",
+                                BinOp::BitXor => "$op$caret",
+                                BinOp::Shl => "$op$lt_lt",
+                                BinOp::Shr => "$op$gt_gt",
+                                BinOp::Ushr => "$op$gt_gt_gt",
                                 _ => unreachable!(),
                             };
                             if let Some((mangled, spec_scm, opt_inst)) =
@@ -741,13 +757,19 @@ impl<'i> K<'i> {
                     }
                 }
             }
-            Term::Unary(UnOp::Neg, e) => {
+            Term::Unary(op @ (UnOp::Neg | UnOp::BitNot), e) => {
+                let uop = *op;
                 self.rewrite_calls_in_term(e, discovered);
                 let operand_ty = e.ty.body().clone();
                 if is_type_concrete(&operand_ty) && !is_builtin_op_primitive(&operand_ty) {
+                    let mname = match uop {
+                        UnOp::Neg => "neg",
+                        UnOp::BitNot => "$op$tilde",
+                        _ => unreachable!(),
+                    };
                     let arg_tys = vec![operand_ty.clone()];
                     if let Some((mangled, spec_scm, opt_inst)) =
-                        self.resolve_concept_call("neg", &arg_tys, &operand_ty)
+                        self.resolve_concept_call(mname, &arg_tys, &operand_ty)
                     {
                         let new_id = self.interner.intern(&mangled);
                         self.direct.insert(new_id, new_id);

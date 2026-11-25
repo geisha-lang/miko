@@ -1105,3 +1105,121 @@ def main() = {
         );
     }
 }
+
+#[test]
+fn e2e_bitwise_operators_precedence_int64_and_custom_flags() {
+    let src = r#"
+use std.list.listFold
+use std.bits.{popCount, popCount64, trailingZeros, hasFlag}
+
+data Flags {
+    MkFlags(Int),
+}
+
+instance BitAnd Flags {
+    def (&)(a, b) = match (a, b) {
+        (MkFlags(x), MkFlags(y)) -> MkFlags(x & y),
+    }
+}
+
+instance BitOr Flags {
+    def (|)(a, b) = match (a, b) {
+        (MkFlags(x), MkFlags(y)) -> MkFlags(x | y),
+    }
+}
+
+instance BitXor Flags {
+    def (^)(a, b) = match (a, b) {
+        (MkFlags(x), MkFlags(y)) -> MkFlags(x ^ y),
+    }
+}
+
+instance BitNot Flags {
+    def (~)(a) = match a {
+        MkFlags(x) -> MkFlags(x ^ 255),
+    }
+}
+
+instance Shl Flags {
+    def (<<)(a, n) = match a {
+        MkFlags(x) -> MkFlags((x << n) & 255),
+    }
+}
+
+instance Eq Flags {
+    def (==)(a, b) = match (a, b) {
+        (MkFlags(x), MkFlags(y)) -> x == y,
+    }
+}
+
+// Generic polymorphic helper constrained by `(BitAnd a, BitNot a)`
+def clearMask(x, m) = x & ~m
+
+def (|>)(x: a, f: a -> b): b = f(x)
+
+def applyUnary(f, x) = f(x)
+
+def main() = {
+    // 1. Unparenthesized precedence: `<<` > `&` > `^` > `|` > `==` / `<` / `>` > `&&` > `||` > `|>`
+    let flags = 1 << 3 | 1 << 1 | 1; // 8 | 2 | 1 = 11
+    let cleared = clearMask(flags, 1 << 1); // 11 & ~2 = 9
+    let precOk =
+        cleared & 2 == 0
+        && flags | 4 == 15 || false;
+    let shiftPrecOk =
+        1 << 2 + 1 == 8
+        && 20 > 3 << 2
+        && 3 << 2 < 20
+        && (1 | 2 ^ 3 & 6) == 1
+        && (true ^ false)
+        && !(true ^ true);
+    let pipeVal = flags | 4 |> (x) -> x + 5; // (11 | 4) + 5 = 20
+
+    // 2. Signed `>>` (`ashr`) vs logical `>>>` (`lshr`) and unary `~` on `Int`
+    let negShift = -16 >> 2;   // -4
+    let logShift = -16 >>> 28; // 15
+    let invZero = ~0;          // -1
+    let invNegOne = ~(-1);     // 0
+    let shiftSum = negShift + logShift + invZero + invNegOne; // 10
+
+    // 3. 64-bit `Int64` bitwise operators & explicit `*64` intrinsics
+    let hi = intToI64(1) << 40;
+    let lo = intToI64(255);
+    let w64 = (hi | lo) ^ (intToI64(1) << 40);
+    let neg64 = ~intToI64(0);
+    let top4 = i64ToInt(neg64 >>> 60); // 15
+    let prim64 = i64ToInt(
+        bitUshr64(
+            bitNot64(
+                bitXor64(
+                    bitOr64(bitShl64(intToI64(1), 35), intToI64(0)),
+                    bitShl64(intToI64(1), 35)
+                )
+            ),
+            60
+        )
+    ); // 15
+    let pc64 = popCount64(hi | intToI64(7)); // 4
+
+    // 4. Custom `Flags` ADT overloading + first-class `(|)` & `(~)` operator sections
+    let fCombined = listFold([MkFlags(1), MkFlags(2), MkFlags(4)], MkFlags(0), (|)); // MkFlags(7)
+    let fAll = fCombined | (MkFlags(1) << 3); // MkFlags(15)
+    let fCleared = clearMask(fAll, MkFlags(6)); // MkFlags(9)
+    let fInverted = applyUnary((~), MkFlags(240)); // MkFlags(15)
+
+    let customOk =
+        w64 == lo
+        && fAll == fInverted
+        && fCleared == MkFlags(9)
+        && hasFlag(flags, 8);
+
+    if (precOk && shiftPrecOk && customOk) {
+        // 9 + 20 + 10 + 15 + 15 + 4 + 4 + 3 = 80
+        putNumber(cleared + pipeVal + shiftSum + top4 + prim64 + pc64 + popCount(29) + trailingZeros(40))
+    } else {
+        putNumber(0)
+    }
+}
+"#;
+    assert_eq!(compile_and_run_src(src), "80");
+}

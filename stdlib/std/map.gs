@@ -113,7 +113,7 @@ pub data IntMap v {
 }
 
 def hashIntKey(k: Int): Int =
-    bitAnd(bitXor(k * 265443576, bitShr(k, 16)), 2147483647)
+    ((k * 265443576) ^ (k >>> 16)) & 2147483647
 
 pub def intMapNew(): IntMap v =
     MkIntMap(cellNew(arrayNew(16, Nil)), cellNew(0))

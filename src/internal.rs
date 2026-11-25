@@ -57,8 +57,10 @@ pub enum BinOp {
     BitOr,
     /// `<<`
     Shl,
-    /// `>>`
+    /// `>>` (signed / arithmetic right shift)
     Shr,
+    /// `>>>` (unsigned / logical right shift)
+    Ushr,
     /// `==`
     Eq,
     /// `<`
@@ -91,6 +93,7 @@ impl BinOp {
             BitOr => "|",
             Shl => "<<",
             Shr => ">>",
+            Ushr => ">>>",
             Eq => "==",
             Lt => "<",
             Le => "<=",
@@ -109,6 +112,12 @@ impl BinOp {
             "*" => Mul,
             "/" => Div,
             "%" => Rem,
+            "^" => BitXor,
+            "&" => BitAnd,
+            "|" => BitOr,
+            "<<" => Shl,
+            ">>" => Shr,
+            ">>>" => Ushr,
             "<" => Lt,
             "<=" => Le,
             "!=" => Ne,
@@ -128,6 +137,8 @@ pub enum UnOp {
     Not,
     /// `-` arithmetic negation
     Neg,
+    /// `~` bitwise NOT
+    BitNot,
 }
 
 impl UnOp {
@@ -135,6 +146,7 @@ impl UnOp {
         match *self {
             UnOp::Not => "!",
             UnOp::Neg => "-",
+            UnOp::BitNot => "~",
         }
     }
 }

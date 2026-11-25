@@ -97,7 +97,7 @@ pub fn encode_op_name(op: &str) -> String {
 }
 
 fn is_reserved_non_op(s: &str) -> bool {
-    matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!")
+    matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!" | "~")
 }
 
 fn builtin_binop_from_str(s: &str) -> Option<BinOp> {
@@ -107,6 +107,12 @@ fn builtin_binop_from_str(s: &str) -> Option<BinOp> {
         "*" => Some(BinOp::Mul),
         "/" => Some(BinOp::Div),
         "%" => Some(BinOp::Rem),
+        "&" => Some(BinOp::BitAnd),
+        "|" => Some(BinOp::BitOr),
+        "^" => Some(BinOp::BitXor),
+        "<<" => Some(BinOp::Shl),
+        ">>" => Some(BinOp::Shr),
+        ">>>" => Some(BinOp::Ushr),
         "==" => Some(BinOp::Eq),
         "!=" => Some(BinOp::Ne),
         "<" => Some(BinOp::Lt),
@@ -117,31 +123,39 @@ fn builtin_binop_from_str(s: &str) -> Option<BinOp> {
     }
 }
 
-/// Scala / Swift leading-character precedence bucket (1 = lowest, 9 = highest custom infix):
-///   1: `|` (e.g. `|>`, below `||` so `a && b |> f` works naturally)
-///   2: `^`
-///   3: `&`
-///   4: `=` / `!` (including `==`, `!=`, `===`, `=/=`)
-///   5: `<` / `>` (including `<`, `<=`, `>`, `>=`, `<|>`, `<+>`, `>>=`)
-///   6: `:` (including `::`)
-///   7: `+` / `-` (including `+`, `-`, `++`, `+:`)
-///   8: `*` / `/` / `%` (including `*`, `/`, `%`, `**`)
-///   9: other symbol chars (`@`, `#`, `$`, `?`, `~`, `\`)
+/// Refined Scala / Swift / Rust precedence bucket (1 = lowest, 11 = highest custom infix):
+///   1: multi-char `|`-leading pipelines (e.g. `|>`, below `||` and `&&`)
+///      [short-circuit `||` then `&&` sit between 1 and 2]
+///   2: `=` / `!`-leading equality & inequality (`==`, `!=`, `===`, `=/=`)
+///   3: `<` / `>`-leading comparisons & combinators except shifts (`<`, `<=`, `>`, `>=`, `<+>`, `<|>`, `>>=`)
+///   4: `:`-leading cons/pair operators (`::` is right-associative)
+///   5: single `|` bitwise OR
+///   6: `^`-leading bitwise XOR (`^`, `^^`)
+///   7: `&`-leading bitwise AND (`&`, `&+`, excluding `&&`)
+///   8: bitwise shifts (`<<`, `>>`, `>>>`)
+///   9: `+` / `-`-leading additive operators (`+`, `-`, `++`, `+:`)
+///  10: `*` / `/` / `%`-leading multiplicative operators (`*`, `/`, `%`, `**`)
+///  11: other symbol chars (`@`, `#`, `$`, `?`, multi-char `~`, `\`)
 fn op_precedence_bucket(op: &str) -> Option<u8> {
     if is_reserved_non_op(op) {
         return None;
     }
+    match op {
+        "|" => return Some(5),
+        "<<" | ">>" | ">>>" => return Some(8),
+        _ => {}
+    }
     let first = op.chars().next()?;
     let b = match first {
         '|' => 1,
-        '^' => 2,
-        '&' => 3,
-        '=' | '!' => 4,
-        '<' | '>' => 5,
-        ':' => 6,
-        '+' | '-' => 7,
-        '*' | '/' | '%' => 8,
-        '@' | '#' | '$' | '?' | '~' | '\\' => 9,
+        '=' | '!' => 2,
+        '<' | '>' => 3,
+        ':' => 4,
+        '^' => 6,
+        '&' => 7,
+        '+' | '-' => 9,
+        '*' | '/' | '%' => 10,
+        '@' | '#' | '$' | '?' | '~' | '\\' => 11,
         _ => return None,
     };
     Some(b)
@@ -321,7 +335,7 @@ peg::parser! {
 
         rule definable_op_str() -> &'input str
             = s:raw_op_str() {?
-                if matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||") {
+                if matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!") {
                     Err("Reserved syntax punctuation cannot be redefined as an operator")
                 } else {
                     Ok(s)
@@ -780,48 +794,59 @@ peg::parser! {
 
         pub rule expression() -> Form
             = precedence! {
-                // Bucket 1: `|`-leading custom operators (e.g. `|>`, lowest so `a && b |> f` works naturally)
+                // Bucket 1: Multi-char `|`-leading pipelines (e.g. `|>`, lowest so `a == b && c |> f` works naturally)
                 lhs:(@) op:infix_op_left(1) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(1) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
                 // Short-circuit logical OR
                 lhs:(@) token(<"||">) rhs:@ { make_spanned_binexpr(BinOp::Or, lhs, rhs) }
                 --
-                // Bucket 2: `^`-leading custom operators
+                // Short-circuit logical AND
+                lhs:(@) token(<"&&">) rhs:@ { make_spanned_binexpr(BinOp::And, lhs, rhs) }
+                --
+                // Bucket 2: `=` / `!` equality & inequality (`==`, `!=`, `===`, `=/=`, ...)
                 lhs:(@) op:infix_op_left(2) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(2) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                // Short-circuit logical AND + Bucket 3 `&`-leading custom operators
-                lhs:(@) token(<"&&">) rhs:@ { make_spanned_binexpr(BinOp::And, lhs, rhs) }
+                // Bucket 3: `<` / `>` comparisons & combinators (`<`, `<=`, `>`, `>=`, `<|>`, `<+>`, `>>=`, ...)
                 lhs:(@) op:infix_op_left(3) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(3) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                // Bucket 4: `=` / `!` equality & inequality (`==`, `!=`, `===`, `=/=`, ...)
+                // Bucket 4: `:`-leading cons/pair ops (`::` is right-associative!)
                 lhs:(@) op:infix_op_left(4) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(4) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                // Bucket 5: `<` / `>` comparisons & monadic/combinator ops (`<`, `<=`, `>`, `>=`, `<|>`, `<+>`, `>>=`, ...)
+                // Bucket 5: Bitwise OR (`|`)
                 lhs:(@) op:infix_op_left(5) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(5) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                // Bucket 6: `:`-leading cons/pair ops (`::` is right-associative!)
+                // Bucket 6: `^`-leading bitwise XOR (`^`, `^^`, ...)
                 lhs:(@) op:infix_op_left(6) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(6) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                // Bucket 7: `+` / `-` additive ops (`+`, `-`, `++`, `+:`, ...)
+                // Bucket 7: `&`-leading bitwise AND (`&`, `&+`, ...)
                 lhs:(@) op:infix_op_left(7) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(7) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                // Bucket 8: `*` / `/` / `%` multiplicative ops (`*`, `/`, `%`, `**`, ...)
+                // Bucket 8: Bitwise shifts (`<<`, `>>`, `>>>`)
                 lhs:(@) op:infix_op_left(8) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(8) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                // Bucket 9: Other special symbol chars (`@`, `#`, `$`, `?`, `~`, `\`)
+                // Bucket 9: `+` / `-` additive ops (`+`, `-`, `++`, `+:`, ...)
                 lhs:(@) op:infix_op_left(9) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
                 lhs:@ op:infix_op_right(9) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
+                // Bucket 10: `*` / `/` / `%` multiplicative ops (`*`, `/`, `%`, `**`, ...)
+                lhs:(@) op:infix_op_left(10) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(10) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
+                --
+                // Bucket 11: Other special symbol chars (`@`, `#`, `$`, `?`, multi-char `~`, `\`)
+                lhs:(@) op:infix_op_left(11) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(11) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
+                --
                 whitespace() start:position!() "!" !"=" e:@ { make_spanned_unexpr(start, UnOp::Not, e) }
                 whitespace() start:position!() "-" !['>' | '0'..='9'] e:@ { make_spanned_unexpr(start, UnOp::Neg, e) }
+                whitespace() start:position!() "~" e:@ { make_spanned_unexpr(start, UnOp::BitNot, e) }
                 --
                 f:form_factor() { f }
             }
@@ -856,10 +881,24 @@ peg::parser! {
 
         rule unit_or_tuple_expr() -> Expr
             = token(<"(">) token(<")">) { Expr::Lit(Lit::Unit) }
-            // First-class operator value / section: `(+)` or `(|>)` or `(<+>)`
+            // First-class operator value / section: `(+)`, `(~)`, `(|>)`, `(<+>)`
             / start:position!() token(<"(">) op:definable_op_str() token(<")">) end:position!() {
                 let span = Span::new(start, end);
-                if let Some(bop) = builtin_binop_from_str(op) {
+                if op == "~" {
+                    let aid = interner.borrow_mut().intern(".op_arg");
+                    let body = Form::new(
+                        span,
+                        Expr::Unary(
+                            UnOp::BitNot,
+                            Box::new(Form::new(span, Expr::Var(aid))),
+                        ),
+                    );
+                    Expr::Abs(Lambda {
+                        param: vec![VarDecl(aid, Scheme::Slot)],
+                        ret_ty: None,
+                        body: Box::new(body),
+                    })
+                } else if let Some(bop) = builtin_binop_from_str(op) {
                     let lid = interner.borrow_mut().intern(".op_lhs");
                     let rid = interner.borrow_mut().intern(".op_rhs");
                     let body = Form::new(

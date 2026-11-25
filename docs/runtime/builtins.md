@@ -23,7 +23,7 @@
 
 ## Low-Level `PrimOp` Intrinsics (Used by `stdlib` & `syslib`)
 
-- **Bitwise & Conversions**: `bitAnd`, `bitOr`, `bitXor`, `bitShl`, `bitShr` (`(Int, Int) -> Int`), `charToInt` (`Char -> Int`), `intToChar` (`Int -> Char`), `intToI64` (`Int -> Int64`), `i64ToInt` (`Int64 -> Int`).
+- **Bitwise & Conversions**: `bitAnd`, `bitOr`, `bitXor`, `bitShl`, `bitShr`, `bitUshr` (`(Int, Int) -> Int`), `bitNot` (`Int -> Int`), `bitAnd64`, `bitOr64`, `bitXor64` (`(Int64, Int64) -> Int64`), `bitNot64` (`Int64 -> Int64`), `bitShl64`, `bitShr64`, `bitUshr64` (`(Int64, Int) -> Int64`), `charToInt` (`Char -> Int`), `intToChar` (`Int -> Char`), `intToI64` (`Int -> Int64`), `i64ToInt` (`Int64 -> Int`).
 - **Strings**: `strLen` (`String -> Int`), `strByteAt` (`(String, Int) -> Int`), `strSlice` (`(String, Int, Int) -> String`), `strConcat` (`(String, String) -> String`), `strFromBytes` (`(MutArray Int, Int) -> String`).
 - **Opaque Pointers & CLI**: `Ptr`, `ptrNull` (`() -> Ptr`), `ptrIsNull` (`Ptr -> Bool`), `ptrAllocBytes` (`Int -> Ptr`), `ptrByteAt` (`(Ptr, Int) -> Int`), `ptrSetByte` (`(Ptr, Int, Int) -> Void`), `ptrToString` (`Ptr -> String`), `sysArgc` (`() -> Int`), `sysArgv` (`Int -> String`).
 
@@ -32,6 +32,7 @@
 - **`std.option`** — `Option a { None, Some(a) }`, `isSome`, `isNone`, `unwrapOr`, `mapOption`, `andThenOption`
 - **`std.result`** — `Result a e { Ok(a), Err(e) }`, `isOk`, `isErr`, `unwrapResultOr`, `mapResult`, `mapErr`, `andThenResult`
 - **`std.list`** — `listLen`, `listIsEmpty`, `listRev`, `listAppend`, `listMap`, `listFilter`, `listFold`, `listAny`, `listAll`, `listNth`
+- **`std.bits`** — Bit manipulation helpers (`hasFlag`, `setFlag`, `clearFlag`, `toggleFlag`, `popCount`, `popCount64`, `trailingZeros`)
 - **`std.char`** — Lexer character/byte predicates (`isDigitByte`, `isAlphaByte`, `isIdentStartByte`, `isIdentContByte`, `isSpaceByte`, etc.)
 - **`std.buf`** — Amortized $O(1)$ `StringBuf` (`bufNew`, `bufPushByte`, `bufPushChar`, `bufPushStr`, `bufPushLine`, `bufPushInt`, `bufToString`)
 - **`std.str`** — `intToStr`, `boolToStr`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, `strTrim`, `strSplitChar`, `strJoin`, `strHash`

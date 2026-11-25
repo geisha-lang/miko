@@ -78,6 +78,29 @@ pub def bufPushLine(b: StringBuf, s: String): Void = {
     bufPushByte(b, 10)
 }
 
+pub def bufPushBuf(dst: StringBuf, src: StringBuf): Void = match src {
+    MkStringBuf(srcArrCell, srcLenCell) -> {
+        let n = cellGet(srcLenCell);
+        if (n > 0) {
+            ensureExtra(dst, n);
+            match dst {
+                MkStringBuf(dstArrCell, dstLenCell) -> {
+                    let sArr = cellGet(srcArrCell);
+                    let dArr = cellGet(dstArrCell);
+                    let base = cellGet(dstLenCell);
+                    let i = cellNew(0);
+                    while (cellGet(i) < n) {
+                        let off = cellGet(i);
+                        arraySet(dArr, base + off, arrayGet(sArr, off));
+                        cellSet(i, off + 1)
+                    };
+                    cellSet(dstLenCell, base + n)
+                },
+            }
+        } else ()
+    },
+}
+
 pub def bufPushInt(b: StringBuf, n: Int): Void =
     if (n == 0) {
         bufPushByte(b, 48)

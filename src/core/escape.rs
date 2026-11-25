@@ -128,9 +128,15 @@ fn collect_vars_in_expr(term: &TaggedTerm, out: &mut HashSet<Id>) {
         Term::Var(id) => {
             out.insert(*id);
         }
-        Term::Tuple(es) | Term::Block(es) => {
+        Term::Tuple(es) | Term::Block(es) | Term::ApplyDir(_, es) => {
             for e in es {
                 collect_vars_in_expr(e, out);
+            }
+        }
+        Term::ApplyCls(c, args) => {
+            collect_vars_in_expr(c, out);
+            for a in args {
+                collect_vars_in_expr(a, out);
             }
         }
         Term::MakeData { fields, .. } => {
@@ -138,7 +144,8 @@ fn collect_vars_in_expr(term: &TaggedTerm, out: &mut HashSet<Id>) {
                 collect_vars_in_expr(f, out);
             }
         }
-        Term::If(_, t, f) => {
+        Term::If(c, t, f) => {
+            collect_vars_in_expr(c, out);
             collect_vars_in_expr(t, out);
             collect_vars_in_expr(f, out);
         }
@@ -146,15 +153,51 @@ fn collect_vars_in_expr(term: &TaggedTerm, out: &mut HashSet<Id>) {
             collect_vars_in_expr(c, out);
             collect_vars_in_expr(b, out);
         }
-        Term::Match(_, arms) => {
-            for (_, _, b) in arms {
+        Term::Match(s, arms) => {
+            collect_vars_in_expr(s, out);
+            for (_, g, b) in arms {
+                if let Some(gt) = g {
+                    collect_vars_in_expr(gt, out);
+                }
                 collect_vars_in_expr(b, out);
             }
         }
-        Term::Let(_, _, b) | Term::MakeCls(_, _, b) => {
+        Term::Let(_, v, b) => {
+            collect_vars_in_expr(v, out);
             collect_vars_in_expr(b, out);
         }
+        Term::MakeCls(_, cls, b) => {
+            for fv in cls.fv() {
+                out.insert(fv);
+            }
+            collect_vars_in_expr(b, out);
+        }
+        Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
+            collect_vars_in_expr(e, out);
+        }
+        Term::Binary(_, l, r) => {
+            collect_vars_in_expr(l, out);
+            collect_vars_in_expr(r, out);
+        }
         _ => {}
+    }
+}
+
+fn collect_pattern_vars(pat: & crate::syntax::form::Pattern, out: &mut Vec<Id>) {
+    use crate::syntax::form::Pattern;
+    match pat {
+        Pattern::Var(id) => out.push(*id),
+        Pattern::Wildcard | Pattern::Lit(_) => {}
+        Pattern::Tuple(ps) | Pattern::Constructor(_, ps) => {
+            for p in ps {
+                collect_pattern_vars(p, out);
+            }
+        }
+        Pattern::StructConstructor(_, fs) => {
+            for (_, p) in fs {
+                collect_pattern_vars(p, out);
+            }
+        }
     }
 }
 
@@ -165,15 +208,16 @@ fn analyze_param_escapes(
 ) -> Vec<ParamEscape> {
     let params = func_def.parameters();
     let mut escapes = vec![ParamEscape::NoEscape; params.len()];
-    let param_ids: HashMap<Id, usize> = params
-        .iter()
-        .enumerate()
-        .map(|(i, VarDecl(id, _))| (*id, i))
-        .collect();
+    let mut param_taints: HashMap<Id, HashSet<usize>> = HashMap::new();
+    for (i, VarDecl(id, _)) in params.iter().enumerate() {
+        let mut s = HashSet::new();
+        s.insert(i);
+        param_taints.insert(*id, s);
+    }
 
     analyze_param_escapes_in_term(
         func_def.body(),
-        &param_ids,
+        &mut param_taints,
         &mut escapes,
         known_escapes,
         recursive_adts,
@@ -182,9 +226,22 @@ fn analyze_param_escapes(
     escapes
 }
 
+fn taint_union_for_vars(
+    vars: &HashSet<Id>,
+    param_taints: &HashMap<Id, HashSet<usize>>,
+) -> HashSet<usize> {
+    let mut u = HashSet::new();
+    for v in vars {
+        if let Some(ts) = param_taints.get(v) {
+            u.extend(ts.iter().copied());
+        }
+    }
+    u
+}
+
 fn analyze_param_escapes_in_term(
     term: &TaggedTerm,
-    param_ids: &HashMap<Id, usize>,
+    param_taints: &mut HashMap<Id, HashSet<usize>>,
     escapes: &mut Vec<ParamEscape>,
     known_escapes: &HashMap<Id, Vec<ParamEscape>>,
     recursive_adts: &HashSet<String>,
@@ -193,8 +250,10 @@ fn analyze_param_escapes_in_term(
     match term.body() {
         Term::Var(id) => {
             if in_tail {
-                if let Some(&idx) = param_ids.get(id) {
-                    escapes[idx] = escapes[idx].max(ParamEscape::EscapesReturn);
+                if let Some(tset) = param_taints.get(id) {
+                    for &idx in tset {
+                        escapes[idx] = escapes[idx].max(ParamEscape::EscapesReturn);
+                    }
                 }
             }
         }
@@ -202,7 +261,7 @@ fn analyze_param_escapes_in_term(
             for el in elems {
                 analyze_param_escapes_in_term(
                     el.deref(),
-                    param_ids,
+                    param_taints,
                     escapes,
                     known_escapes,
                     recursive_adts,
@@ -210,25 +269,38 @@ fn analyze_param_escapes_in_term(
                 );
             }
         }
-        Term::MakeCls(_, cls, body) => {
+        Term::MakeCls(VarDecl(cls_var_id, _), cls, body) => {
+            let mut cls_taint = HashSet::new();
             for fv_id in cls.fv() {
-                if let Some(&idx) = param_ids.get(&fv_id) {
-                    escapes[idx] = escapes[idx].max(ParamEscape::EscapesCapture);
+                if let Some(tset) = param_taints.get(&fv_id) {
+                    for &idx in tset {
+                        escapes[idx] = escapes[idx].max(ParamEscape::EscapesCapture);
+                        cls_taint.insert(idx);
+                    }
                 }
+            }
+            if !cls_taint.is_empty() {
+                param_taints.insert(*cls_var_id, cls_taint);
             }
             analyze_param_escapes_in_term(
                 body.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
                 in_tail,
             );
         }
-        Term::Let(_, val, body) => {
+        Term::Let(VarDecl(lhs_id, _), val, body) => {
+            let mut rhs_vars = HashSet::new();
+            collect_vars_in_expr(val, &mut rhs_vars);
+            let rhs_taint = taint_union_for_vars(&rhs_vars, param_taints);
+            if !rhs_taint.is_empty() {
+                param_taints.insert(*lhs_id, rhs_taint);
+            }
             analyze_param_escapes_in_term(
                 val.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -236,7 +308,7 @@ fn analyze_param_escapes_in_term(
             );
             analyze_param_escapes_in_term(
                 body.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -248,26 +320,25 @@ fn analyze_param_escapes_in_term(
                 for (i, arg) in args.iter().enumerate() {
                     let mut arg_vars = HashSet::new();
                     collect_vars_in_expr(arg, &mut arg_vars);
-                    for avid in arg_vars {
-                        if let Some(&param_idx) = param_ids.get(&avid) {
-                            if i < callee_escapes.len() {
-                                match callee_escapes[i] {
-                                    ParamEscape::EscapesCapture | ParamEscape::EscapesStore => {
-                                        escapes[param_idx] =
-                                            escapes[param_idx].max(ParamEscape::EscapesStore);
-                                    }
-                                    ParamEscape::EscapesReturn if in_tail => {
-                                        escapes[param_idx] =
-                                            escapes[param_idx].max(ParamEscape::EscapesReturn);
-                                    }
-                                    _ => {}
+                    let arg_taints = taint_union_for_vars(&arg_vars, param_taints);
+                    for param_idx in arg_taints {
+                        if i < callee_escapes.len() {
+                            match callee_escapes[i] {
+                                ParamEscape::EscapesCapture | ParamEscape::EscapesStore => {
+                                    escapes[param_idx] =
+                                        escapes[param_idx].max(ParamEscape::EscapesStore);
                                 }
+                                ParamEscape::EscapesReturn if in_tail => {
+                                    escapes[param_idx] =
+                                        escapes[param_idx].max(ParamEscape::EscapesReturn);
+                                }
+                                _ => {}
                             }
                         }
                     }
                     analyze_param_escapes_in_term(
                         arg.deref(),
-                        param_ids,
+                        param_taints,
                         escapes,
                         known_escapes,
                         recursive_adts,
@@ -276,18 +347,17 @@ fn analyze_param_escapes_in_term(
                 }
             } else {
                 // External / intrinsic function (e.g. `cellNew`, `cellSet`, `arrayNew`, `arraySet`):
-                // conservatively treat any passed parameter as escaping into heap storage!
+                // conservatively treat any passed parameter (or local derived from it) as escaping into heap storage!
                 for arg in args {
                     let mut arg_vars = HashSet::new();
                     collect_vars_in_expr(arg, &mut arg_vars);
-                    for avid in arg_vars {
-                        if let Some(&param_idx) = param_ids.get(&avid) {
-                            escapes[param_idx] = ParamEscape::EscapesStore;
-                        }
+                    let arg_taints = taint_union_for_vars(&arg_vars, param_taints);
+                    for param_idx in arg_taints {
+                        escapes[param_idx] = ParamEscape::EscapesStore;
                     }
                     analyze_param_escapes_in_term(
                         arg.deref(),
-                        param_ids,
+                        param_taints,
                         escapes,
                         known_escapes,
                         recursive_adts,
@@ -299,17 +369,21 @@ fn analyze_param_escapes_in_term(
         Term::ApplyCls(callee, args) => {
             analyze_param_escapes_in_term(
                 callee.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
                 false,
             );
             for arg in args {
-                // Unknown closure may return or store its argument
+                let mut arg_vars = HashSet::new();
+                collect_vars_in_expr(arg, &mut arg_vars);
+                for param_idx in taint_union_for_vars(&arg_vars, param_taints) {
+                    escapes[param_idx] = ParamEscape::EscapesStore;
+                }
                 analyze_param_escapes_in_term(
                     arg.deref(),
-                    param_ids,
+                    param_taints,
                     escapes,
                     known_escapes,
                     recursive_adts,
@@ -320,7 +394,7 @@ fn analyze_param_escapes_in_term(
         Term::If(c, t, f) => {
             analyze_param_escapes_in_term(
                 c.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -328,7 +402,7 @@ fn analyze_param_escapes_in_term(
             );
             analyze_param_escapes_in_term(
                 t.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -336,7 +410,7 @@ fn analyze_param_escapes_in_term(
             );
             analyze_param_escapes_in_term(
                 f.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -346,7 +420,7 @@ fn analyze_param_escapes_in_term(
         Term::While(c, b) => {
             analyze_param_escapes_in_term(
                 c.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -354,7 +428,7 @@ fn analyze_param_escapes_in_term(
             );
             analyze_param_escapes_in_term(
                 b.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -364,7 +438,7 @@ fn analyze_param_escapes_in_term(
         Term::Binary(_, l, r) => {
             analyze_param_escapes_in_term(
                 l.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -372,7 +446,7 @@ fn analyze_param_escapes_in_term(
             );
             analyze_param_escapes_in_term(
                 r.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -382,7 +456,7 @@ fn analyze_param_escapes_in_term(
         Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
             analyze_param_escapes_in_term(
                 e.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
@@ -390,31 +464,37 @@ fn analyze_param_escapes_in_term(
             );
         }
         Term::Match(scrutinee, arms) => {
-            // Note: matching an ADT and returning one of its extracted fields means a component of scrutinee may escape!
+            let mut svars = HashSet::new();
+            collect_vars_in_expr(scrutinee, &mut svars);
+            let scrut_taints = taint_union_for_vars(&svars, param_taints);
             if in_tail {
-                let mut svars = HashSet::new();
-                collect_vars_in_expr(scrutinee, &mut svars);
-                for sv in svars {
-                    if let Some(&idx) = param_ids.get(&sv) {
-                        if escapes[idx] == ParamEscape::NoEscape {
-                            escapes[idx] = ParamEscape::EscapesReturn;
-                        }
-                    }
+                for &idx in &scrut_taints {
+                    escapes[idx] = escapes[idx].max(ParamEscape::EscapesReturn);
                 }
             }
             analyze_param_escapes_in_term(
                 scrutinee.deref(),
-                param_ids,
+                param_taints,
                 escapes,
                 known_escapes,
                 recursive_adts,
                 false,
             );
-            for (_, guard, body) in arms {
+            for (pat, guard, body) in arms {
+                if !scrut_taints.is_empty() {
+                    let mut pvars = Vec::new();
+                    collect_pattern_vars(pat, &mut pvars);
+                    for pv in pvars {
+                        param_taints
+                            .entry(pv)
+                            .or_default()
+                            .extend(scrut_taints.iter().copied());
+                    }
+                }
                 if let Some(ref g) = guard {
                     analyze_param_escapes_in_term(
                         g.deref(),
-                        param_ids,
+                        param_taints,
                         escapes,
                         known_escapes,
                         recursive_adts,
@@ -423,7 +503,7 @@ fn analyze_param_escapes_in_term(
                 }
                 analyze_param_escapes_in_term(
                     body.deref(),
-                    param_ids,
+                    param_taints,
                     escapes,
                     known_escapes,
                     recursive_adts,
@@ -438,7 +518,7 @@ fn analyze_param_escapes_in_term(
             for field in fields {
                 analyze_param_escapes_in_term(
                     field.deref(),
-                    param_ids,
+                    param_taints,
                     escapes,
                     known_escapes,
                     recursive_adts,
@@ -451,7 +531,7 @@ fn analyze_param_escapes_in_term(
                 let is_last = i + 1 == items.len();
                 analyze_param_escapes_in_term(
                     item.deref(),
-                    param_ids,
+                    param_taints,
                     escapes,
                     known_escapes,
                     recursive_adts,
@@ -840,15 +920,29 @@ fn analyze_allocation_escapes(
             );
         }
         Term::Match(scrutinee, arms) => {
-            // If match is in tail position, an extracted field from `scrutinee` might be returned;
-            // any inner allocation stored in `scrutinee` that returns must be on heap if `scrutinee` is destructured to return an inner pointer.
-            if in_tail {
+            // Any pattern-bound variables extracted from `scrutinee` may outlive `scrutinee` (or be stored/returned);
+            // if `scrutinee` is NOT a direct `Term::Var(sid)` of a single local allocation with wildcards-only,
+            // conservatively mark allocations referenced in `scrutinee` (and their contained inner allocations when bound or in_tail)!
+            let has_pat_bindings = arms.iter().any(|(pat, _, _)| {
+                let mut pvs = Vec::new();
+                collect_pattern_vars(pat, &mut pvs);
+                !pvs.is_empty()
+            });
+            if in_tail || has_pat_bindings {
                 if let Term::Var(sid) = scrutinee.body() {
                     if let Some(ainfo) = allocations.get(sid) {
                         for &inner in &ainfo.contained_vars {
                             if allocations.contains_key(&inner) {
                                 escaping.insert(inner);
                             }
+                        }
+                    }
+                } else {
+                    let mut svars = HashSet::new();
+                    collect_vars_in_expr(scrutinee, &mut svars);
+                    for sv in svars {
+                        if allocations.contains_key(&sv) {
+                            escaping.insert(sv);
                         }
                     }
                 }

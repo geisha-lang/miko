@@ -1186,17 +1186,15 @@ impl<'i> LLVMEmit<'i> {
             "strByteAt" => {
                 let s = self.gen_expr(&args[0], symbols);
                 let idx32 = self.gen_expr(&args[1], symbols);
-                let strlen_fn = self.generator.declare_libc_strlen();
                 let i64_ty = self.context().get_int64_type();
                 let i32_ty = self.context().get_int32_type();
                 let i8_ty = self.context().get_int8_type();
+                let zero32 = self.context().get_int32_const(0);
 
-                let len64 = self.builder().call(&strlen_fn, &mut [s], "str.len64");
-                let len32 = self.builder().trunc(&len64, &i32_ty, "str.len32");
                 let oob = self.builder().icmp(
-                    libllvm::LLVMIntPredicate::LLVMIntUGE,
+                    libllvm::LLVMIntPredicate::LLVMIntSLT,
                     &idx32,
-                    &len32,
+                    &zero32,
                     "str.oob",
                 );
 
@@ -1207,7 +1205,7 @@ impl<'i> LLVMEmit<'i> {
 
                 self.builder().set_position_at_end(&oob_blk);
                 let fail_fn = self.generator.declare_gs_bounds_fail();
-                self.builder().call(&fail_fn, &mut [idx32, len32], "");
+                self.builder().call(&fail_fn, &mut [idx32, zero32], "");
                 self.builder().unreachable();
 
                 self.builder().set_position_at_end(&ok_blk);

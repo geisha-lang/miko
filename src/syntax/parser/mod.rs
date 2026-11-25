@@ -1173,17 +1173,184 @@ pub fn def_contains_try(def: &Def) -> bool {
 struct TryDesugarer<'a> {
     interner: &'a mut Interner,
     ok_ctor: String,
+    ok_fn_id: Id,
     err_ctor: String,
     err_fn_id: Id,
     counter: usize,
 }
 
 impl<'a> TryDesugarer<'a> {
+    fn wrap_in_ok(&self, expr: Form) -> Form {
+        let sp = expr.tag.pos;
+        Form::new(
+            sp,
+            Expr::Apply(
+                Box::new(Form::new(sp, Expr::Var(self.ok_fn_id))),
+                vec![Box::new(expr)],
+            ),
+        )
+    }
     fn fresh_ids(&mut self) -> (Id, Id) {
         self.counter += 1;
         let ok_id = self.interner.intern(&format!(".try_ok_{}", self.counter));
         let err_id = self.interner.intern(&format!(".try_err_{}", self.counter));
         (ok_id, err_id)
+    }
+
+    fn fresh_helper_id(&mut self, prefix: &str) -> Id {
+        self.counter += 1;
+        self.interner.intern(&format!(".{}_{}", prefix, self.counter))
+    }
+
+    /// Sequence a `Void`-typed statement `stmt` (which may contain `?` inside `while`/`if`/`match`/`let`)
+    /// right before a `Result`-producing continuation `cont`!
+    fn sequence_void_before_result(&mut self, stmt: Form, cont: Form) -> Form {
+        let sp = stmt.tag.pos.union(&cont.tag.pos);
+        if !form_contains_try(&stmt) {
+            let clean_stmt = self.desugar_non_result_expr(stmt);
+            return match cont.node {
+                Expr::Block(mut tail_items) => {
+                    let mut combined = vec![Box::new(clean_stmt)];
+                    combined.append(&mut tail_items);
+                    Form::new(sp, Expr::Block(combined))
+                }
+                _ => Form::new(sp, Expr::Block(vec![Box::new(clean_stmt), Box::new(cont)])),
+            };
+        }
+
+        let Form { node, tag } = stmt;
+        let s_pos = tag.pos;
+        match node {
+            Expr::Let(vd, val, body) => {
+                let mut binds = Vec::new();
+                let clean_val = self.extract_value_tries(*val, &mut binds);
+                let next_cont = self.sequence_void_before_result(*body, cont);
+                let rebuilt = Form::new(
+                    sp,
+                    Expr::Let(vd, Box::new(clean_val), Box::new(next_cont)),
+                );
+                self.wrap_tries(binds, rebuilt)
+            }
+            Expr::Block(mut items) => {
+                let mut acc = cont;
+                while let Some(it) = items.pop() {
+                    acc = self.sequence_void_before_result(*it, acc);
+                }
+                acc
+            }
+            Expr::While(wcond, wbody) => {
+                let loop_id = self.fresh_helper_id("try_while");
+                let call_loop = Form::new(
+                    s_pos,
+                    Expr::Apply(Box::new(Form::new(s_pos, Expr::Var(loop_id))), vec![]),
+                );
+                let mut cond_binds = Vec::new();
+                let clean_cond = self.extract_value_tries(*wcond, &mut cond_binds);
+                let step = self.sequence_void_before_result(*wbody, call_loop.clone());
+                let if_form = Form::new(
+                    sp,
+                    Expr::If(Box::new(clean_cond), Box::new(step), Box::new(cont)),
+                );
+                let lam_body = self.wrap_tries(cond_binds, if_form);
+                let lam = Form::new(
+                    sp,
+                    Expr::Abs(Lambda {
+                        param: vec![],
+                        ret_ty: None,
+                        body: Box::new(lam_body),
+                    }),
+                );
+                Form::new(
+                    sp,
+                    Expr::Let(
+                        VarDecl(loop_id, Scheme::Slot),
+                        Box::new(lam),
+                        Box::new(call_loop),
+                    ),
+                )
+            }
+            Expr::If(c, t, f) => {
+                let join_id = self.fresh_helper_id("try_join");
+                let call_join = Form::new(
+                    s_pos,
+                    Expr::Apply(Box::new(Form::new(s_pos, Expr::Var(join_id))), vec![]),
+                );
+                let mut binds = Vec::new();
+                let clean_c = self.extract_value_tries(*c, &mut binds);
+                let ct = self.sequence_void_before_result(*t, call_join.clone());
+                let cf = self.sequence_void_before_result(*f, call_join);
+                let br = self.wrap_tries(
+                    binds,
+                    Form::new(s_pos, Expr::If(Box::new(clean_c), Box::new(ct), Box::new(cf))),
+                );
+                let join_lam = Form::new(
+                    sp,
+                    Expr::Abs(Lambda {
+                        param: vec![],
+                        ret_ty: None,
+                        body: Box::new(cont),
+                    }),
+                );
+                Form::new(
+                    sp,
+                    Expr::Let(
+                        VarDecl(join_id, Scheme::Slot),
+                        Box::new(join_lam),
+                        Box::new(br),
+                    ),
+                )
+            }
+            Expr::Match(scrut, arms) => {
+                let join_id = self.fresh_helper_id("try_join");
+                let call_join = Form::new(
+                    s_pos,
+                    Expr::Apply(Box::new(Form::new(s_pos, Expr::Var(join_id))), vec![]),
+                );
+                let mut binds = Vec::new();
+                let clean_scrut = self.extract_value_tries(*scrut, &mut binds);
+                let clean_arms = arms
+                    .into_iter()
+                    .map(|mut arm| {
+                        arm.guard = arm.guard.map(|g| Box::new(self.desugar_non_result_expr(*g)));
+                        arm.body = Box::new(self.sequence_void_before_result(*arm.body, call_join.clone()));
+                        arm
+                    })
+                    .collect();
+                let mform = self.wrap_tries(
+                    binds,
+                    Form::new(s_pos, Expr::Match(Box::new(clean_scrut), clean_arms)),
+                );
+                let join_lam = Form::new(
+                    sp,
+                    Expr::Abs(Lambda {
+                        param: vec![],
+                        ret_ty: None,
+                        body: Box::new(cont),
+                    }),
+                );
+                Form::new(
+                    sp,
+                    Expr::Let(
+                        VarDecl(join_id, Scheme::Slot),
+                        Box::new(join_lam),
+                        Box::new(mform),
+                    ),
+                )
+            }
+            other => {
+                let mut binds = Vec::new();
+                let clean_stmt = self.extract_value_tries(Form { node: other, tag }, &mut binds);
+                let seq = match cont.node {
+                    Expr::Block(mut tail_items) => {
+                        let mut combined = vec![Box::new(clean_stmt)];
+                        combined.append(&mut tail_items);
+                        Form::new(sp, Expr::Block(combined))
+                    }
+                    _ => Form::new(sp, Expr::Block(vec![Box::new(clean_stmt), Box::new(cont)])),
+                };
+                self.wrap_tries(binds, seq)
+            }
+        }
     }
 
     fn wrap_tries(&mut self, binds: Vec<(Id, Span, Form)>, mut cont: Form) -> Form {
@@ -1236,10 +1403,33 @@ impl<'a> TryDesugarer<'a> {
                 Expr::Unary(op, Box::new(o))
             }
             Expr::Binary(op @ (BinOp::And | BinOp::Or), lhs, rhs) => {
-                let l = self.extract_value_tries(*lhs, binds);
-                // Short-circuit RHS only desugars nested lambdas
-                let r = self.desugar_non_result_expr(*rhs);
-                Expr::Binary(op, Box::new(l), Box::new(r))
+                if !form_contains_try(&rhs) {
+                    let l = self.extract_value_tries(*lhs, binds);
+                    let r = self.desugar_non_result_expr(*rhs);
+                    Expr::Binary(op, Box::new(l), Box::new(r))
+                } else {
+                    // Rewrite short-circuit `lhs && rhs` -> `if (lhs) rhs else false`, `lhs || rhs` -> `if (lhs) true else rhs`
+                    let rewritten_if = if op == BinOp::And {
+                        Form::new(
+                            span,
+                            Expr::If(
+                                lhs,
+                                rhs,
+                                Box::new(Form::new(span, Expr::Lit(Lit::Bool(false)))),
+                            ),
+                        )
+                    } else {
+                        Form::new(
+                            span,
+                            Expr::If(
+                                lhs,
+                                Box::new(Form::new(span, Expr::Lit(Lit::Bool(true)))),
+                                rhs,
+                            ),
+                        )
+                    };
+                    return self.extract_value_tries(rewritten_if, binds);
+                }
             }
             Expr::Binary(op, lhs, rhs) => {
                 let l = self.extract_value_tries(*lhs, binds);
@@ -1273,6 +1463,67 @@ impl<'a> TryDesugarer<'a> {
             Expr::Abs(mut lam) => {
                 lam.body = Box::new(self.desugar_result_scope(*lam.body));
                 Expr::Abs(lam)
+            }
+            Expr::If(c, t, f) if form_contains_try(&c) || form_contains_try(&t) || form_contains_try(&f) => {
+                let lifted = self.desugar_result_scope(Form::new(
+                    span,
+                    Expr::If(
+                        c,
+                        Box::new(self.wrap_in_ok(*t)),
+                        Box::new(self.wrap_in_ok(*f)),
+                    ),
+                ));
+                let (ok_id, _) = self.fresh_ids();
+                binds.push((ok_id, span, lifted));
+                return Form {
+                    node: Expr::Var(ok_id),
+                    tag,
+                };
+            }
+            Expr::Match(s, arms)
+                if form_contains_try(&s)
+                    || arms.iter().any(|a| {
+                        a.guard.as_ref().map_or(false, |g| form_contains_try(g))
+                            || form_contains_try(&a.body)
+                    }) =>
+            {
+                let lifted_arms = arms
+                    .into_iter()
+                    .map(|mut a| {
+                        a.body = Box::new(self.wrap_in_ok(*a.body));
+                        a
+                    })
+                    .collect();
+                let lifted = self.desugar_result_scope(Form::new(span, Expr::Match(s, lifted_arms)));
+                let (ok_id, _) = self.fresh_ids();
+                binds.push((ok_id, span, lifted));
+                return Form {
+                    node: Expr::Var(ok_id),
+                    tag,
+                };
+            }
+            Expr::Let(vd, v, b) if form_contains_try(&v) || form_contains_try(&b) => {
+                let lifted = self.desugar_result_scope(Form::new(
+                    span,
+                    Expr::Let(vd, v, Box::new(self.wrap_in_ok(*b))),
+                ));
+                let (ok_id, _) = self.fresh_ids();
+                binds.push((ok_id, span, lifted));
+                return Form {
+                    node: Expr::Var(ok_id),
+                    tag,
+                };
+            }
+            Expr::Block(mut es) if es.iter().any(|e| form_contains_try(e)) && !es.is_empty() => {
+                let last = *es.pop().unwrap();
+                es.push(Box::new(self.wrap_in_ok(last)));
+                let lifted = self.desugar_result_scope(Form::new(span, Expr::Block(es)));
+                let (ok_id, _) = self.fresh_ids();
+                binds.push((ok_id, span, lifted));
+                return Form {
+                    node: Expr::Var(ok_id),
+                    tag,
+                };
             }
             other => self.desugar_non_result_expr(Form { node: other, tag: tag.clone() }).node,
         };
@@ -1383,18 +1634,7 @@ impl<'a> TryDesugarer<'a> {
                 let last = *items.pop().unwrap();
                 let mut acc = self.desugar_result_scope(last);
                 while let Some(stmt) = items.pop() {
-                    let mut binds = Vec::new();
-                    let clean_stmt = self.extract_value_tries(*stmt, &mut binds);
-                    let bspan = clean_stmt.tag.pos.union(&acc.tag.pos);
-                    let seq = match acc.node {
-                        Expr::Block(mut tail_items) => {
-                            let mut combined = vec![Box::new(clean_stmt)];
-                            combined.append(&mut tail_items);
-                            Form::new(bspan, Expr::Block(combined))
-                        }
-                        _ => Form::new(bspan, Expr::Block(vec![Box::new(clean_stmt), Box::new(acc)])),
-                    };
-                    acc = self.wrap_tries(binds, seq);
+                    acc = self.sequence_void_before_result(*stmt, acc);
                 }
                 acc.tag.annotate = tag.annotate;
                 acc
@@ -1449,10 +1689,12 @@ pub fn desugar_try_in_def(
     if !def_contains_try(def) {
         return;
     }
+    let ok_fn_id = interner.intern(ok_ctor);
     let err_fn_id = interner.intern(err_ctor);
     let mut d = TryDesugarer {
         interner,
         ok_ctor: ok_ctor.to_string(),
+        ok_fn_id,
         err_ctor: err_ctor.to_string(),
         err_fn_id,
         counter: 0,

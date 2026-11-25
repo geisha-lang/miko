@@ -32,6 +32,8 @@ static gc_thread_t *_threads_head = NULL;
 static gc_heap_t *_heaps = NULL;
 static gc_free_t *_free_list = NULL;
 static size_t _default_init_words = 131072;
+static size_t _last_sweep_total_words = 0;
+static size_t _last_sweep_free_words = 0;
 static void **_global_roots[MAX_GLOBAL_ROOTS];
 static size_t _global_roots_count = 0;
 static size_t _collections = 0;
@@ -324,39 +326,47 @@ __attribute__((noinline)) static void *gc_alloc_impl(size_t size_bytes, bool nos
 
     size_t actual_total_words = total_words;
     void *block = pickup_fragment(total_words, &actual_total_words);
+    bool collected = false;
     if (block == NULL) {
         if (self != NULL) {
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
             self->safepoint_sp = (uintptr_t)&sp_marker;
         }
         bitmap_collect_locked(self);
+        collected = true;
         block = pickup_fragment(total_words, &actual_total_words);
     }
 
-    if (block == NULL) {
-        size_t grow_words = _heaps ? _heaps->total_words * 2 : _default_init_words;
+    /* Grow heap if allocation still failed OR post-GC free headroom is below 40% (prevents GC thrashing!) */
+    if (block == NULL || (collected && _last_sweep_free_words * 5 < _last_sweep_total_words * 2)) {
+        size_t total_cur = _last_sweep_total_words > 0 ? _last_sweep_total_words : (_heaps ? _heaps->total_words : _default_init_words);
+        size_t grow_words = total_cur;
         if (grow_words < total_words * 2) {
             grow_words = total_words * 2;
         }
         gc_heap_t *extra = new_heap(grow_words);
-        if (extra == NULL) {
+        if (extra == NULL && block == NULL) {
             pthread_mutex_unlock(&_gc_mu);
             fprintf(stderr, "GC out of memory allocating %zu bytes\n", size_bytes);
             abort();
         }
-        extra->next = _heaps;
-        _heaps = extra;
+        if (extra != NULL) {
+            extra->next = _heaps;
+            _heaps = extra;
 
-        gc_free_t *frag = (gc_free_t *)extra->base;
-        frag->size = extra->total_words;
-        frag->next = _free_list;
-        _free_list = frag;
+            gc_free_t *frag = (gc_free_t *)extra->base;
+            frag->size = extra->total_words;
+            frag->next = _free_list;
+            _free_list = frag;
+        }
 
-        block = pickup_fragment(total_words, &actual_total_words);
         if (block == NULL) {
-            pthread_mutex_unlock(&_gc_mu);
-            fprintf(stderr, "GC internal fragmentation failure\n");
-            abort();
+            block = pickup_fragment(total_words, &actual_total_words);
+            if (block == NULL) {
+                pthread_mutex_unlock(&_gc_mu);
+                fprintf(stderr, "GC internal fragmentation failure\n");
+                abort();
+            }
         }
     }
 
@@ -559,8 +569,11 @@ static void bitmap_sweep(void)
 {
     _free_list = NULL;
     gc_free_t *tail = NULL;
+    size_t sum_total = 0;
+    size_t sum_free = 0;
 
     for (gc_heap_t *h = _heaps; h != NULL; h = h->next) {
+        sum_total += h->total_words;
         uintptr_t cur = h->base;
         uintptr_t free_start = 0;
         size_t free_words = 0;
@@ -576,6 +589,7 @@ static void bitmap_sweep(void)
 
                 if (h->mark_bits[idx] & mask) {
                     if (free_words >= 2) {
+                        sum_free += free_words;
                         gc_free_t *frag = (gc_free_t *)free_start;
                         frag->size = free_words;
                         frag->next = NULL;
@@ -605,6 +619,7 @@ static void bitmap_sweep(void)
         }
 
         if (free_words >= 2) {
+            sum_free += free_words;
             gc_free_t *frag = (gc_free_t *)free_start;
             frag->size = free_words;
             frag->next = NULL;
@@ -618,4 +633,6 @@ static void bitmap_sweep(void)
 
         memset(h->mark_bits, 0, h->bitslen * sizeof(bitmap_t));
     }
+    _last_sweep_total_words = sum_total;
+    _last_sweep_free_words = sum_free;
 }

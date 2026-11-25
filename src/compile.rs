@@ -72,6 +72,13 @@ pub fn load_prelude<'a, 'b: 'a>(interner: &mut Interner, env: &'b TypeEnv) -> Ty
         ("putNumber", "Int -> Void"),
         ("putFloat", "Float -> Void"),
         ("putChar", "Char -> Void"),
+        ("cellNew", "forall a. a -> Cell a"),
+        ("cellGet", "forall a. Cell a -> a"),
+        ("cellSet", "forall a. (Cell a, a) -> Void"),
+        ("arrayNew", "forall a. (Int, a) -> MutArray a"),
+        ("arrayLen", "forall a. MutArray a -> Int"),
+        ("arrayGet", "forall a. (MutArray a, Int) -> a"),
+        ("arraySet", "forall a. (MutArray a, Int, a) -> Void"),
     ];
     let mut v = Vec::with_capacity(builtins.len());
     for (name, sig) in builtins {
@@ -741,6 +748,10 @@ impl<'a> ModuleAstRewriter<'a> {
                 self.rewrite_form(c, bound);
                 self.rewrite_form(t, bound);
                 self.rewrite_form(f, bound);
+            }
+            Expr::While(c, b) => {
+                self.rewrite_form(c, bound);
+                self.rewrite_form(b, bound);
             }
             Expr::Abs(fun) => {
                 let mut inner_bound = bound.clone();

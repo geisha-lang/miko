@@ -51,3 +51,9 @@ void gs_match_fail(void)
     fprintf(stderr, "Runtime error: non-exhaustive pattern match failed\n");
     abort();
 }
+
+void gs_bounds_fail(int32_t idx, int32_t len)
+{
+    fprintf(stderr, "Runtime error: array index %d out of bounds (length %d)\n", idx, len);
+    abort();
+}

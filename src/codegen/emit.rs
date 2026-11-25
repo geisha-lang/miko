@@ -162,7 +162,8 @@ impl<'i> LLVMEmit<'i> {
             }
         }
 
-        let fun_body = self.gen_expr(def.body(), &mut symtbl);
+        let allow_tail = !self.escape_info.has_stack_allocations(&def.name());
+        let fun_body = self.gen_expr_in_pos(def.body(), &mut symtbl, allow_tail);
         if !self.builder().current_block_has_terminator() {
             if void_ret {
                 self.builder().ret_void();
@@ -180,27 +181,18 @@ impl<'i> LLVMEmit<'i> {
     }
 
     pub fn gen_main(&mut self, def: &FunDef, globals: &[GlobalValDef], prelude: &VarEnv) {
+        // 1. Emit `@__geisha_main` containing global initializers and the user's `main` body so its entire stack frame
+        //    (all allocas, register spills, and saved callee-saved registers) sits strictly below `@main`'s stack anchor!
         self.current_func = Some(def.name());
         self.pending_let_binding = None;
 
-        let main_ty = self.generator.get_main_type();
-        let fun = self.module().add_function("main", &main_ty);
+        let void_ty = self.context().get_void_type();
+        let user_main_ty = LLVMContext::get_function_type(&void_ty, &[], false);
+        let user_main_fn = self.module().add_function("__geisha_main", &user_main_ty);
 
-        let block = self.context().append_basic_block(&fun, "entry");
-        self.builder().set_position_at_end(&block);
+        let user_entry = self.context().append_basic_block(&user_main_fn, "entry");
+        self.builder().set_position_at_end(&user_entry);
 
-        // Anchor stack root at the very top of `main`'s entry frame!
-        let i64_ty = self.context().get_int64_type();
-        let stack_anchor = self.builder().alloca(&i64_ty, "gc.stack.anchor");
-        let zero64 = self.context().get_int64_const(0);
-        self.builder().store(&zero64, &stack_anchor);
-
-        let gc_init_fn = self.generator.declare_gc_init_with_stack();
-        let heap_size = self.context().get_int64_const(131072);
-        self.builder()
-            .call(&gc_init_fn, &mut [heap_size, stack_anchor], "");
-
-        // Register pointer-typed global value slots with GC and evaluate top-level value initializers in order
         let mut symtbl = prelude.sub_env();
         let gc_reg_fn = self.generator.declare_gc_register_root();
         for g in globals {
@@ -216,22 +208,55 @@ impl<'i> LLVMEmit<'i> {
         self.gen_expr(def.body(), &mut symtbl);
 
         if !self.builder().current_block_has_terminator() {
-            let zero = self.context().get_int32_const(0);
-            self.builder().ret(&zero);
+            self.builder().ret_void();
         }
+
+        if !user_main_fn.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction) {
+            self.generator.module.dump();
+            panic!("LLVM verification failed for '__geisha_main'");
+        }
+
+        self.current_func = None;
+
+        // 2. Emit 4-line C entry trampoline `@main` with zero GC pointers of its own
+        let main_ty = self.generator.get_main_type();
+        let fun = self.module().add_function("main", &main_ty);
+        let block = self.context().append_basic_block(&fun, "entry");
+        self.builder().set_position_at_end(&block);
+
+        let i64_ty = self.context().get_int64_type();
+        let stack_anchor = self.builder().alloca(&i64_ty, "gc.stack.anchor");
+        let zero64 = self.context().get_int64_const(0);
+        self.builder().store(&zero64, &stack_anchor);
+
+        let gc_init_fn = self.generator.declare_gc_init_with_stack();
+        let heap_size = self.context().get_int64_const(131072);
+        self.builder()
+            .call(&gc_init_fn, &mut [heap_size, stack_anchor], "");
+        self.builder().call(&user_main_fn, &mut [], "");
+
+        let zero = self.context().get_int32_const(0);
+        self.builder().ret(&zero);
 
         if !fun.verify(LLVMVerifierFailureAction::LLVMPrintMessageAction) {
             self.generator.module.dump();
             panic!("LLVM verification failed for 'main'");
         }
-
-        self.current_func = None;
     }
 
     fn gen_expr<'a: 'b, 'b>(
         &mut self,
         term: &'a TaggedTerm,
         symbols: &mut VarEnv<'b>,
+    ) -> LLVMValue {
+        self.gen_expr_in_pos(term, symbols, false)
+    }
+
+    fn gen_expr_in_pos<'a: 'b, 'b>(
+        &mut self,
+        term: &'a TaggedTerm,
+        symbols: &mut VarEnv<'b>,
+        in_tail: bool,
     ) -> LLVMValue {
         use self::Term::*;
 
@@ -364,7 +389,7 @@ impl<'i> LLVMEmit<'i> {
                         ptr: alloca,
                         ty: val_llvm_ty,
                     },
-                    |sym| self.gen_expr(exp.deref(), sym),
+                    |sym| self.gen_expr_in_pos(exp.deref(), sym, in_tail),
                 )
             }
 
@@ -391,6 +416,9 @@ impl<'i> LLVMEmit<'i> {
                 let call_val =
                     self.builder()
                         .call_value(&callee_fn_ty, &fn_entry, &mut argsv, "callcls");
+                if in_tail {
+                    call_val.set_tail_call(true);
+                }
                 if callee_fn_ty.get_return_type().is_void() {
                     self.context().get_uint8_const(0)
                 } else {
@@ -400,6 +428,12 @@ impl<'i> LLVMEmit<'i> {
 
             ApplyDir(VarDecl(fun_id, ref fun_ty), ref args) => {
                 let callee_name = self.interner.trace(fun_id).to_owned();
+                if let Some(intrinsic_val) =
+                    self.try_emit_container_intrinsic(&callee_name, args, term.ref_scheme().body(), symbols)
+                {
+                    return intrinsic_val;
+                }
+
                 let callee = self.generator.get_or_add_function(&callee_name, fun_ty.body());
                 let fn_ty = callee.get_function_type();
 
@@ -409,6 +443,9 @@ impl<'i> LLVMEmit<'i> {
                 argsv.push(null_fv);
 
                 let call_val = self.builder().call(&callee, &mut argsv, "calldir");
+                if in_tail && !matches!(callee_name.as_str(), "printLn" | "putNumber" | "putFloat" | "putChar") {
+                    call_val.set_tail_call(true);
+                }
                 if fn_ty.get_return_type().is_void() {
                     self.context().get_uint8_const(0)
                 } else {
@@ -418,8 +455,9 @@ impl<'i> LLVMEmit<'i> {
 
             Block(ref fs) => {
                 let mut ret = self.context().get_uint8_const(0);
-                for n in fs {
-                    ret = self.gen_expr(n, symbols);
+                let len = fs.len();
+                for (i, n) in fs.iter().enumerate() {
+                    ret = self.gen_expr_in_pos(n, symbols, in_tail && (i + 1 == len));
                 }
                 ret
             }
@@ -506,7 +544,7 @@ impl<'i> LLVMEmit<'i> {
                             self.builder().store(&val, &fv_field);
                         }
                     }
-                    self.gen_expr(exp, sym)
+                    self.gen_expr_in_pos(exp, sym, in_tail && alloc_strategy == AllocationStrategy::Heap)
                 })
             }
 
@@ -520,12 +558,12 @@ impl<'i> LLVMEmit<'i> {
                 self.builder().cond_br(&cond, &then_blk, &else_blk);
 
                 self.builder().set_position_at_end(&then_blk);
-                let then_val = self.gen_expr(t, symbols);
+                let then_val = self.gen_expr_in_pos(t, symbols, in_tail);
                 let then_end = self.builder().get_insert_block();
                 self.builder().br(&cont_blk);
 
                 self.builder().set_position_at_end(&else_blk);
-                let else_val = self.gen_expr(f, symbols);
+                let else_val = self.gen_expr_in_pos(f, symbols, in_tail);
                 let else_end = self.builder().get_insert_block();
                 self.builder().br(&cont_blk);
 
@@ -536,6 +574,28 @@ impl<'i> LLVMEmit<'i> {
                     &[(&then_val, &then_end), (&else_val, &else_end)],
                     "if.res",
                 )
+            }
+
+            While(ref cond, ref body) => {
+                let parent = self.builder().get_insert_block().get_parent();
+                let cond_blk = self.context().append_basic_block(&parent, "while.cond");
+                let body_blk = self.context().append_basic_block(&parent, "while.body");
+                let end_blk = self.context().append_basic_block(&parent, "while.end");
+
+                self.builder().br(&cond_blk);
+
+                self.builder().set_position_at_end(&cond_blk);
+                let cval = self.gen_expr(cond, symbols);
+                self.builder().cond_br(&cval, &body_blk, &end_blk);
+
+                self.builder().set_position_at_end(&body_blk);
+                let _ = self.gen_expr(body, symbols);
+                if !self.builder().current_block_has_terminator() {
+                    self.builder().br(&cond_blk);
+                }
+
+                self.builder().set_position_at_end(&end_blk);
+                self.context().get_uint8_const(0)
             }
 
             MakeData {
@@ -676,7 +736,7 @@ impl<'i> LLVMEmit<'i> {
                         self.builder().set_position_at_end(&guard_pass_blk);
                     }
 
-                    let body_val = self.gen_expr(body, &mut arm_symbols);
+                    let body_val = self.gen_expr_in_pos(body, &mut arm_symbols, in_tail);
                     let body_end_blk = self.builder().get_insert_block();
                     self.builder().br(&cont_blk);
                     incoming_results.push((body_val, body_end_blk));
@@ -694,6 +754,211 @@ impl<'i> LLVMEmit<'i> {
                     incoming_results.iter().map(|(v, b)| (v, b)).collect();
                 self.builder().phi_node(&res_llvm_ty, &refs, "match.res")
             }
+        }
+    }
+
+    /// Emit inline LLVM 20 IR for built-in mutable container primitives (`Cell a` & `MutArray a`).
+    fn try_emit_container_intrinsic<'a: 'b, 'b>(
+        &mut self,
+        name: &str,
+        args: &'a [Node],
+        ret_ty: &Type,
+        symbols: &mut VarEnv<'b>,
+    ) -> Option<LLVMValue> {
+        match name {
+            "cellNew" => {
+                let init_val = self.gen_expr(&args[0], symbols);
+                let elem_llvm_ty = self.generator.get_val_llvm_type(args[0].ref_scheme().body());
+                let byte_size = self.generator.get_type_size(&elem_llvm_ty).max(8);
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let size_val = self.context().get_int64_const(byte_size as i64);
+                let cell_ptr = self
+                    .builder()
+                    .call(&gc_alloc_fn, &mut [size_val], "cell.ptr");
+                self.builder().store(&init_val, &cell_ptr);
+                Some(cell_ptr)
+            }
+            "cellGet" => {
+                let cell_ptr = self.gen_expr(&args[0], symbols);
+                let elem_llvm_ty = self.generator.get_val_llvm_type(ret_ty);
+                Some(self.builder().load(&elem_llvm_ty, &cell_ptr, "cell.val"))
+            }
+            "cellSet" => {
+                let cell_ptr = self.gen_expr(&args[0], symbols);
+                let new_val = self.gen_expr(&args[1], symbols);
+                self.builder().store(&new_val, &cell_ptr);
+                Some(self.context().get_uint8_const(0))
+            }
+            "arrayNew" => {
+                let len32 = self.gen_expr(&args[0], symbols);
+                let init_val = self.gen_expr(&args[1], symbols);
+                let elem_llvm_ty = self.generator.get_val_llvm_type(args[1].ref_scheme().body());
+                let elem_size = self.generator.get_type_size(&elem_llvm_ty).max(1);
+
+                let parent = self.builder().get_insert_block().get_parent();
+                let bad_blk = self.context().append_basic_block(&parent, "arr.bad_len");
+                let alloc_blk = self.context().append_basic_block(&parent, "arr.alloc");
+                let init_cond_blk = self.context().append_basic_block(&parent, "arr.init.cond");
+                let init_body_blk = self.context().append_basic_block(&parent, "arr.init.body");
+                let init_done_blk = self.context().append_basic_block(&parent, "arr.init.done");
+
+                let zero32 = self.context().get_int32_const(0);
+                let is_neg = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSLT,
+                    &len32,
+                    &zero32,
+                    "arr.is_neg",
+                );
+                self.builder().cond_br(&is_neg, &bad_blk, &alloc_blk);
+
+                self.builder().set_position_at_end(&bad_blk);
+                let fail_fn = self.generator.declare_gs_bounds_fail();
+                self.builder().call(&fail_fn, &mut [len32, zero32], "");
+                self.builder().unreachable();
+
+                self.builder().set_position_at_end(&alloc_blk);
+                let i64_ty = self.context().get_int64_type();
+                let i8_ty = self.context().get_int8_type();
+                let len64 = self.builder().sext(&len32, &i64_ty, "arr.len64");
+                let stride_const = self.context().get_int64_const(elem_size as i64);
+                let data_bytes = self.builder().mul(&len64, &stride_const, "arr.data_bytes");
+                let hdr_bytes = self.context().get_int64_const(8);
+                let total_bytes = self.builder().add(&hdr_bytes, &data_bytes, "arr.total_bytes");
+
+                let gc_alloc_fn = self.generator.declare_gc_alloc();
+                let arr_ptr = self
+                    .builder()
+                    .call(&gc_alloc_fn, &mut [total_bytes], "arr.ptr");
+                // Store length (`i64`) at byte offset 0; elements buffer starts at 8-byte aligned offset +8
+                self.builder().store(&len64, &arr_ptr);
+
+                let mut off8 = [hdr_bytes];
+                let elems_base = self
+                    .builder()
+                    .gep(&i8_ty, &arr_ptr, &mut off8, "arr.elems");
+
+                let idx_slot =
+                    self.generator
+                        .create_entry_block_alloca(&parent, "arr.init.idx", &i64_ty);
+                let zero64 = self.context().get_int64_const(0);
+                let one64 = self.context().get_int64_const(1);
+                self.builder().store(&zero64, &idx_slot);
+                self.builder().br(&init_cond_blk);
+
+                self.builder().set_position_at_end(&init_cond_blk);
+                let cur_idx = self.builder().load(&i64_ty, &idx_slot, "arr.idx");
+                let more = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntSLT,
+                    &cur_idx,
+                    &len64,
+                    "arr.more",
+                );
+                self.builder()
+                    .cond_br(&more, &init_body_blk, &init_done_blk);
+
+                self.builder().set_position_at_end(&init_body_blk);
+                let mut idx_arr = [cur_idx];
+                let slot_ptr =
+                    self.builder()
+                        .gep(&elem_llvm_ty, &elems_base, &mut idx_arr, "arr.slot");
+                self.builder().store(&init_val, &slot_ptr);
+                let next_idx = self.builder().add(&cur_idx, &one64, "arr.next_idx");
+                self.builder().store(&next_idx, &idx_slot);
+                self.builder().br(&init_cond_blk);
+
+                self.builder().set_position_at_end(&init_done_blk);
+                Some(arr_ptr)
+            }
+            "arrayLen" => {
+                let arr_ptr = self.gen_expr(&args[0], symbols);
+                let i64_ty = self.context().get_int64_type();
+                let i32_ty = self.context().get_int32_type();
+                let len64 = self.builder().load(&i64_ty, &arr_ptr, "arr.len64");
+                Some(self.builder().trunc(&len64, &i32_ty, "arr.len"))
+            }
+            "arrayGet" => {
+                let arr_ptr = self.gen_expr(&args[0], symbols);
+                let idx32 = self.gen_expr(&args[1], symbols);
+                let elem_llvm_ty = self.generator.get_val_llvm_type(ret_ty);
+
+                let i64_ty = self.context().get_int64_type();
+                let i32_ty = self.context().get_int32_type();
+                let i8_ty = self.context().get_int8_type();
+
+                let len64 = self.builder().load(&i64_ty, &arr_ptr, "arr.len64");
+                let len32 = self.builder().trunc(&len64, &i32_ty, "arr.len32");
+                let oob = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntUGE,
+                    &idx32,
+                    &len32,
+                    "arr.oob",
+                );
+
+                let parent = self.builder().get_insert_block().get_parent();
+                let oob_blk = self.context().append_basic_block(&parent, "arr.oob_trap");
+                let ok_blk = self.context().append_basic_block(&parent, "arr.get_ok");
+                self.builder().cond_br(&oob, &oob_blk, &ok_blk);
+
+                self.builder().set_position_at_end(&oob_blk);
+                let fail_fn = self.generator.declare_gs_bounds_fail();
+                self.builder().call(&fail_fn, &mut [idx32, len32], "");
+                self.builder().unreachable();
+
+                self.builder().set_position_at_end(&ok_blk);
+                let idx64 = self.builder().sext(&idx32, &i64_ty, "arr.idx64");
+                let mut off8 = [self.context().get_int64_const(8)];
+                let elems_base = self
+                    .builder()
+                    .gep(&i8_ty, &arr_ptr, &mut off8, "arr.elems");
+                let mut idx_arr = [idx64];
+                let slot_ptr =
+                    self.builder()
+                        .gep(&elem_llvm_ty, &elems_base, &mut idx_arr, "arr.slot");
+                Some(self.builder().load(&elem_llvm_ty, &slot_ptr, "arr.val"))
+            }
+            "arraySet" => {
+                let arr_ptr = self.gen_expr(&args[0], symbols);
+                let idx32 = self.gen_expr(&args[1], symbols);
+                let new_val = self.gen_expr(&args[2], symbols);
+                let elem_llvm_ty = self.generator.get_val_llvm_type(args[2].ref_scheme().body());
+
+                let i64_ty = self.context().get_int64_type();
+                let i32_ty = self.context().get_int32_type();
+                let i8_ty = self.context().get_int8_type();
+
+                let len64 = self.builder().load(&i64_ty, &arr_ptr, "arr.len64");
+                let len32 = self.builder().trunc(&len64, &i32_ty, "arr.len32");
+                let oob = self.builder().icmp(
+                    libllvm::LLVMIntPredicate::LLVMIntUGE,
+                    &idx32,
+                    &len32,
+                    "arr.oob",
+                );
+
+                let parent = self.builder().get_insert_block().get_parent();
+                let oob_blk = self.context().append_basic_block(&parent, "arr.oob_trap");
+                let ok_blk = self.context().append_basic_block(&parent, "arr.set_ok");
+                self.builder().cond_br(&oob, &oob_blk, &ok_blk);
+
+                self.builder().set_position_at_end(&oob_blk);
+                let fail_fn = self.generator.declare_gs_bounds_fail();
+                self.builder().call(&fail_fn, &mut [idx32, len32], "");
+                self.builder().unreachable();
+
+                self.builder().set_position_at_end(&ok_blk);
+                let idx64 = self.builder().sext(&idx32, &i64_ty, "arr.idx64");
+                let mut off8 = [self.context().get_int64_const(8)];
+                let elems_base = self
+                    .builder()
+                    .gep(&i8_ty, &arr_ptr, &mut off8, "arr.elems");
+                let mut idx_arr = [idx64];
+                let slot_ptr =
+                    self.builder()
+                        .gep(&elem_llvm_ty, &elems_base, &mut idx_arr, "arr.slot");
+                self.builder().store(&new_val, &slot_ptr);
+                Some(self.context().get_uint8_const(0))
+            }
+            _ => None,
         }
     }
 

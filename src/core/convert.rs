@@ -82,6 +82,10 @@ fn sanitize_phantom_vars_in_term(term: &mut TaggedTerm) {
             sanitize_phantom_vars_in_term(t);
             sanitize_phantom_vars_in_term(f);
         }
+        Term::While(c, b) => {
+            sanitize_phantom_vars_in_term(c);
+            sanitize_phantom_vars_in_term(b);
+        }
         Term::Match(scrut, arms) => {
             sanitize_phantom_vars_in_term(scrut);
             for (_, g, b) in arms {
@@ -606,6 +610,10 @@ impl<'i> K<'i> {
                 self.rewrite_calls_in_term(t, discovered);
                 self.rewrite_calls_in_term(f, discovered);
             }
+            Term::While(c, b) => {
+                self.rewrite_calls_in_term(c, discovered);
+                self.rewrite_calls_in_term(b, discovered);
+            }
             Term::Match(scrutinee, arms) => {
                 self.rewrite_calls_in_term(scrutinee, discovered);
                 for (_, guard, body) in arms {
@@ -868,6 +876,11 @@ impl<'i> K<'i> {
                 let mut r = self.fv(c.deref());
                 r.extend(self.fv(t.deref()));
                 r.extend(self.fv(f.deref()));
+                r
+            }
+            While(ref c, ref b) => {
+                let mut r = self.fv(c.deref());
+                r.extend(self.fv(b.deref()));
                 r
             }
             Match(ref scrutinee, ref arms) => {
@@ -1365,6 +1378,10 @@ impl<'i> K<'i> {
                 Box::new(self.transform(*tr)),
                 Box::new(self.transform(*fl)),
             ),
+            While(cond, body) => Term::While(
+                Box::new(self.transform(*cond)),
+                Box::new(self.transform(*body)),
+            ),
             Binary(op, left, right) => Term::Binary(
                 op,
                 Box::new(self.transform(*left)),
@@ -1686,6 +1703,10 @@ fn specialize_term_body(term: &Term, ctx: &SpecializeContext) -> Term {
             Box::new(specialize_term(c, ctx)),
             Box::new(specialize_term(t, ctx)),
             Box::new(specialize_term(f, ctx)),
+        ),
+        Term::While(c, b) => Term::While(
+            Box::new(specialize_term(c, ctx)),
+            Box::new(specialize_term(b, ctx)),
         ),
         Term::ApplyDir(VarDecl(id, scm), args) => {
             let new_id = ctx.fn_rename.get(id).copied().unwrap_or(*id);

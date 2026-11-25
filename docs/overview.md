@@ -1,6 +1,6 @@
 # Geisha Language Overview
 
-Geisha is a statically-typed, strict functional programming language that compiles to native code via LLVM 20. It combines Hindley-Milner type inference, algebraic data types, first-class tuples, pattern matching with guards, zero-overhead monomorphized concepts (typeclasses), escape-analyzed stack allocation, and a Rust-inspired module system.
+Geisha is a statically-typed, strict impure functional programming language in the MLton/OCaml tradition that compiles to native code via LLVM 20. Bindings (`def` / `let`), tuples, and algebraic data types are immutable by default, while controlled imperative algorithms are supported cleanly via `while` loops, explicit mutable heap containers (`Cell a`, `MutArray a`), and non-tail `Void` checking in blocks. It combines Hindley-Milner type inference, pattern matching with guards, zero-overhead monomorphized concepts (typeclasses), escape-analyzed stack allocation, and a Rust-inspired module system.
 
 ## Quick Examples
 

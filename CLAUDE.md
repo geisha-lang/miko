@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agents when w
 
 ## Project Overview
 
-Miko is a compiler for the Geisha language (a statically-typed functional programming language) implemented in Rust. It uses **LLVM 20** (opaque pointers, `llvm-sys` v201) for native code generation and a PEG-based inline parser (`peg` 0.8).
+Miko is a compiler for the Geisha language (a statically-typed, pragmatic impure functional ML-family language: immutable bindings and ADTs by default, explicit mutable heap containers `Cell` / `MutArray`, native `while` loops, and direct side effects) implemented in Rust. It uses **LLVM 20** (opaque pointers, `llvm-sys` v201) for native code generation and a PEG-based inline parser (`peg` 0.8).
 
 ## Build & Test Commands
 
@@ -51,9 +51,13 @@ def add(x: Int, y: Int): Int = x + y        // (Int, Int) -> Int
 def swap(p: (a, b)): (b, a) = match p { (x, y) -> (y, x) }
 def makeAdder(n: Int): Int -> Int = (x) -> n + x  // Right-associative ->
 
-// Blocks (; or newline separated), unary ops, short-circuit && / ||
+// Blocks (; or newline separated; non-tail expressions MUST have type Void), while loops, Cell & MutArray
 def demo() = {
-    putNumber(-42);
+    let i = cellNew(0);
+    while (cellGet(i) < 3) {
+        putNumber(cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
     printLn("done")
 }
 

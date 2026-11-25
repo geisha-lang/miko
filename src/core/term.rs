@@ -137,6 +137,8 @@ pub enum Term {
     Let(VarDecl, Node, Node),
     /// Conditional branch
     If(Node, Node, Node),
+    /// Imperative while loop
+    While(Node, Node),
     /// Pattern match with optional transformed guard term
     Match(Node, Vec<(Pattern, Option<Node>, Node)>),
     /// Construct ADT variant value

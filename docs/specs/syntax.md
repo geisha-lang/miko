@@ -76,6 +76,7 @@ let      - Local binding
 in       - Part of let expression
 if       - Conditional or pattern guard
 else     - Conditional alternative
+while    - Imperative loop expression
 match    - Pattern matching
 data     - ADT definition
 type     - Type alias
@@ -228,11 +229,15 @@ let variable = value in body
 let variable: Type = value in body
 ```
 
-### Conditional Expressions
+### Conditional & Loop Expressions
 
 ```
 if (condition) thenExpr else elseExpr
+
+while (condition) bodyExpr
 ```
+
+`while` evaluates `condition: Bool` before each iteration, executes `bodyExpr: Void` while true, and evaluates to `()` (`Void`).
 
 ### Match Expressions (with Optional Guards)
 
@@ -255,11 +260,12 @@ List literals construct values of the standard `List a` ADT (`Cons` / `Nil`).
 
 ### Block Expressions
 
-Expressions inside `{ ... }` are separated by `;` or newlines; the value of the block is its final expression:
+Expressions inside `{ ... }` are separated by `;` or newlines; the value of the block is its final expression. Every non-final expression in a block **must have type `Void`**—to intentionally discard a non-`Void` result, write `let _ = expr;`:
 
 ```
 {
     putNumber(42);
+    let _ = computeSomething();
     printLn("");
     0
 }

@@ -1087,6 +1087,10 @@ impl<'i> Infer<'i> {
                 self.check_exhaustiveness_in_form(t)?;
                 self.check_exhaustiveness_in_form(f)
             }
+            Expr::While(c, b) => {
+                self.check_exhaustiveness_in_form(c)?;
+                self.check_exhaustiveness_in_form(b)
+            }
             Expr::Lit(_) | Expr::Var(_) | Expr::QualifiedVar(_) => Ok(()),
         }
     }
@@ -1476,10 +1480,29 @@ impl<'i> Infer<'i> {
                 form.tag.set_type(tytr);
             }
 
+            While(ref mut cond, ref mut body) => {
+                let cond_pos = cond.tag.pos;
+                let body_pos = body.tag.pos;
+                let ty_cond = self.infer(e, cond.as_mut())?.body().clone();
+                let ty_body = self.infer(e, body.as_mut())?.body().clone();
+
+                self.uni(&ty_cond, &Type::Con("Bool".to_string()), cond_pos);
+                self.uni(&ty_body, &Type::Void, body_pos);
+                form.tag.set_type(Type::Void);
+            }
+
             Block(ref mut exps) => {
+                let len = exps.len();
                 let mut last_ty = Type::Void;
-                for f in exps.iter_mut() {
-                    last_ty = self.infer(e, f.deref_mut())?.body().clone();
+                for (i, f) in exps.iter_mut().enumerate() {
+                    let f_pos = f.tag.pos;
+                    let ty = self.infer(e, f.deref_mut())?.body().clone();
+                    if i + 1 < len {
+                        // Non-final expressions in `{ e1; e2 }` must evaluate to `Void` (use `let _ = e1;` to discard explicitly)
+                        self.uni(&ty, &Type::Void, f_pos);
+                    } else {
+                        last_ty = ty;
+                    }
                 }
                 form.tag.set_type(last_ty);
             }

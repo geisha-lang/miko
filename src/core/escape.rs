@@ -14,11 +14,11 @@ pub enum AllocationStrategy {
     Heap,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ParamEscape {
     NoEscape,
-    EscapesCapture,
     EscapesReturn,
+    EscapesCapture,
     EscapesStore,
 }
 
@@ -56,6 +56,17 @@ impl EscapeAnalysis {
 
     pub fn is_recursive_adt(&self, adt_name: &str) -> bool {
         self.recursive_adts.contains(adt_name)
+    }
+
+    pub fn has_stack_allocations(&self, func_id: &Id) -> bool {
+        self.functions
+            .get(func_id)
+            .map(|info| {
+                info.allocations
+                    .values()
+                    .any(|&s| s == AllocationStrategy::Stack)
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -131,6 +142,10 @@ fn collect_vars_in_expr(term: &TaggedTerm, out: &mut HashSet<Id>) {
             collect_vars_in_expr(t, out);
             collect_vars_in_expr(f, out);
         }
+        Term::While(c, b) => {
+            collect_vars_in_expr(c, out);
+            collect_vars_in_expr(b, out);
+        }
         Term::Match(_, arms) => {
             for (_, _, b) in arms {
                 collect_vars_in_expr(b, out);
@@ -179,7 +194,7 @@ fn analyze_param_escapes_in_term(
         Term::Var(id) => {
             if in_tail {
                 if let Some(&idx) = param_ids.get(id) {
-                    escapes[idx] = ParamEscape::EscapesReturn;
+                    escapes[idx] = escapes[idx].max(ParamEscape::EscapesReturn);
                 }
             }
         }
@@ -198,9 +213,7 @@ fn analyze_param_escapes_in_term(
         Term::MakeCls(_, cls, body) => {
             for fv_id in cls.fv() {
                 if let Some(&idx) = param_ids.get(&fv_id) {
-                    if escapes[idx] == ParamEscape::NoEscape {
-                        escapes[idx] = ParamEscape::EscapesCapture;
-                    }
+                    escapes[idx] = escapes[idx].max(ParamEscape::EscapesCapture);
                 }
             }
             analyze_param_escapes_in_term(
@@ -240,12 +253,12 @@ fn analyze_param_escapes_in_term(
                             if i < callee_escapes.len() {
                                 match callee_escapes[i] {
                                     ParamEscape::EscapesCapture | ParamEscape::EscapesStore => {
-                                        escapes[param_idx] = ParamEscape::EscapesStore;
+                                        escapes[param_idx] =
+                                            escapes[param_idx].max(ParamEscape::EscapesStore);
                                     }
                                     ParamEscape::EscapesReturn if in_tail => {
-                                        if escapes[param_idx] == ParamEscape::NoEscape {
-                                            escapes[param_idx] = ParamEscape::EscapesReturn;
-                                        }
+                                        escapes[param_idx] =
+                                            escapes[param_idx].max(ParamEscape::EscapesReturn);
                                     }
                                     _ => {}
                                 }
@@ -262,7 +275,16 @@ fn analyze_param_escapes_in_term(
                     );
                 }
             } else {
+                // External / intrinsic function (e.g. `cellNew`, `cellSet`, `arrayNew`, `arraySet`):
+                // conservatively treat any passed parameter as escaping into heap storage!
                 for arg in args {
+                    let mut arg_vars = HashSet::new();
+                    collect_vars_in_expr(arg, &mut arg_vars);
+                    for avid in arg_vars {
+                        if let Some(&param_idx) = param_ids.get(&avid) {
+                            escapes[param_idx] = ParamEscape::EscapesStore;
+                        }
+                    }
                     analyze_param_escapes_in_term(
                         arg.deref(),
                         param_ids,
@@ -319,6 +341,24 @@ fn analyze_param_escapes_in_term(
                 known_escapes,
                 recursive_adts,
                 in_tail,
+            );
+        }
+        Term::While(c, b) => {
+            analyze_param_escapes_in_term(
+                c.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
+            );
+            analyze_param_escapes_in_term(
+                b.deref(),
+                param_ids,
+                escapes,
+                known_escapes,
+                recursive_adts,
+                false,
             );
         }
         Term::Binary(_, l, r) => {
@@ -531,6 +571,10 @@ fn collect_allocations(
             collect_allocations(t.deref(), allocations, recursive_adts);
             collect_allocations(f.deref(), allocations, recursive_adts);
         }
+        Term::While(c, b) => {
+            collect_allocations(c.deref(), allocations, recursive_adts);
+            collect_allocations(b.deref(), allocations, recursive_adts);
+        }
         Term::Binary(_, l, r) => {
             collect_allocations(l.deref(), allocations, recursive_adts);
             collect_allocations(r.deref(), allocations, recursive_adts);
@@ -682,8 +726,16 @@ fn analyze_allocation_escapes(
                     );
                 }
             } else {
-                // Unknown external/runtime function: mark any passed allocations as escaping
+                // Unknown external/runtime/intrinsic function (e.g. `cellNew`, `cellSet`, `arrayNew`, `arraySet`):
+                // mark any passed allocations (including nested tuple/ADT vars) as escaping!
                 for arg in args {
+                    let mut avars = HashSet::new();
+                    collect_vars_in_expr(arg, &mut avars);
+                    for av in avars {
+                        if allocations.contains_key(&av) {
+                            escaping.insert(av);
+                        }
+                    }
                     analyze_allocation_escapes(
                         arg.deref(),
                         allocations,
@@ -739,6 +791,24 @@ fn analyze_allocation_escapes(
                 all_param_escapes,
                 recursive_adts,
                 in_tail,
+            );
+        }
+        Term::While(c, b) => {
+            analyze_allocation_escapes(
+                c.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
+            );
+            analyze_allocation_escapes(
+                b.deref(),
+                allocations,
+                escaping,
+                all_param_escapes,
+                recursive_adts,
+                false,
             );
         }
         Term::Binary(_, l, r) => {

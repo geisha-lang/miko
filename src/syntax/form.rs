@@ -424,6 +424,8 @@ pub enum Expr {
     Let(VarDecl, E, E),
     /// Conditional (`if (cond) then_e else else_e`)
     If(E, E, E),
+    /// Imperative loop (`while (cond) body_e`)
+    While(E, E),
     /// Pattern match (`match e { pat -> body, ... }`)
     Match(E, Vec<MatchArm>),
 }

@@ -11,6 +11,13 @@ Geisha has a static Hindley-Milner type system extended with algebraic data type
 - **`Bool`**: Boolean (`true`, `false`)
 - **`Void`** (also written `()`): Unit type (`()`)
 
+## Explicit Mutable Containers (`Cell a` & `MutArray a`)
+
+Variable bindings (`def` / `let`), tuples, and ADTs are strictly immutable. Local or encapsulated imperative state uses explicit heap-allocated mutable containers:
+
+- **`Cell a`**: Single mutable slot (`cellNew: forall a. a -> Cell a`, `cellGet: forall a. Cell a -> a`, `cellSet: forall a. (Cell a, a) -> Void`)
+- **`MutArray a`**: Fixed-length bounds-checked mutable array (`arrayNew: forall a. (Int, a) -> MutArray a`, `arrayLen: forall a. MutArray a -> Int`, `arrayGet: forall a. (MutArray a, Int) -> a`, `arraySet: forall a. (MutArray a, Int, a) -> Void`)
+
 ## Function Types vs First-Class Tuple Types
 
 Geisha cleanly separates **function parameter arity** from **first-class tuple values**:

@@ -179,7 +179,7 @@ peg::parser! {
         rule whitespace_inline_only() = quiet!{ ([' ' | '\t'] / block_comment())+ }
 
         rule keywords() = (
-            "def" / "if" / "else" / "let" / "in" / "type" / "data"
+            "def" / "if" / "else" / "while" / "let" / "in" / "type" / "data"
             / "match" / "concept" / "instance" / "forall"
             / "pub" / "use" / "mod" / "open" / "as"
             / "true" / "false" / "Void"
@@ -221,7 +221,7 @@ peg::parser! {
             = lexeme(<$(['a'..='z' | '_'] identifier_char()*)>)
 
         rule type_constant_identifier() -> &'input str
-            = whitespace() !("def" / "if" / "else" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance" / "forall" / "pub" / "use" / "mod" / "open" / "as" / "true" / "false" / "Void") !identifier_char()
+            = whitespace() !("def" / "if" / "else" / "while" / "let" / "in" / "type" / "data" / "match" / "concept" / "instance" / "forall" / "pub" / "use" / "mod" / "open" / "as" / "true" / "false" / "Void") !identifier_char()
               s:$(['A'..='Z'] identifier_char()*) { s }
             / whitespace() !"Void" !identifier_char() s:$(['A'..='Z'] identifier_char()*) { s }
 
@@ -642,6 +642,7 @@ peg::parser! {
 
         rule factor_expr() -> Expr
             = ifelse()
+            / whileexpr()
             / letin()
             / matchexpr()
             / lambda()
@@ -675,6 +676,11 @@ peg::parser! {
               t:expression() reserved(<"else">) f:expression() {
                   Expr::If(Box::new(c), Box::new(t), Box::new(f))
               }
+
+        rule whileexpr() -> Expr
+            = reserved(<"while">) c:parens(<expression()>) b:expression() {
+                Expr::While(Box::new(c), Box::new(b))
+            }
 
         rule letin() -> Expr
             = reserved(<"let">) v:variable_declaration() token(<"=">) val:expression()

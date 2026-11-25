@@ -13,6 +13,8 @@
 | `(T1, T2, ...)` | `{ T1_llvm, T2_llvm, ... }` | Unpacked first-class tuple value |
 | Function `(...) -> R` | `ptr` | Pointer to `{ ptr fn_entry, env_struct }` closure |
 | ADT `Data ...` | `ptr` | Pointer to `{ i32 tag, [N x i64] }` ABI-sized inline union |
+| `Cell T` | `ptr` | Pointer to GC-allocated cell holding `T_llvm` at 8-byte aligned payload start |
+| `MutArray T` | `ptr` | Pointer to GC-allocated `{ i64 len, [len x T_llvm] }` buffer (elements start at +8B) |
 
 ## ABI-Sized ADT Union Layout
 

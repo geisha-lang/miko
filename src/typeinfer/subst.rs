@@ -200,6 +200,10 @@ impl SubstMut for Form {
                 tr.apply_mut(sub);
                 fl.apply_mut(sub);
             }
+            While(ref mut cond, ref mut body) => {
+                cond.apply_mut(sub);
+                body.apply_mut(sub);
+            }
             Match(ref mut scrutinee, ref mut arms) => {
                 scrutinee.apply_mut(sub);
                 for arm in arms.iter_mut() {

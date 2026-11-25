@@ -279,6 +279,10 @@ impl LLVMValue {
     pub fn dump(&self) {
         unsafe { LLVMDumpValue(self.raw_ptr()) }
     }
+
+    pub fn set_tail_call(&self, is_tail: bool) {
+        unsafe { LLVMSetTailCall(self.raw_ptr(), if is_tail { 1 } else { 0 }) }
+    }
 }
 
 impl LLVMFunction {
@@ -378,6 +382,75 @@ impl LLVMBuilder {
                 struct_ty.raw_ptr(),
                 ptr.raw_ptr(),
                 idx as u32,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn gep(
+        &self,
+        elem_ty: &LLVMType,
+        ptr: &LLVMValue,
+        indices: &mut [LLVMValue],
+        name: &str,
+    ) -> LLVMValue {
+        let c = to_cstring(name);
+        let mut raw_indices: Vec<_> = indices.iter().map(|v| v.raw_ptr()).collect();
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildGEP2(
+                self.raw_ptr(),
+                elem_ty.raw_ptr(),
+                ptr.raw_ptr(),
+                raw_indices.as_mut_ptr(),
+                raw_indices.len() as c_uint,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn add(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildAdd(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn mul(&self, lhs: &LLVMValue, rhs: &LLVMValue, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildMul(
+                self.raw_ptr(),
+                lhs.raw_ptr(),
+                rhs.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn sext(&self, val: &LLVMValue, dest_ty: &LLVMType, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildSExt(
+                self.raw_ptr(),
+                val.raw_ptr(),
+                dest_ty.raw_ptr(),
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn trunc(&self, val: &LLVMValue, dest_ty: &LLVMType, name: &str) -> LLVMValue {
+        let c = to_cstring(name);
+        unsafe {
+            LLVMValue::from_ref(LLVMBuildTrunc(
+                self.raw_ptr(),
+                val.raw_ptr(),
+                dest_ty.raw_ptr(),
                 c.as_ptr(),
             ))
         }

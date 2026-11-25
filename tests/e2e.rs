@@ -424,4 +424,145 @@ def main() = printLn(show(42))
             _
         ))
     ));
+
+    // Non-tail expression in `{ ... }` block returning non-`Void` MUST be rejected!
+    let ignored_non_void = r#"
+def step(x: Int): Int = x + 1
+def main() = {
+    step(10);
+    putNumber(0)
+}
+"#;
+    assert!(matches!(
+        compile_str("ignored.gs", ignored_non_void),
+        Err(miko::compile::CompileError::TypeError(
+            TypeError::MisMatch(..),
+            _
+        ))
+    ));
+
+    // `while` body returning non-`Void` MUST be rejected!
+    let bad_while = r#"
+def main() = while (false) 42
+"#;
+    assert!(matches!(
+        compile_str("bad_while.gs", bad_while),
+        Err(miko::compile::CompileError::TypeError(
+            TypeError::MisMatch(..),
+            _
+        ))
+    ));
+}
+
+#[test]
+fn e2e_while_cell_mutarray_sieve_and_gc_safety() {
+    let src = r#"
+data Boxed { MkBox(Int, Int) }
+
+// Generic helper swapping two polymorphic `Cell t`s
+def swapCells(a: Cell t, b: Cell t): Void = {
+    let tmp = cellGet(a);
+    cellSet(a, cellGet(b));
+    cellSet(b, tmp)
+}
+
+// Helper storing a non-recursive ADT parameter into a Cell (must trigger interprocedural escape!)
+def storeBox(dst: Cell Boxed, b: Boxed): Void = cellSet(dst, b)
+
+def makeEscapingCell(n: Int): Cell Boxed = {
+    let c = cellNew(MkBox(0, 0));
+    let localBox = MkBox(n, n + 2);
+    storeBox(c, localBox);
+    c
+}
+
+// Sieve of Eratosthenes using `while`, `Cell`, and `MutArray`
+def countPrimes(limit: Int): Int = {
+    let isPrime = arrayNew(limit + 1, true);
+    arraySet(isPrime, 0, false);
+    arraySet(isPrime, 1, false);
+
+    let p = cellNew(2);
+    while (cellGet(p) * cellGet(p) <= limit) {
+        let cur = cellGet(p);
+        if (arrayGet(isPrime, cur)) {
+            let mult = cellNew(cur * cur);
+            while (cellGet(mult) <= limit) {
+                arraySet(isPrime, cellGet(mult), false);
+                cellSet(mult, cellGet(mult) + cur)
+            }
+        } else ();
+        cellSet(p, cur + 1)
+    };
+
+    let count = cellNew(0);
+    let idx = cellNew(2);
+    while (cellGet(idx) <= limit) {
+        if (arrayGet(isPrime, cellGet(idx))) {
+            cellSet(count, cellGet(count) + 1)
+        } else ();
+        cellSet(idx, cellGet(idx) + 1)
+    };
+    cellGet(count)
+}
+
+def main() = {
+    // 1. Closure sharing mutable `Cell` state cleanly via immutable value capture
+    let counter = cellNew(0);
+    let bump = (delta: Int) -> {
+        cellSet(counter, cellGet(counter) + delta);
+        cellGet(counter)
+    };
+    let _ = bump(4);
+    let cval = bump(6); // 10
+
+    // 2. Generic cell swap
+    let c1 = cellNew(1);
+    let c2 = cellNew(2);
+    swapCells(c1, c2); // c1 = 2, c2 = 1
+
+    // 3. `MutArray` holding heap-allocated ADTs under small-heap GC churn!
+    let boxes = arrayNew(4, MkBox(0, 0));
+    let k = cellNew(0);
+    while (cellGet(k) < arrayLen(boxes)) {
+        let idx = cellGet(k);
+        arraySet(boxes, idx, MkBox(idx * 10, 1));
+        cellSet(k, idx + 1)
+    };
+    // Trigger repeated GC collections while `boxes` and `escapedCell` hold heap ADTs
+    let escapedCell = makeEscapingCell(5);
+    let primes100 = countPrimes(100); // 25 primes <= 100
+    let boxSum = match (arrayGet(boxes, 3), cellGet(escapedCell)) {
+        (MkBox(a, b), MkBox(x, y)) -> a + b + x + y
+    }; // (30 + 1) + (5 + 7) = 43
+
+    // 10 + 2 + 25 + 43 = 80
+    putNumber(cval + cellGet(c1) + primes100 + boxSum)
+}
+"#;
+    // Run with tiny 64-word initial GC heap to stress GC scanning of `Cell` and `MutArray`!
+    let out = compile_and_run_src_with_env(src, &[("GEISHA_GC_HEAP_WORDS", "64")]);
+    assert_eq!(out, "80");
+
+    // Verify `MutArray` bounds checking catches out-of-bounds index cleanly (aborts non-zero instead of silent memory corruption)
+    let oob_src = r#"
+def main() = {
+    let arr = arrayNew(3, 10);
+    putNumber(arrayGet(arr, 3))
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("oob.gs");
+    let bin_path = dir.path().join("oob_bin");
+    fs::write(&src_path, oob_src).unwrap();
+    let comp = Command::new(miko_bin())
+        .arg("-o")
+        .arg(&bin_path)
+        .arg(&src_path)
+        .output()
+        .unwrap();
+    assert!(comp.status.success());
+    let run = Command::new(&bin_path).output().unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("out of bounds"));
 }

@@ -392,6 +392,16 @@ impl LLVMCodegen {
         self.module.add_function("gs_match_fail", &fn_ty)
     }
 
+    pub fn declare_gs_bounds_fail(&self) -> LLVMFunction {
+        if let Some(f) = self.module.get_function("gs_bounds_fail") {
+            return f;
+        }
+        let void_ty = self.context.get_void_type();
+        let i32_ty = self.context.get_int32_type();
+        let fn_ty = LLVMContext::get_function_type(&void_ty, &[i32_ty, i32_ty], false);
+        self.module.add_function("gs_bounds_fail", &fn_ty)
+    }
+
     pub fn get_type_size(&self, ty: &LLVMType) -> u64 {
         unsafe {
             let target_data = llvm_sys::target::LLVMGetModuleDataLayout(self.module.raw_ptr());

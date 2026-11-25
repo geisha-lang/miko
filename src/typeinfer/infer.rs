@@ -72,18 +72,47 @@ impl<'i> Infer<'i> {
     }
 
     fn register_builtin_concepts(&mut self) {
-        for (concept, prims) in [
-            ("$Num", &["Int", "Float"][..]),
-            ("$EqOp", &["Int", "Float", "Bool", "Char", "String"][..]),
-            ("$OrdOp", &["Int", "Float", "Char", "String"][..]),
-        ] {
+        let tv_a = Type::Var("a".to_string());
+        let bin_same = Type::Arr(vec![tv_a.clone(), tv_a.clone()], P(tv_a.clone()));
+        let unary_same = Type::Arr(vec![tv_a.clone()], P(tv_a.clone()));
+        let bin_bool = Type::Arr(
+            vec![tv_a.clone(), tv_a.clone()],
+            P(Type::Con("Bool".to_string())),
+        );
+        let bin_int = Type::Arr(
+            vec![tv_a.clone(), tv_a.clone()],
+            P(Type::Con("Int".to_string())),
+        );
+
+        let specs: [(&str, &str, Type, &[&str]); 8] = [
+            ("Add", "$op$plus", bin_same.clone(), &["Int", "Int64", "Float", "String"]),
+            ("Sub", "$op$minus", bin_same.clone(), &["Int", "Int64", "Float"]),
+            ("Mul", "$op$star", bin_same.clone(), &["Int", "Int64", "Float"]),
+            ("Div", "$op$slash", bin_same.clone(), &["Int", "Int64", "Float"]),
+            ("Rem", "$op$rem", bin_same, &["Int", "Int64"]),
+            ("Neg", "neg", unary_same, &["Int", "Int64", "Float"]),
+            ("Eq", "eq", bin_bool, &["Int", "Int64", "Float", "Bool", "Char", "String"]),
+            ("Ord", "compare", bin_int, &["Int", "Int64", "Float", "Char", "String"]),
+        ];
+
+        for (concept, method_name, method_ty, prims) in specs {
+            let method_scm = Scheme::PolyConstrained(
+                vec!["a".to_string()],
+                vec![SchemeConstraint {
+                    concept: concept.to_string(),
+                    type_arg: "a".to_string(),
+                }],
+                method_ty,
+            );
+            self.concept_methods
+                .insert(method_name.to_string(), (concept.to_string(), 0));
             self.concept_registry.insert(
                 concept.to_string(),
                 ConceptInfo {
                     name: concept.to_string(),
                     type_params: vec!["a".to_string()],
                     superclasses: vec![],
-                    methods: vec![],
+                    methods: vec![(method_name.to_string(), method_scm)],
                 },
             );
             for p in prims {
@@ -630,7 +659,26 @@ impl<'i> Infer<'i> {
         for (expected_name, expected_scm) in &cinfo.methods {
             let m_impl = methods
                 .iter()
-                .find(|mi| self.interner.trace(mi.name) == expected_name)
+                .find(|mi| {
+                    let actual = self.interner.trace(mi.name);
+                    actual == expected_name
+                        || matches!(
+                            (expected_name.as_str(), actual),
+                            ("$op$plus", "add")
+                                | ("add", "$op$plus")
+                                | ("$op$minus", "sub")
+                                | ("sub", "$op$minus")
+                                | ("$op$star", "mul")
+                                | ("mul", "$op$star")
+                                | ("$op$slash", "div")
+                                | ("div", "$op$slash")
+                                | ("$op$rem", "rem")
+                                | ("rem", "$op$rem")
+                                | ("neg", "$op$minus")
+                                | ("eq", "$op$eq_eq")
+                                | ("$op$eq_eq", "eq")
+                        )
+                })
                 .ok_or_else(|| {
                     TypeError::NoInstance {
                         concept: format!(
@@ -678,13 +726,17 @@ impl<'i> Infer<'i> {
             ));
         }
 
-        self.instance_registry.push(InstanceInfo {
-            concept_name: concept_name.to_string(),
-            type_params: inst_tvs,
-            constraints: inst_constraints,
-            target_types: expanded_args,
-            method_impls: method_impls_map,
-        });
+        // Insert at front so explicit user instances take priority over built-in primitive placeholders
+        self.instance_registry.insert(
+            0,
+            InstanceInfo {
+                concept_name: concept_name.to_string(),
+                type_params: inst_tvs,
+                constraints: inst_constraints,
+                target_types: expanded_args,
+                method_impls: method_impls_map,
+            },
+        );
 
         Ok(synth_defs)
     }
@@ -1327,10 +1379,18 @@ impl<'i> Infer<'i> {
                 let ty_right = self.infer(e, right.as_mut())?.body().clone();
 
                 match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                        let concept = match op {
+                            BinOp::Add => "Add",
+                            BinOp::Sub => "Sub",
+                            BinOp::Mul => "Mul",
+                            BinOp::Div => "Div",
+                            BinOp::Rem => "Rem",
+                            _ => unreachable!(),
+                        };
                         let a = self.fresh();
                         self.wanted_constraints.push(WantedConstraint {
-                            concept: "$Num".to_string(),
+                            concept: concept.to_string(),
                             ty: a.clone(),
                             span,
                         });
@@ -1338,16 +1398,10 @@ impl<'i> Infer<'i> {
                         self.uni(&ty_right, &a, right.tag.pos);
                         form.tag.set_type(a);
                     }
-                    BinOp::Rem => {
-                        let int_ty = Type::Con("Int".to_string());
-                        self.uni(&ty_left, &int_ty, left.tag.pos);
-                        self.uni(&ty_right, &int_ty, right.tag.pos);
-                        form.tag.set_type(int_ty);
-                    }
                     BinOp::Eq | BinOp::Ne => {
                         let a = self.fresh();
                         self.wanted_constraints.push(WantedConstraint {
-                            concept: "$EqOp".to_string(),
+                            concept: "Eq".to_string(),
                             ty: a.clone(),
                             span,
                         });
@@ -1358,7 +1412,7 @@ impl<'i> Infer<'i> {
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         let a = self.fresh();
                         self.wanted_constraints.push(WantedConstraint {
-                            concept: "$OrdOp".to_string(),
+                            concept: "Ord".to_string(),
                             ty: a.clone(),
                             span,
                         });
@@ -1387,7 +1441,7 @@ impl<'i> Infer<'i> {
                     UnOp::Neg => {
                         let a = self.fresh();
                         self.wanted_constraints.push(WantedConstraint {
-                            concept: "$Num".to_string(),
+                            concept: "Neg".to_string(),
                             ty: a.clone(),
                             span,
                         });
@@ -1655,6 +1709,13 @@ impl<'i> Infer<'i> {
         for (ctor_id, ctor_scm) in constructor_types {
             initial_bindings.push((ctor_id, ctor_scm));
         }
+        // Seed built-in Concept method names (`eq`, `compare`, `neg`, `(+)`..`(%)`) before user definitions
+        for cinfo in self.concept_registry.values() {
+            for (m_name, m_scm) in &cinfo.methods {
+                let mid = self.interner.intern(m_name);
+                initial_bindings.push((mid, m_scm.clone()));
+            }
+        }
         for (m_id, m_scm) in concept_method_entries {
             initial_bindings.push((m_id, m_scm));
         }
@@ -1889,10 +1950,15 @@ def both() = {
     #[test]
     fn test_string_addition_rejected_by_num_concept() {
         let mut interner = Interner::new();
-        let mut program = parser::parse("def bad() = \"a\" + \"b\"", &mut interner).unwrap();
+        // `String + String` is supported via `Add String`, while `true + false` and `"a" - "b"` are rejected!
+        let mut ok_prog = parser::parse("def ok() = \"a\" + \"b\"", &mut interner).unwrap();
         let env = Infer::new_env();
-        let mut inf = Infer::new(&mut interner);
-        let res = inf.infer_defs(&env, &mut program);
+        let mut inf_ok = Infer::new(&mut interner);
+        assert!(inf_ok.infer_defs(&env, &mut ok_prog).is_ok());
+
+        let mut bad_prog = parser::parse("def bad() = \"a\" - \"b\"", &mut interner).unwrap();
+        let mut inf_bad = Infer::new(&mut interner);
+        let res = inf_bad.infer_defs(&env, &mut bad_prog);
         assert!(matches!(res, Err(TypeError::NoInstance { .. })));
     }
 

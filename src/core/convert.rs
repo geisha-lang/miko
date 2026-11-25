@@ -22,6 +22,17 @@ fn is_type_concrete(ty: &Type) -> bool {
     }
 }
 
+fn is_builtin_op_primitive(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Con(n)
+            if matches!(
+                n.as_str(),
+                "Int" | "Int64" | "Float" | "Bool" | "Char" | "String"
+            )
+    )
+}
+
 /// Default unconstrained phantom type variables (e.g. `b` in `Left(10) : Either Int ?b` or `a` in `Nothing : Maybe ?a`)
 /// to `Type::Void` inside monomorphic contexts so monomorphization produces concrete types.
 fn default_phantom_type(ty: &Type) -> Type {
@@ -527,7 +538,7 @@ impl<'i> K<'i> {
                 // First-class polymorphic function value (e.g. `twice(id, 5)`)!
                 let name = self.interner.trace(*id).to_string();
                 let node_ty = term.ty.body().clone();
-                if is_type_concrete(&node_ty) {
+                if is_type_concrete(&node_ty) && !self.global.contains_key(id) {
                     if let Type::Arr(ref ps, ref r) = node_ty {
                         if let Some((mangled, spec_scm, opt_inst)) =
                             self.resolve_concept_call(&name, ps, r)
@@ -542,6 +553,8 @@ impl<'i> K<'i> {
                             return;
                         }
                     }
+                }
+                if is_type_concrete(&node_ty) {
                     if let Some((mangled, spec_scm, inst)) =
                         self.resolve_poly_fn_call(&name, &node_ty)
                     {
@@ -579,17 +592,52 @@ impl<'i> K<'i> {
                 let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.body().clone()).collect();
                 let ret_ty = term.ty.body().clone();
 
-                // 1. Check if this is a concept method call
-                if let Some((mangled, spec_scm, opt_inst)) =
-                    self.resolve_concept_call(&fn_name, &arg_tys, &ret_ty)
-                {
-                    let new_id = self.interner.intern(&mangled);
-                    self.direct.insert(new_id, new_id);
-                    *callee_decl = VarDecl(new_id, spec_scm);
-                    if let Some(inst) = opt_inst {
-                        discovered.push(inst);
+                // 1. Check if this is a concept method call (unless shadowed by an explicit top-level `def`)
+                if !self.global.contains_key(&callee_decl.0) {
+                    if let Some((mangled, spec_scm, opt_inst)) =
+                        self.resolve_concept_call(&fn_name, &arg_tys, &ret_ty)
+                    {
+                        let new_id = self.interner.intern(&mangled);
+                        self.direct.insert(new_id, new_id);
+                        *callee_decl = VarDecl(new_id, spec_scm);
+                        if let Some(inst) = opt_inst {
+                            discovered.push(inst);
+                        }
+                        return;
                     }
-                    return;
+
+                    // Built-in fallback when calling `eq(a, b)` or `compare(a, b)` on primitives without a user `instance`
+                    if arg_tys.len() == 2 && is_builtin_op_primitive(&arg_tys[0]) {
+                        if fn_name == "eq" {
+                            let a = args.remove(0);
+                            let b = args.remove(0);
+                            term.node = Term::Binary(BinOp::Eq, a, b);
+                            return;
+                        } else if fn_name == "compare" {
+                            let a = args.remove(0);
+                            let b = args.remove(0);
+                            let bool_scm = Scheme::Mono(Type::Con("Bool".to_string()));
+                            let int_scm = Scheme::Mono(Type::Con("Int".to_string()));
+                            let lt_cond = Box::new(TaggedTerm::new(
+                                bool_scm.clone(),
+                                Term::Binary(BinOp::Lt, a.clone(), b.clone()),
+                            ));
+                            let eq_cond = Box::new(TaggedTerm::new(
+                                bool_scm,
+                                Term::Binary(BinOp::Eq, a, b),
+                            ));
+                            let neg_one =
+                                Box::new(TaggedTerm::new(int_scm.clone(), Term::Lit(Lit::Int(-1))));
+                            let zero =
+                                Box::new(TaggedTerm::new(int_scm.clone(), Term::Lit(Lit::Int(0))));
+                            let pos_one =
+                                Box::new(TaggedTerm::new(int_scm.clone(), Term::Lit(Lit::Int(1))));
+                            let inner_if =
+                                Box::new(TaggedTerm::new(int_scm, Term::If(eq_cond, zero, pos_one)));
+                            term.node = Term::If(lt_cond, neg_one, inner_if);
+                            return;
+                        }
+                    }
                 }
 
                 // 2. Check if this is a polymorphic function call
@@ -603,9 +651,113 @@ impl<'i> K<'i> {
                     discovered.push(inst);
                 }
             }
-            Term::Binary(_, l, r) => {
+            Term::Binary(op, l, r) => {
+                let bop = *op;
                 self.rewrite_calls_in_term(l, discovered);
                 self.rewrite_calls_in_term(r, discovered);
+
+                let operand_ty = l.ty.body().clone();
+                if is_type_concrete(&operand_ty) && !is_builtin_op_primitive(&operand_ty) {
+                    let arg_tys = vec![operand_ty.clone(), operand_ty.clone()];
+                    let ret_ty = term.ty.body().clone();
+                    match bop {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                            let mname = match bop {
+                                BinOp::Add => "$op$plus",
+                                BinOp::Sub => "$op$minus",
+                                BinOp::Mul => "$op$star",
+                                BinOp::Div => "$op$slash",
+                                BinOp::Rem => "$op$rem",
+                                _ => unreachable!(),
+                            };
+                            if let Some((mangled, spec_scm, opt_inst)) =
+                                self.resolve_concept_call(mname, &arg_tys, &ret_ty)
+                            {
+                                let new_id = self.interner.intern(&mangled);
+                                self.direct.insert(new_id, new_id);
+                                if let Some(inst) = opt_inst {
+                                    discovered.push(inst);
+                                }
+                                let args = vec![l.clone(), r.clone()];
+                                term.node = Term::ApplyDir(VarDecl(new_id, spec_scm), args);
+                            }
+                        }
+                        BinOp::Eq => {
+                            if let Some((mangled, spec_scm, opt_inst)) =
+                                self.resolve_concept_call("eq", &arg_tys, &ret_ty)
+                            {
+                                let new_id = self.interner.intern(&mangled);
+                                self.direct.insert(new_id, new_id);
+                                if let Some(inst) = opt_inst {
+                                    discovered.push(inst);
+                                }
+                                let args = vec![l.clone(), r.clone()];
+                                term.node = Term::ApplyDir(VarDecl(new_id, spec_scm), args);
+                            }
+                        }
+                        BinOp::Ne => {
+                            let bool_ty = Type::Con("Bool".to_string());
+                            if let Some((mangled, spec_scm, opt_inst)) =
+                                self.resolve_concept_call("eq", &arg_tys, &bool_ty)
+                            {
+                                let new_id = self.interner.intern(&mangled);
+                                self.direct.insert(new_id, new_id);
+                                if let Some(inst) = opt_inst {
+                                    discovered.push(inst);
+                                }
+                                let eq_call = TaggedTerm::new(
+                                    Scheme::Mono(bool_ty),
+                                    Term::ApplyDir(
+                                        VarDecl(new_id, spec_scm),
+                                        vec![l.clone(), r.clone()],
+                                    ),
+                                );
+                                term.node = Term::Unary(UnOp::Not, Box::new(eq_call));
+                            }
+                        }
+                        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                            let int_ty = Type::Con("Int".to_string());
+                            if let Some((mangled, spec_scm, opt_inst)) =
+                                self.resolve_concept_call("compare", &arg_tys, &int_ty)
+                            {
+                                let new_id = self.interner.intern(&mangled);
+                                self.direct.insert(new_id, new_id);
+                                if let Some(inst) = opt_inst {
+                                    discovered.push(inst);
+                                }
+                                let cmp_call = TaggedTerm::new(
+                                    Scheme::Mono(int_ty.clone()),
+                                    Term::ApplyDir(
+                                        VarDecl(new_id, spec_scm),
+                                        vec![l.clone(), r.clone()],
+                                    ),
+                                );
+                                let zero =
+                                    TaggedTerm::new(Scheme::Mono(int_ty), Term::Lit(Lit::Int(0)));
+                                term.node = Term::Binary(bop, Box::new(cmp_call), Box::new(zero));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Term::Unary(UnOp::Neg, e) => {
+                self.rewrite_calls_in_term(e, discovered);
+                let operand_ty = e.ty.body().clone();
+                if is_type_concrete(&operand_ty) && !is_builtin_op_primitive(&operand_ty) {
+                    let arg_tys = vec![operand_ty.clone()];
+                    if let Some((mangled, spec_scm, opt_inst)) =
+                        self.resolve_concept_call("neg", &arg_tys, &operand_ty)
+                    {
+                        let new_id = self.interner.intern(&mangled);
+                        self.direct.insert(new_id, new_id);
+                        if let Some(inst) = opt_inst {
+                            discovered.push(inst);
+                        }
+                        let args = vec![e.clone()];
+                        term.node = Term::ApplyDir(VarDecl(new_id, spec_scm), args);
+                    }
+                }
             }
             Term::Unary(_, e) | Term::GetTag(e) | Term::GetField(e, _) => {
                 self.rewrite_calls_in_term(e, discovered);

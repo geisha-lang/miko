@@ -498,6 +498,30 @@ impl LLVMCodegen {
         };
 
         if type_name == "String" {
+            if op == Add {
+                let strlen_fn = self.declare_libc_strlen();
+                let memcpy_fn = self.declare_libc_memcpy();
+                let gc_alloc_fn = self.declare_gc_alloc();
+                let i8_ty = self.context.get_int8_type();
+                let one64 = self.context.get_int64_const(1);
+                let zero8 = self.context.get_uint8_const(0);
+
+                let la = self.builder.call(&strlen_fn, &mut [lhs], "cat.la");
+                let lb = self.builder.call(&strlen_fn, &mut [rhs], "cat.lb");
+                let lab = self.builder.add(&la, &lb, "cat.lab");
+                let alloc_sz = self.builder.add(&lab, &one64, "cat.alloc");
+
+                let dst = self.builder.call(&gc_alloc_fn, &mut [alloc_sz], "cat.dst");
+                self.builder.call(&memcpy_fn, &mut [dst, lhs, la], "");
+                let mut off_a = [la];
+                let dst_b = self.builder.gep(&i8_ty, &dst, &mut off_a, "cat.dst_b");
+                self.builder.call(&memcpy_fn, &mut [dst_b, rhs, lb], "");
+                let mut off_end = [lab];
+                let term_ptr = self.builder.gep(&i8_ty, &dst, &mut off_end, "cat.term");
+                self.builder.store(&zero8, &term_ptr);
+                return dst;
+            }
+
             let cmp_fn = self.declare_gs_str_cmp();
             let cmp_val = self.builder.call(&cmp_fn, &mut [lhs, rhs], "strcmp");
             let zero = self.context.get_int32_const(0);
@@ -520,18 +544,18 @@ impl LLVMCodegen {
             let d = csym.as_ptr();
 
             let raw = match (op, type_name) {
-                // Signed 32-bit Int arithmetic & comparisons
-                (Add, "Int") => LLVMBuildAdd(b, l, r, d),
-                (Sub, "Int") => LLVMBuildSub(b, l, r, d),
-                (Mul, "Int") => LLVMBuildMul(b, l, r, d),
-                (Div, "Int") => LLVMBuildSDiv(b, l, r, d),
-                (Rem, "Int") => LLVMBuildSRem(b, l, r, d),
-                (Eq, "Int") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, l, r, d),
-                (Ne, "Int") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntNE, l, r, d),
-                (Lt, "Int") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSLT, l, r, d),
-                (Le, "Int") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSLE, l, r, d),
-                (Gt, "Int") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSGT, l, r, d),
-                (Ge, "Int") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSGE, l, r, d),
+                // Signed 32-bit Int & 64-bit Int64 arithmetic & comparisons
+                (Add, "Int") | (Add, "Int64") => LLVMBuildAdd(b, l, r, d),
+                (Sub, "Int") | (Sub, "Int64") => LLVMBuildSub(b, l, r, d),
+                (Mul, "Int") | (Mul, "Int64") => LLVMBuildMul(b, l, r, d),
+                (Div, "Int") | (Div, "Int64") => LLVMBuildSDiv(b, l, r, d),
+                (Rem, "Int") | (Rem, "Int64") => LLVMBuildSRem(b, l, r, d),
+                (Eq, "Int") | (Eq, "Int64") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntEQ, l, r, d),
+                (Ne, "Int") | (Ne, "Int64") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntNE, l, r, d),
+                (Lt, "Int") | (Lt, "Int64") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSLT, l, r, d),
+                (Le, "Int") | (Le, "Int64") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSLE, l, r, d),
+                (Gt, "Int") | (Gt, "Int64") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSGT, l, r, d),
+                (Ge, "Int") | (Ge, "Int64") => LLVMBuildICmp(b, LLVMIntPredicate::LLVMIntSGE, l, r, d),
 
                 // 64-bit Float arithmetic & ordered comparisons ("Float", NOT "Double"!)
                 (Add, "Float") => LLVMBuildFAdd(b, l, r, d),

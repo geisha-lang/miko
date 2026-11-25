@@ -65,6 +65,107 @@ fn make_spanned_unexpr(start: usize, op: UnOp, rhs: Form) -> Form {
     Form::new(span, Expr::Unary(op, Box::new(rhs)))
 }
 
+/// Encode an operator symbol into a valid, injective ASCII identifier (`$op$...`).
+pub fn encode_op_name(op: &str) -> String {
+    let mut parts = Vec::with_capacity(op.len());
+    for ch in op.chars() {
+        let tok = match ch {
+            '+' => "plus",
+            '-' => "minus",
+            '*' => "star",
+            '/' => "slash",
+            '%' => "rem",
+            '=' => "eq",
+            '!' => "bang",
+            '<' => "lt",
+            '>' => "gt",
+            '&' => "amp",
+            '|' => "bar",
+            '^' => "caret",
+            ':' => "colon",
+            '~' => "tilde",
+            '?' => "qmark",
+            '@' => "at",
+            '#' => "hash",
+            '$' => "dollar",
+            '\\' => "bslash",
+            _ => "sym",
+        };
+        parts.push(tok);
+    }
+    format!("$op${}", parts.join("_"))
+}
+
+fn is_reserved_non_op(s: &str) -> bool {
+    matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||" | "!")
+}
+
+fn builtin_binop_from_str(s: &str) -> Option<BinOp> {
+    match s {
+        "+" => Some(BinOp::Add),
+        "-" => Some(BinOp::Sub),
+        "*" => Some(BinOp::Mul),
+        "/" => Some(BinOp::Div),
+        "%" => Some(BinOp::Rem),
+        "==" => Some(BinOp::Eq),
+        "!=" => Some(BinOp::Ne),
+        "<" => Some(BinOp::Lt),
+        "<=" => Some(BinOp::Le),
+        ">" => Some(BinOp::Gt),
+        ">=" => Some(BinOp::Ge),
+        _ => None,
+    }
+}
+
+/// Scala / Swift leading-character precedence bucket (1 = lowest, 9 = highest custom infix):
+///   1: `|` (e.g. `|>`, below `||` so `a && b |> f` works naturally)
+///   2: `^`
+///   3: `&`
+///   4: `=` / `!` (including `==`, `!=`, `===`, `=/=`)
+///   5: `<` / `>` (including `<`, `<=`, `>`, `>=`, `<|>`, `<+>`, `>>=`)
+///   6: `:` (including `::`)
+///   7: `+` / `-` (including `+`, `-`, `++`, `+:`)
+///   8: `*` / `/` / `%` (including `*`, `/`, `%`, `**`)
+///   9: other symbol chars (`@`, `#`, `$`, `?`, `~`, `\`)
+fn op_precedence_bucket(op: &str) -> Option<u8> {
+    if is_reserved_non_op(op) {
+        return None;
+    }
+    let first = op.chars().next()?;
+    let b = match first {
+        '|' => 1,
+        '^' => 2,
+        '&' => 3,
+        '=' | '!' => 4,
+        '<' | '>' => 5,
+        ':' => 6,
+        '+' | '-' => 7,
+        '*' | '/' | '%' => 8,
+        '@' | '#' | '$' | '?' | '~' | '\\' => 9,
+        _ => return None,
+    };
+    Some(b)
+}
+
+/// Scala right-associativity rule: operators ending in `:` (e.g. `::`, `+:`, `~:`) are right-associative!
+fn is_right_assoc_op(op: &str) -> bool {
+    op.ends_with(':')
+}
+
+fn make_infix_expr(op_str: &str, lhs: Form, rhs: Form, interner: &RefCell<Interner>) -> Form {
+    if let Some(bop) = builtin_binop_from_str(op_str) {
+        make_spanned_binexpr(bop, lhs, rhs)
+    } else {
+        let span = lhs.tag.pos.union(&rhs.tag.pos);
+        let op_id = interner.borrow_mut().intern(&encode_op_name(op_str));
+        let callee = Form::new(span, Expr::Var(op_id));
+        Form::new(
+            span,
+            Expr::Apply(Box::new(callee), vec![Box::new(lhs), Box::new(rhs)]),
+        )
+    }
+}
+
 enum BlockItem {
     LetVar(Span, VarDecl, E),
     LetPat(Span, Pattern, E),
@@ -211,11 +312,50 @@ peg::parser! {
         rule char_content() -> &'input str
             = $((!['\'' | '\\'] [_] / "\\" [_])+)
 
-        // Identifiers
+        // Identifiers (plus parenthesized operator names `(+)` / `(|>)` / `(<+>)` where definitions/imports expect a name)
+        rule op_char()
+            = ['!' | '#' | '$' | '%' | '&' | '*' | '+' | '-' | '/' | ':' | '<' | '=' | '>' | '?' | '@' | '\\' | '^' | '|' | '~']
+
+        rule raw_op_str() -> &'input str
+            = token(<$((!("//" / "/*") op_char())+)>)
+
+        rule definable_op_str() -> &'input str
+            = s:raw_op_str() {?
+                if matches!(s, "=" | ":" | "->" | "=>" | "&&" | "||") {
+                    Err("Reserved syntax punctuation cannot be redefined as an operator")
+                } else {
+                    Ok(s)
+                }
+            }
+
+        rule infix_op_left(bucket: u8) -> &'input str
+            = s:raw_op_str() {?
+                if op_precedence_bucket(s) == Some(bucket) && !is_right_assoc_op(s) {
+                    Ok(s)
+                } else {
+                    Err("not left-assoc op at this precedence")
+                }
+            }
+
+        rule infix_op_right(bucket: u8) -> &'input str
+            = s:raw_op_str() {?
+                if op_precedence_bucket(s) == Some(bucket) && is_right_assoc_op(s) {
+                    Ok(s)
+                } else {
+                    Err("not right-assoc op at this precedence")
+                }
+            }
+
         rule identifier() -> Id
             = id:lexeme(<$(['a'..='z' | 'A'..='Z' | '_'] identifier_char()*)>) {
                 interner.borrow_mut().intern(id)
             }
+
+        rule callable_identifier() -> Id
+            = token(<"(">) op:definable_op_str() token(<")">) {
+                interner.borrow_mut().intern(&encode_op_name(op))
+            }
+            / identifier()
 
         rule lower_identifier_str() -> &'input str
             = lexeme(<$(['a'..='z' | '_'] identifier_char()*)>)
@@ -272,8 +412,8 @@ peg::parser! {
             }
 
         rule use_spec() -> UseSpec
-            = name:identifier() reserved(<"as">) alias:identifier() { UseSpec::with_alias(name, alias) }
-            / name:identifier() { UseSpec::new(name) }
+            = name:callable_identifier() reserved(<"as">) alias:callable_identifier() { UseSpec::with_alias(name, alias) }
+            / name:callable_identifier() { UseSpec::new(name) }
 
         rule use_item_list() -> Vec<UseSpec>
             = token(<"{">) specs:use_spec() ++ token(<",">) token(<",">)? token(<"}">) { specs }
@@ -383,14 +523,14 @@ peg::parser! {
             / d:type_definition() { (Visibility::Private, d) }
 
         rule forward_declaration() -> (Id, Scheme)
-            = n:identifier() token(<":">) t:type_scheme() { (n, t) }
+            = n:callable_identifier() token(<":">) t:type_scheme() { (n, t) }
 
         rule form_definition() -> (Id, Form)
             = function_definition()
             / value_definition()
 
         rule value_definition() -> (Id, Form)
-            = reserved(<"def">) name:identifier() ann:(token(<":">) s:type_scheme() { s })? token(<"=">) value:expression() {
+            = reserved(<"def">) name:callable_identifier() ann:(token(<":">) s:type_scheme() { s })? token(<"=">) value:expression() {
                 let mut value = value;
                 if let Some(scm) = ann {
                     value.tag.annotate = Some(scm);
@@ -399,7 +539,7 @@ peg::parser! {
             }
 
         rule function_definition() -> (Id, Form)
-            = reserved(<"def">) name:identifier()
+            = reserved(<"def">) name:callable_identifier()
               token(<"(">) ps:parameter_sequence() token(<")">)
               ret_ann:(token(<":">) s:type_scheme() { s })?
               token(<"=">) body:expression() {
@@ -482,7 +622,7 @@ peg::parser! {
             }
 
         rule concept_method() -> MethodDecl
-            = n:identifier() token(<":">) t:type_scheme() {
+            = n:callable_identifier() token(<":">) t:type_scheme() {
                 MethodDecl { name: n, ty: t }
             }
 
@@ -509,7 +649,7 @@ peg::parser! {
             / t:type_atom() { vec![t] }
 
         rule instance_method() -> MethodImpl
-            = reserved(<"def">) n:identifier()
+            = reserved(<"def">) n:callable_identifier()
               token(<"(">) ps:parameter_sequence() token(<")">)
               ret_ann:(token(<":">) t:type_expression() { t })?
               token(<"=">) body:expression() {
@@ -640,23 +780,45 @@ peg::parser! {
 
         pub rule expression() -> Form
             = precedence! {
+                // Bucket 1: `|`-leading custom operators (e.g. `|>`, lowest so `a && b |> f` works naturally)
+                lhs:(@) op:infix_op_left(1) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(1) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
+                --
+                // Short-circuit logical OR
                 lhs:(@) token(<"||">) rhs:@ { make_spanned_binexpr(BinOp::Or, lhs, rhs) }
                 --
+                // Bucket 2: `^`-leading custom operators
+                lhs:(@) op:infix_op_left(2) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(2) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
+                --
+                // Short-circuit logical AND + Bucket 3 `&`-leading custom operators
                 lhs:(@) token(<"&&">) rhs:@ { make_spanned_binexpr(BinOp::And, lhs, rhs) }
+                lhs:(@) op:infix_op_left(3) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(3) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                lhs:(@) token(<"<=">) rhs:@ { make_spanned_binexpr(BinOp::Le, lhs, rhs) }
-                lhs:(@) token(<">=">) rhs:@ { make_spanned_binexpr(BinOp::Ge, lhs, rhs) }
-                lhs:(@) token(<"==">) rhs:@ { make_spanned_binexpr(BinOp::Eq, lhs, rhs) }
-                lhs:(@) token(<"!=">) rhs:@ { make_spanned_binexpr(BinOp::Ne, lhs, rhs) }
-                lhs:(@) token(<"<">)  rhs:@ { make_spanned_binexpr(BinOp::Lt, lhs, rhs) }
-                lhs:(@) token(<">">)  rhs:@ { make_spanned_binexpr(BinOp::Gt, lhs, rhs) }
+                // Bucket 4: `=` / `!` equality & inequality (`==`, `!=`, `===`, `=/=`, ...)
+                lhs:(@) op:infix_op_left(4) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(4) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                lhs:(@) token(<"+">) rhs:@ { make_spanned_binexpr(BinOp::Add, lhs, rhs) }
-                lhs:(@) token(<"-">) rhs:@ { make_spanned_binexpr(BinOp::Sub, lhs, rhs) }
+                // Bucket 5: `<` / `>` comparisons & monadic/combinator ops (`<`, `<=`, `>`, `>=`, `<|>`, `<+>`, `>>=`, ...)
+                lhs:(@) op:infix_op_left(5) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(5) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
-                lhs:(@) token(<"*">) rhs:@ { make_spanned_binexpr(BinOp::Mul, lhs, rhs) }
-                lhs:(@) token(<"/">) rhs:@ { make_spanned_binexpr(BinOp::Div, lhs, rhs) }
-                lhs:(@) token(<"%">) rhs:@ { make_spanned_binexpr(BinOp::Rem, lhs, rhs) }
+                // Bucket 6: `:`-leading cons/pair ops (`::` is right-associative!)
+                lhs:(@) op:infix_op_left(6) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(6) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
+                --
+                // Bucket 7: `+` / `-` additive ops (`+`, `-`, `++`, `+:`, ...)
+                lhs:(@) op:infix_op_left(7) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(7) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
+                --
+                // Bucket 8: `*` / `/` / `%` multiplicative ops (`*`, `/`, `%`, `**`, ...)
+                lhs:(@) op:infix_op_left(8) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(8) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
+                --
+                // Bucket 9: Other special symbol chars (`@`, `#`, `$`, `?`, `~`, `\`)
+                lhs:(@) op:infix_op_left(9) rhs:@ { make_infix_expr(op, lhs, rhs, interner) }
+                lhs:@ op:infix_op_right(9) rhs:(@) { make_infix_expr(op, lhs, rhs, interner) }
                 --
                 whitespace() start:position!() "!" !"=" e:@ { make_spanned_unexpr(start, UnOp::Not, e) }
                 whitespace() start:position!() "-" !['>' | '0'..='9'] e:@ { make_spanned_unexpr(start, UnOp::Neg, e) }
@@ -694,6 +856,29 @@ peg::parser! {
 
         rule unit_or_tuple_expr() -> Expr
             = token(<"(">) token(<")">) { Expr::Lit(Lit::Unit) }
+            // First-class operator value / section: `(+)` or `(|>)` or `(<+>)`
+            / start:position!() token(<"(">) op:definable_op_str() token(<")">) end:position!() {
+                let span = Span::new(start, end);
+                if let Some(bop) = builtin_binop_from_str(op) {
+                    let lid = interner.borrow_mut().intern(".op_lhs");
+                    let rid = interner.borrow_mut().intern(".op_rhs");
+                    let body = Form::new(
+                        span,
+                        Expr::Binary(
+                            bop,
+                            Box::new(Form::new(span, Expr::Var(lid))),
+                            Box::new(Form::new(span, Expr::Var(rid))),
+                        ),
+                    );
+                    Expr::Abs(Lambda {
+                        param: vec![VarDecl(lid, Scheme::Slot), VarDecl(rid, Scheme::Slot)],
+                        ret_ty: None,
+                        body: Box::new(body),
+                    })
+                } else {
+                    Expr::Var(interner.borrow_mut().intern(&encode_op_name(op)))
+                }
+            }
             / token(<"(">) first:expression() token(<",">) rest:(expression() ++ token(<",">)) token(<",">)? token(<")">) {
                 let mut elems = vec![Box::new(first)];
                 elems.extend(rest.into_iter().map(Box::new));

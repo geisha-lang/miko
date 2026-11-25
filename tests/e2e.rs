@@ -735,3 +735,96 @@ def main() = {
         "; tag=stage1\ntokens=6,symbols=2,sym1=answer,check=87,ok,alpha|beta|gamma"
     );
 }
+
+#[test]
+fn e2e_concept_operator_overloading_and_scala_custom_operators() {
+    let src = r#"
+use std.list.listFold
+
+data Vec2 {
+    MkVec2(Int, Int),
+}
+
+// Layer 1: Overload built-in `+`, `-`, unary `-`, `==`/`!=`, and `<`/`<=`/`>`/`>=` via open Concepts!
+instance Add Vec2 {
+    def (+)(a, b) = match (a, b) {
+        (MkVec2(x1, y1), MkVec2(x2, y2)) -> MkVec2(x1 + x2, y1 + y2),
+    }
+}
+
+instance Sub Vec2 {
+    def (-)(a, b) = match (a, b) {
+        (MkVec2(x1, y1), MkVec2(x2, y2)) -> MkVec2(x1 - x2, y1 - y2),
+    }
+}
+
+instance Neg Vec2 {
+    def neg(v) = match v {
+        MkVec2(x, y) -> MkVec2(-x, -y),
+    }
+}
+
+instance Eq Vec2 {
+    def (==)(a, b) = match (a, b) {
+        (MkVec2(x1, y1), MkVec2(x2, y2)) -> x1 == x2 && y1 == y2,
+    }
+}
+
+instance Ord Vec2 {
+    def compare(a, b) = match (a, b) {
+        (MkVec2(x1, y1), MkVec2(x2, y2)) -> (x1 * x1 + y1 * y1) - (x2 * x2 + y2 * y2),
+    }
+}
+
+// Layer 2a: Custom symbolic operator in a Concept (`<+>`) with static monomorphization!
+concept Semigroup a {
+    (<+>): (a, a) -> a
+}
+
+instance Semigroup Int {
+    def (<+>)(x, y) = x + y
+}
+
+instance Semigroup String {
+    def (<+>)(x, y) = x + y
+}
+
+def combineThree(a, b, c): forall t. (Semigroup t) => (t, t, t) -> t =
+    a <+> b <+> c
+
+// Layer 2b: Custom top-level operators testing Scala precedence & `:`-suffix right-associativity!
+// `|>` starts with `|` (lowest precedence, left-associative): `1 + 2 |> f |> g` == `g(f(1 + 2))`
+def (|>)(x: a, f: a -> b): b = f(x)
+
+// `::` ends with `:` -> RIGHT-ASSOCIATIVE: `1 :: 2 :: 3 :: Nil` == `Cons(1, Cons(2, Cons(3, Nil)))`
+def (::)(head: a, tail: List a): List a = Cons(head, tail)
+
+// `+:` starts with `+` and ends with `:` -> additive precedence AND right-associative!
+def (+:)(head: Int, tail: List Int): List Int = Cons(head, tail)
+
+def main() = {
+    let v1 = MkVec2(3, 4);
+    let v2 = MkVec2(1, 2);
+    let v3 = v1 + v2 - (-MkVec2(6, 4)); // (4, 6) - (-6, -4) = (10, 10)
+
+    // Operator section `(+)` passed as a first-class function to `listFold` on custom `Vec2` AND `Int`!
+    let foldedVec = listFold([v1, v2], MkVec2(0, 0), (+)); // (4, 6)
+    let nums = 10 :: 20 :: 12 :: Nil;
+    let nums2 = 1 + 1 +: 3 +: Nil; // `(1 + 1) +: (3 +: Nil)` -> [2, 3]
+    let sumNums = listFold(nums, 0, (+)) + listFold(nums2, 0, (<+>)); // 42 + 5 = 47
+
+    // Pipeline `|>` has lower precedence than `+` and `==`!
+    let piped = 10 + 5 |> (n) -> n * 2 |> (n) -> n - 10; // 20
+
+    // Built-in `String + String` AND custom `Semigroup String` `<+>`
+    let msg = combineThree("Gei", "sha", "!") + "";
+
+    if (v3 == MkVec2(10, 10) && v1 != v2 && v2 < v1 && foldedVec == MkVec2(4, 6) && msg == "Geisha!") {
+        putNumber(sumNums + piped) // 47 + 20 = 67
+    } else {
+        putNumber(0)
+    }
+}
+"#;
+    assert_eq!(compile_and_run_src(src), "67");
+}

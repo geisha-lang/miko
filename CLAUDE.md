@@ -16,22 +16,22 @@ LLVM_SYS_201_PREFIX=/opt/homebrew/opt/llvm@20 cargo build
 LLVM_SYS_201_PREFIX=/opt/homebrew/opt/llvm@20 cargo test
 
 # Compile Geisha source to executable (auto-links with runtime)
-./target/debug/miko -o output input.gs
+./target/debug/miko -o output input.gsa
 
 # Multi-file project compilation
-./target/debug/miko --src-root ./src -o output src/main/mod.gs
+./target/debug/miko --src-root ./src -o output src/main/mod.gsa
 
 # Compile to object file only (no linking)
-./target/debug/miko -c -o output.o input.gs
+./target/debug/miko -c -o output.o input.gsa
 
 # Emit LLVM IR
-./target/debug/miko -e input.gs
+./target/debug/miko -e input.gsa
 ```
 
 ## Architecture
 
 ```
-Source (.gs) → [Module Loader / DependencyGraph] → Parse → Type Infer (HM + Concepts) → K-Convert & Worklist Monomorphize → Escape Analysis → LLVM 20 Codegen → Executable
+Source (.gsa) → [Module Loader / DependencyGraph] → Parse → Type Infer (HM + Concepts) → K-Convert & Worklist Monomorphize → Escape Analysis → LLVM 20 Codegen → Executable
 ```
 
 ### Key Modules

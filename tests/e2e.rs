@@ -49,7 +49,7 @@ fn compile_and_run_src(src: &str) -> String {
 
 fn compile_and_run_src_with_env(src: &str, extra_env: &[(&str, &str)]) -> String {
     let dir = tempfile::tempdir().expect("tempdir");
-    let src_path = dir.path().join("main.gs");
+    let src_path = dir.path().join("main.gsa");
     fs::write(&src_path, src).expect("write source");
     compile_and_run_file(&src_path, extra_env)
 }
@@ -58,24 +58,24 @@ fn compile_and_run_src_with_env(src: &str, extra_env: &[(&str, &str)]) -> String
 fn e2e_all_repository_test_programs() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let cases = [
-        ("test/adt_basic.gs", "42"),
-        ("test/adt_bool.gs", "1"),
-        ("test/adt_either.gs", "42"),
-        ("test/adt_list.gs", "3"),
-        ("test/adt_maybe.gs", "42"),
-        ("test/adt_multi_field.gs", "42"),
-        ("test/adt_nat.gs", "5"),
-        ("test/adt_nested.gs", "42"),
-        ("test/adt_pair.gs", "40"),
-        ("test/adt_tree.gs", "10"),
-        ("test/cls.gs", "5"),
-        ("test/concept_eq.gs", "42"),
-        ("test/factorial.gs", "3628800"),
-        ("test/fib_cls.gs", "55"),
-        ("test/fibonacci.gs", "34"),
-        ("test/match_literal.gs", "100"),
+        ("test/adt_basic.gsa", "42"),
+        ("test/adt_bool.gsa", "1"),
+        ("test/adt_either.gsa", "42"),
+        ("test/adt_list.gsa", "3"),
+        ("test/adt_maybe.gsa", "42"),
+        ("test/adt_multi_field.gsa", "42"),
+        ("test/adt_nat.gsa", "5"),
+        ("test/adt_nested.gsa", "42"),
+        ("test/adt_pair.gsa", "40"),
+        ("test/adt_tree.gsa", "10"),
+        ("test/cls.gsa", "5"),
+        ("test/concept_eq.gsa", "42"),
+        ("test/factorial.gsa", "3628800"),
+        ("test/fib_cls.gsa", "55"),
+        ("test/fibonacci.gsa", "34"),
+        ("test/match_literal.gsa", "100"),
         (
-            "test/fizzbuzz.gs",
+            "test/fizzbuzz.gsa",
             "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n",
         ),
     ];
@@ -342,7 +342,7 @@ mod Math {
 }
 def main() = putNumber(Math.secret(1))
 "#;
-    assert!(compile_str("bad.gs", bad_inline).is_err());
+    assert!(compile_str("bad.gsa", bad_inline).is_err());
 
     // 2. Multi-file `--src-root` project where submodule `service` imports sibling submodule `math`
     let dir = tempfile::tempdir().unwrap();
@@ -350,7 +350,7 @@ def main() = putNumber(Math.secret(1))
     fs::create_dir_all(src_root.join("main")).unwrap();
 
     fs::write(
-        src_root.join("main/math.gs"),
+        src_root.join("main/math.gsa"),
         r#"
 def internalScale() = 2
 pub def add(x, y) = x + y
@@ -360,7 +360,7 @@ pub def scaled(x) = x * internalScale()
     .unwrap();
 
     fs::write(
-        src_root.join("main/service.gs"),
+        src_root.join("main/service.gsa"),
         r#"
 use math.{add, scaled}
 pub use math.add
@@ -369,7 +369,7 @@ pub def compute(a, b) = scaled(add(a, b))
     )
     .unwrap();
 
-    let entry = src_root.join("main/mod.gs");
+    let entry = src_root.join("main/mod.gsa");
     fs::write(
         &entry,
         r#"
@@ -405,7 +405,7 @@ fn e2e_negative_compile_time_checks() {
     // Cyclic type alias
     let cyc = "type A = B\ntype B = A\ndef main() = ()";
     assert!(matches!(
-        compile_str("cyc.gs", cyc),
+        compile_str("cyc.gsa", cyc),
         Err(miko::compile::CompileError::TypeError(
             TypeError::TypeAliasError(..),
             _
@@ -418,7 +418,7 @@ concept Show a { show: a -> String }
 def main() = printLn(show(42))
 "#;
     assert!(matches!(
-        compile_str("no_inst.gs", no_inst),
+        compile_str("no_inst.gsa", no_inst),
         Err(miko::compile::CompileError::TypeError(
             TypeError::NoInstance { .. },
             _
@@ -434,7 +434,7 @@ def main() = {
 }
 "#;
     assert!(matches!(
-        compile_str("ignored.gs", ignored_non_void),
+        compile_str("ignored.gsa", ignored_non_void),
         Err(miko::compile::CompileError::TypeError(
             TypeError::MisMatch(..),
             _
@@ -446,7 +446,7 @@ def main() = {
 def main() = while (false) 42
 "#;
     assert!(matches!(
-        compile_str("bad_while.gs", bad_while),
+        compile_str("bad_while.gsa", bad_while),
         Err(miko::compile::CompileError::TypeError(
             TypeError::MisMatch(..),
             _
@@ -552,7 +552,7 @@ def main() = {
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    let src_path = dir.path().join("oob.gs");
+    let src_path = dir.path().join("oob.gsa");
     let bin_path = dir.path().join("oob_bin");
     fs::write(&src_path, oob_src).unwrap();
     let comp = Command::new(miko_bin())
@@ -570,9 +570,9 @@ def main() = {
 #[test]
 fn e2e_extern_c_ffi_stdlib_syslib_and_mini_compiler_pipeline() {
     let dir = tempfile::tempdir().unwrap();
-    let input_gs = dir.path().join("sample_input.gs");
+    let input_gs = dir.path().join("sample_input.gsa");
     let output_ir = dir.path().join("emitted_out.ll");
-    let compiler_src = dir.path().join("mini_driver.gs");
+    let compiler_src = dir.path().join("mini_driver.gsa");
     let compiler_bin = dir.path().join("mini_driver_bin");
 
     fs::write(&input_gs, "def answer = 42 + answer\n").unwrap();
@@ -711,7 +711,7 @@ def main() = {
         .unwrap();
     assert!(
         comp.status.success(),
-        "failed compiling mini_driver.gs:\nstderr: {}",
+        "failed compiling mini_driver.gsa:\nstderr: {}",
         String::from_utf8_lossy(&comp.stderr)
     );
 
@@ -1094,7 +1094,7 @@ def main() = {
     ];
 
     for (idx, src) in unsafe_programs.iter().enumerate() {
-        let err = compile_str("unsafe_conc.gs", src)
+        let err = compile_str("unsafe_conc.gsa", src)
             .expect_err(&format!("Case #{} should have failed Send check!", idx + 1));
         let msg = err.to_string();
         assert!(
@@ -1297,11 +1297,11 @@ def main() = {
     };
 
     // 3. `std.path` helpers
-    let p = pathJoin("src/compiler", "codegen.gs");
+    let p = pathJoin("src/compiler", "codegen.gsa");
     let pathOk =
-        p == "src/compiler/codegen.gs"
+        p == "src/compiler/codegen.gsa"
         && pathDirname(p) == "src/compiler"
-        && pathBasename(p) == "codegen.gs"
+        && pathBasename(p) == "codegen.gsa"
         && pathStem(p) == "codegen"
         && pathWithExt(p, "ll") == "src/compiler/codegen.ll"
         && !isAbsPath(p)

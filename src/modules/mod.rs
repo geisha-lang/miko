@@ -1,7 +1,7 @@
 //! Module system infrastructure for multi-file compilation.
 //!
 //! This module provides:
-//! - `ModuleLoader`: Finds and loads `.gs` source files based on module paths
+//! - `ModuleLoader`: Finds and loads `.gsa` source files based on module paths
 //! - `DependencyGraph`: Resolves compilation order and detects circular dependencies
 //! - `ImportMap`: Resolves `use` statements to bring names into scope
 

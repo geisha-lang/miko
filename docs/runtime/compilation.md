@@ -1,7 +1,7 @@
 # Compilation Pipeline
 
 ```
-Source (.gs)
+Source (.gsa)
   → Module Loader & DependencyGraph (multi-file & inline modules, per-module imports)
   → PEG Parser (AST with spans, comments, tuples, ADTs, concepts)
   → Type Inference (HM + occurs check + let-polymorphism + type aliases + concept constraints + exhaustiveness)

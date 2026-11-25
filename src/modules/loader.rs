@@ -1,4 +1,4 @@
-//! Module loader for finding and loading `.gs` source files and inline submodules.
+//! Module loader for finding and loading `.gsa` source files and inline submodules.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -13,23 +13,23 @@ use crate::utils::{Id, Interner};
 /// Built-in standard library (`std.*`) and system library (`sys.*`) modules embedded in `miko`.
 pub fn builtin_module_source(module_key: &str) -> Option<&'static str> {
     match module_key {
-        "std.option" => Some(include_str!("../../stdlib/std/option.gs")),
-        "std.result" => Some(include_str!("../../stdlib/std/result.gs")),
-        "std.list" => Some(include_str!("../../stdlib/std/list.gs")),
-        "std.bits" => Some(include_str!("../../stdlib/std/bits.gs")),
-        "std.path" => Some(include_str!("../../stdlib/std/path.gs")),
-        "std.char" => Some(include_str!("../../stdlib/std/char.gs")),
-        "std.buf" => Some(include_str!("../../stdlib/std/buf.gs")),
-        "std.str" => Some(include_str!("../../stdlib/std/str.gs")),
-        "std.vec" => Some(include_str!("../../stdlib/std/vec.gs")),
-        "std.map" => Some(include_str!("../../stdlib/std/map.gs")),
-        "std.sync" => Some(include_str!("../../stdlib/std/sync.gs")),
-        "std.task" => Some(include_str!("../../stdlib/std/task.gs")),
-        "std.actor" => Some(include_str!("../../stdlib/std/actor.gs")),
-        "sys.io" => Some(include_str!("../../stdlib/sys/io.gs")),
-        "sys.fs" => Some(include_str!("../../stdlib/sys/fs.gs")),
-        "sys.env" => Some(include_str!("../../stdlib/sys/env.gs")),
-        "sys.proc" => Some(include_str!("../../stdlib/sys/proc.gs")),
+        "std.option" => Some(include_str!("../../stdlib/std/option.gsa")),
+        "std.result" => Some(include_str!("../../stdlib/std/result.gsa")),
+        "std.list" => Some(include_str!("../../stdlib/std/list.gsa")),
+        "std.bits" => Some(include_str!("../../stdlib/std/bits.gsa")),
+        "std.path" => Some(include_str!("../../stdlib/std/path.gsa")),
+        "std.char" => Some(include_str!("../../stdlib/std/char.gsa")),
+        "std.buf" => Some(include_str!("../../stdlib/std/buf.gsa")),
+        "std.str" => Some(include_str!("../../stdlib/std/str.gsa")),
+        "std.vec" => Some(include_str!("../../stdlib/std/vec.gsa")),
+        "std.map" => Some(include_str!("../../stdlib/std/map.gsa")),
+        "std.sync" => Some(include_str!("../../stdlib/std/sync.gsa")),
+        "std.task" => Some(include_str!("../../stdlib/std/task.gsa")),
+        "std.actor" => Some(include_str!("../../stdlib/std/actor.gsa")),
+        "sys.io" => Some(include_str!("../../stdlib/sys/io.gsa")),
+        "sys.fs" => Some(include_str!("../../stdlib/sys/fs.gsa")),
+        "sys.env" => Some(include_str!("../../stdlib/sys/env.gsa")),
+        "sys.proc" => Some(include_str!("../../stdlib/sys/proc.gsa")),
         _ => None,
     }
 }
@@ -138,12 +138,12 @@ impl ModuleLoader {
             base_path.push(segment);
         }
 
-        let file_path = base_path.with_extension("gs");
+        let file_path = base_path.with_extension("gsa");
         if file_path.exists() {
             return Some(file_path);
         }
 
-        let mod_path = base_path.join("mod.gs");
+        let mod_path = base_path.join("mod.gsa");
         if mod_path.exists() {
             return Some(mod_path);
         }
@@ -162,7 +162,7 @@ impl ModuleLoader {
         for segment in module_path {
             base_path.push(segment);
         }
-        vec![base_path.with_extension("gs"), base_path.join("mod.gs")]
+        vec![base_path.with_extension("gsa"), base_path.join("mod.gsa")]
     }
 
     pub fn load(
@@ -311,7 +311,7 @@ impl ModuleLoader {
             needed.sort();
             for key in needed {
                 let src = builtin_module_source(&key).unwrap();
-                let virt_path = PathBuf::from(format!("<stdlib>/{}.gs", key.replace('.', "/")));
+                let virt_path = PathBuf::from(format!("<stdlib>/{}.gsa", key.replace('.', "/")));
                 let mod_path = {
                     let mut inter = interner.borrow_mut();
                     let segs: Vec<Id> = key.split('.').map(|s| inter.intern(s)).collect();
@@ -518,8 +518,8 @@ mod tests {
         let mut loader = ModuleLoader::new(src_root.clone());
         let interner = RefCell::new(Interner::new());
 
-        write_file(&src_root.join("utils/mod.gs"), "pub mod math");
-        write_file(&src_root.join("utils/math.gs"), "pub def add(x, y) = x + y");
+        write_file(&src_root.join("utils/mod.gsa"), "pub mod math");
+        write_file(&src_root.join("utils/math.gsa"), "pub def add(x, y) = x + y");
 
         loader.load(&["utils"], &interner).unwrap();
         assert!(loader.is_loaded("utils"));
@@ -538,7 +538,7 @@ mod Math {
 def main() = Math.abs(-5)
 ";
         loader
-            .load_single_source(Path::new("test.gs"), src, &interner)
+            .load_single_source(Path::new("test.gsa"), src, &interner)
             .unwrap();
         assert!(loader.is_loaded("Math"));
         assert!(loader.is_loaded(""));
